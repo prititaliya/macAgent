@@ -13,6 +13,12 @@ struct TraceStep: Identifiable, Equatable {
     let body: String
 }
 
+struct PendingConfirm: Identifiable, Equatable {
+    let id: String
+    let summary: String
+    let command: String
+}
+
 @MainActor
 final class AgentModel: ObservableObject {
     static let shared = AgentModel()
@@ -21,6 +27,13 @@ final class AgentModel: ObservableObject {
     @Published var lastQuestion = ""
     @Published var sources: [SourceLink] = []
     @Published var traceSteps: [TraceStep] = []
+    @Published var pendingConfirm: PendingConfirm?
+    /// Seconds left before auto-hide; nil when disabled / hidden.
+    @Published var hideCountdown: Int?
+    /// True only in the last 3 seconds.
+    @Published var hideUrgency = false
+    /// Alternates only while hideUrgency — drives the heartbeat.
+    @Published var hidePulse = false
     @Published var busy = false
     @Published var statusLine = ""
     @Published var daemonOnline = false
@@ -68,6 +81,7 @@ final class AgentModel: ObservableObject {
         lastQuestion = text
         answer = ""
         sources = []
+        pendingConfirm = nil
         traceSteps = [
             TraceStep(title: "Input", body: text)
         ]
@@ -90,6 +104,33 @@ final class AgentModel: ObservableObject {
         } catch {
             lastError = error.localizedDescription
             answer = "Request failed: \(error.localizedDescription)"
+            statusLine = ""
+        }
+    }
+
+    func respondToConfirm(approve: Bool) async {
+        guard let pending = pendingConfirm else { return }
+        busy = true
+        statusLine = approve ? "Running approved action…" : "Cancelling…"
+        onUserActivity?()
+        defer { busy = false }
+        do {
+            var req = URLRequest(url: base.appendingPathComponent("v1/confirm"))
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.timeoutInterval = 60
+            req.httpBody = try JSONSerialization.data(
+                withJSONObject: ["id": pending.id, "approve": approve]
+            )
+            let (_, resp) = try await URLSession.shared.data(for: req)
+            guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                throw URLError(.badServerResponse)
+            }
+            pendingConfirm = nil
+            await refreshPrefs()
+        } catch {
+            lastError = error.localizedDescription
+            answer = "Could not send approval: \(error.localizedDescription)"
             statusLine = ""
         }
     }
@@ -203,6 +244,38 @@ final class AgentModel: ObservableObject {
             return
         }
 
+        if kind == "confirm" {
+            var confirmId = ""
+            var summary = text
+            var command = ""
+            if let input = obj["tool_input"] as? [String: Any] {
+                confirmId = (input["id"] as? String) ?? ""
+                if let s = input["summary"] as? String, !s.isEmpty { summary = s }
+                command = (input["command"] as? String) ?? ""
+            }
+            if confirmId.isEmpty {
+                if let n = obj["id"] as? Int {
+                    confirmId = String(n)
+                } else if let s = obj["id"] as? String {
+                    confirmId = s
+                } else {
+                    confirmId = UUID().uuidString
+                }
+            }
+            pendingConfirm = PendingConfirm(
+                id: confirmId,
+                summary: summary.isEmpty ? "This action needs your permission." : summary,
+                command: command
+            )
+            answer = ""
+            statusLine = "Waiting for your approval…"
+            busy = false
+            appendTraceLine(title: "Needs permission", body: summary)
+            onEvent?()
+            onUserActivity?()
+            return
+        }
+
         if kind == "action" || detail == "pending" {
             if !text.isEmpty {
                 statusLine = text
@@ -226,6 +299,7 @@ final class AgentModel: ObservableObject {
             if !extracted.isEmpty {
                 sources = extracted
             }
+            pendingConfirm = nil
             statusLine = ""
             busy = false
             onUserActivity?()
@@ -258,8 +332,21 @@ final class AgentModel: ObservableObject {
         let tool = (obj["tool"] as? String) ?? ""
         let title: String
         switch step {
-        case "input": title = "Input"
+        case "input":
+            // Never pretty-print {"utterance":…} into the UI — use plain text.
+            let spoken = (obj["utterance"] as? String)
+                ?? (obj["text"] as? String)
+                ?? fallbackTitle
+            let clean = spoken == "Received input"
+                ? ((obj["utterance"] as? String) ?? lastQuestion)
+                : spoken
+            if !clean.isEmpty {
+                lastQuestion = clean
+                appendTraceLine(title: "Input", body: clean)
+            }
+            return
         case "codegen": title = "Generated code"
+        case "shellgen": title = "Generated shell"
         case "tool_call": title = tool.isEmpty ? "Tool call" : "Call \(tool)"
         case "tool_result": title = tool.isEmpty ? "Tool output" : "\(tool) output"
         case "respond": title = "Respond"
@@ -294,8 +381,8 @@ final class AgentModel: ObservableObject {
         if let last = traceSteps.last, last.title == title, last.body == body {
             return
         }
-        if title == "Answer" {
-            traceSteps.removeAll { $0.title == "Answer" }
+        if title == "Answer" || title == "Input" {
+            traceSteps.removeAll { $0.title == title }
         }
         traceSteps.append(TraceStep(title: title, body: body))
     }

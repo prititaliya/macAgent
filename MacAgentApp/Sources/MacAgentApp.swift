@@ -18,13 +18,9 @@ struct MacAgentMain: App {
                 AppDelegate.shared?.quitApp()
             }
         } label: {
-            Label {
-                Text("MacAgent")
-            } icon: {
-                Image("Logo")
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-            }
+            // Keep this tiny — a full Logo asset in the menu bar looks like a
+            // giant circle stuck on the top of the screen.
+            Image(systemName: "sparkles")
         }
 
         Settings {

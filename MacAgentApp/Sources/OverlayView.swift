@@ -9,62 +9,31 @@ struct OverlayView: View {
     var onInteract: () -> Void = {}
     @AppStorage(OverlayAutoHide.defaultsKey) private var autoHideSeconds: Int = 15
     @State private var draft = ""
+    @State private var logsExpanded = false
     @FocusState private var focused: Bool
+
+    private var logSteps: [TraceStep] {
+        model.traceSteps.filter { $0.title != "Answer" && $0.title != "Input" }
+    }
+
+    private var hasAnswer: Bool {
+        !model.answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var countdownLabel: String {
+        guard let left = model.hideCountdown, autoHideSeconds > 0 else {
+            return autoHideSeconds == 0 ? "Auto-hide off" : ""
+        }
+        if model.busy || model.pendingConfirm != nil {
+            return "Paused · \(left)s"
+        }
+        return "Hides in \(left)s"
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 8) {
-                logoImage
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .frame(width: 28, height: 28)
-                    .clipShape(Circle())
-                Text("MacAgent")
-                    .font(.system(size: 13, weight: .semibold, design: .rounded))
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Text("⌃⌥Space")
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(.tertiary)
-                Button(action: onPrefs) {
-                    Image(systemName: "gearshape")
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
-                .help("Preferences")
-                Button(action: onDismiss) {
-                    Image(systemName: "xmark")
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
-                .help("Hide overlay")
-                .keyboardShortcut(.escape, modifiers: [])
-                Button(action: onQuit) {
-                    Image(systemName: "power")
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
-                .help("Quit MacAgent")
-            }
-
-            HStack(spacing: 8) {
-                TextField("Ask or tell MacAgent…", text: $draft)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 18, weight: .medium))
-                    .focused($focused)
-                    .onSubmit { send() }
-                    .onChange(of: draft) { _ in onInteract() }
-                Button("Send") { send() }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.busy)
-            }
-            .padding(12)
-            .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
-            .contentShape(Rectangle())
-            .onTapGesture {
-                focused = true
-                onInteract()
-            }
+            header
+            inputBar
 
             if model.busy {
                 HStack(spacing: 8) {
@@ -75,36 +44,82 @@ struct OverlayView: View {
                 }
             }
 
-            ScrollViewReader { proxy in
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 12) {
-                        ForEach(model.traceSteps) { step in
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(step.title)
-                                    .font(.caption.weight(.semibold))
-                                    .foregroundStyle(.secondary)
-                                Text(step.body)
-                                    .font(.system(size: 12, design: .monospaced))
-                                    .textSelection(.enabled)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                            .padding(8)
-                            .background(.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
-                            .id(step.id)
-                        }
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    if !model.lastQuestion.isEmpty {
+                        Text(model.lastQuestion)
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
 
-                        if !model.answer.isEmpty && !model.traceSteps.contains(where: { $0.title == "Answer" }) {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text("Answer")
-                                    .font(.caption.weight(.semibold))
+                    if let pending = model.pendingConfirm {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Label("Permission needed", systemImage: "hand.raised.fill")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(.orange)
+                            Text(pending.summary)
+                                .font(.system(size: 15, weight: .semibold))
+                                .foregroundStyle(.primary)
+                                .textSelection(.enabled)
+                            if !pending.command.isEmpty {
+                                Text(pending.command)
+                                    .font(.system(size: 11, design: .monospaced))
                                     .foregroundStyle(.secondary)
-                                Text(model.answer)
-                                    .font(.system(size: 14))
                                     .textSelection(.enabled)
                             }
+                            HStack(spacing: 10) {
+                                Button("Deny") {
+                                    onInteract()
+                                    Task { await model.respondToConfirm(approve: false) }
+                                }
+                                .buttonStyle(.bordered)
+                                Button("Approve") {
+                                    onInteract()
+                                    Task { await model.respondToConfirm(approve: true) }
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .tint(.orange)
+                            }
                         }
+                        .padding(14)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(
+                            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                .fill(Color.orange.opacity(0.14))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                .strokeBorder(Color.orange.opacity(0.5), lineWidth: 1.5)
+                        )
+                    }
 
-                        if !model.sources.isEmpty {
+                    // Final answer — visually distinct
+                    if hasAnswer {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Label("Answer", systemImage: "checkmark.seal.fill")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(Color.accentColor)
+                            Text(model.answer)
+                                .font(.system(size: 16, weight: .semibold))
+                                .foregroundStyle(.primary)
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .padding(14)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(
+                            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                .fill(Color.accentColor.opacity(0.14))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                .strokeBorder(Color.accentColor.opacity(0.45), lineWidth: 1.5)
+                        )
+                    }
+
+                    if !model.sources.isEmpty {
+                        VStack(alignment: .leading, spacing: 6) {
                             Text("Sources")
                                 .font(.caption.weight(.semibold))
                                 .foregroundStyle(.secondary)
@@ -122,58 +137,214 @@ struct OverlayView: View {
                             }
                         }
                     }
-                }
-                .frame(maxHeight: 320)
-                .simultaneousGesture(
-                    DragGesture(minimumDistance: 1).onChanged { _ in onInteract() }
-                )
-                .onHover { hovering in
-                    if hovering { onInteract() }
-                }
-                .onChange(of: model.traceSteps.count) { _ in
-                    if let last = model.traceSteps.last {
-                        withAnimation {
-                            proxy.scrollTo(last.id, anchor: .bottom)
+
+                    // Collapsible activity logs
+                    if !logSteps.isEmpty || model.busy {
+                        DisclosureGroup(isExpanded: $logsExpanded) {
+                            VStack(alignment: .leading, spacing: 8) {
+                                ForEach(logSteps) { step in
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text(step.title)
+                                            .font(.caption2.weight(.semibold))
+                                            .foregroundStyle(.tertiary)
+                                        Text(step.body)
+                                            .font(.system(size: 11, design: .monospaced))
+                                            .foregroundStyle(.secondary)
+                                            .textSelection(.enabled)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                    }
+                                    .padding(8)
+                                    .background(.white.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
+                                }
+                            }
+                            .padding(.top, 6)
+                        } label: {
+                            HStack {
+                                Image(systemName: "chevron.right.circle")
+                                    .rotationEffect(.degrees(logsExpanded ? 90 : 0))
+                                Text(logsExpanded ? "Hide activity logs" : "Show activity logs")
+                                    .font(.caption.weight(.medium))
+                                Text("(\(logSteps.count))")
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                                Spacer()
+                            }
+                            .foregroundStyle(.secondary)
+                            .contentShape(Rectangle())
+                        }
+                        .onChange(of: hasAnswer) { answered in
+                            if answered {
+                                withAnimation(.easeInOut(duration: 0.2)) {
+                                    logsExpanded = false
+                                }
+                            }
+                        }
+                        .onChange(of: model.busy) { busy in
+                            // While working, keep logs open so progress is visible.
+                            if busy {
+                                logsExpanded = true
+                            }
                         }
                     }
                 }
             }
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 1).onChanged { _ in onInteract() }
+            )
 
-            HStack {
-                Circle()
-                    .fill(model.daemonOnline ? Color.green : Color.orange)
-                    .frame(width: 7, height: 7)
-                Text(model.daemonOnline ? "Daemon ready" : "Starting daemon…")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-                Spacer()
-                if autoHideSeconds > 0 {
-                    Text("Hides in \(autoHideSeconds)s idle")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                }
-                Text("Voice: FreeFlow → :8081")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-            }
+            footer
         }
         .padding(18)
-        .frame(width: 560, height: 480)
+        .frame(minWidth: 420, minHeight: 280)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background {
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .fill(.ultraThinMaterial)
                 .overlay(
                     RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .strokeBorder(.white.opacity(0.12), lineWidth: 1)
+                        .strokeBorder(borderColor, lineWidth: model.hideUrgency ? 2.5 : 1)
                 )
-                .shadow(color: .black.opacity(0.35), radius: 24, y: 12)
+                .shadow(
+                    color: model.hideUrgency
+                        ? Color.orange.opacity(model.hidePulse ? 0.55 : 0.18)
+                        : Color.black.opacity(0.35),
+                    radius: model.hideUrgency ? (model.hidePulse ? 26 : 14) : 24,
+                    y: 12
+                )
         }
+        // Slight scale only while urgent + pulse beat — no forever animation.
+        .scaleEffect(model.hideUrgency && model.hidePulse ? 1.015 : 1.0)
+        .animation(.easeInOut(duration: 0.2), value: model.hidePulse)
         .onAppear {
             Task { await model.refreshHealth() }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
                 focused = true
             }
             onInteract()
+            logsExpanded = !hasAnswer
+        }
+        .onChange(of: model.lastQuestion) { _ in
+            if model.busy || !hasAnswer {
+                logsExpanded = true
+            }
+        }
+        .onChange(of: autoHideSeconds) { _ in
+            onInteract()
+        }
+    }
+
+    private var borderColor: Color {
+        if model.hideUrgency {
+            return Color.orange.opacity(model.hidePulse ? 0.95 : 0.4)
+        }
+        return Color.white.opacity(0.12)
+    }
+
+    private var header: some View {
+        HStack(spacing: 8) {
+            logoImage
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 28, height: 28)
+                .clipShape(Circle())
+            Text("MacAgent")
+                .font(.system(size: 13, weight: .semibold, design: .rounded))
+                .foregroundStyle(.secondary)
+            Spacer()
+            Text("⌃⌥Space")
+                .font(.caption2.monospaced())
+                .foregroundStyle(.tertiary)
+            Button(action: onPrefs) {
+                Image(systemName: "gearshape")
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help("Preferences")
+            Button(action: onDismiss) {
+                Image(systemName: "xmark")
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help("Hide overlay")
+            .keyboardShortcut(.escape, modifiers: [])
+            Button(action: onQuit) {
+                Image(systemName: "power")
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help("Quit MacAgent")
+        }
+    }
+
+    private var inputBar: some View {
+        HStack(spacing: 8) {
+            TextField("Ask or tell MacAgent…", text: $draft)
+                .textFieldStyle(.plain)
+                .font(.system(size: 18, weight: .medium))
+                .focused($focused)
+                .onSubmit { send() }
+                .onChange(of: draft) { _ in onInteract() }
+            Button("Send") { send() }
+                .buttonStyle(.borderedProminent)
+                .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.busy)
+        }
+        .padding(12)
+        .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+        .contentShape(Rectangle())
+        .onTapGesture {
+            focused = true
+            onInteract()
+        }
+    }
+
+    private var footer: some View {
+        HStack(spacing: 8) {
+            Circle()
+                .fill(model.daemonOnline ? Color.green : Color.orange)
+                .frame(width: 7, height: 7)
+            Text(model.daemonOnline ? "Daemon ready" : "Starting daemon…")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+            Spacer()
+            if autoHideSeconds > 0, let left = model.hideCountdown {
+                HStack(spacing: 6) {
+                    if model.hideUrgency {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                            .opacity(model.hidePulse ? 1 : 0.35)
+                    }
+                    Text(countdownLabel)
+                        .font(.system(size: 11, weight: model.hideUrgency ? .bold : .medium, design: .rounded))
+                        .monospacedDigit()
+                        .foregroundStyle(model.hideUrgency ? Color.orange : Color.secondary)
+                    // Tiny progress bar for remaining idle time.
+                    Capsule()
+                        .fill(Color.white.opacity(0.12))
+                        .frame(width: 44, height: 4)
+                        .overlay(alignment: .leading) {
+                            Capsule()
+                                .fill(model.hideUrgency ? Color.orange : Color.accentColor.opacity(0.8))
+                                .frame(
+                                    width: max(4, 44 * CGFloat(left) / CGFloat(max(autoHideSeconds, 1))),
+                                    height: 4
+                                )
+                        }
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(
+                    Capsule()
+                        .fill(model.hideUrgency ? Color.orange.opacity(0.18) : Color.white.opacity(0.06))
+                )
+            } else if autoHideSeconds == 0 {
+                Text("Auto-hide off")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+            Text("Voice: FreeFlow → :8081")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
         }
     }
 
@@ -192,6 +363,7 @@ struct OverlayView: View {
         let q = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { return }
         draft = ""
+        logsExpanded = true
         onInteract()
         Task { await model.ask(q) }
     }

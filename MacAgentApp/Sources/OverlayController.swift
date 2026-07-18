@@ -11,10 +11,11 @@ final class KeyablePanel: NSPanel {
 final class OverlayController {
     private var panel: KeyablePanel?
     private let model: AgentModel
-    private var hideWork: DispatchWorkItem?
-    /// True while pointer is over the overlay or user is actively using it.
-    private var pointerInside = false
-    private var tracking: NSTrackingArea?
+    /// Absolute time when the overlay should hide (nil = not counting).
+    private var hideDeadline: Date?
+    private var tickTimer: Timer?
+    private var resignObserver: NSObjectProtocol?
+    private var activateObserver: NSObjectProtocol?
 
     init(model: AgentModel) {
         self.model = model
@@ -22,7 +23,7 @@ final class OverlayController {
             self?.show()
         }
         model.onUserActivity = { [weak self] in
-            self?.scheduleAutoHide()
+            self?.bumpIdleTimer()
         }
     }
 
@@ -44,54 +45,119 @@ final class OverlayController {
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
         panel.orderFrontRegardless()
-        scheduleAutoHide()
+        bumpIdleTimer()
     }
 
     func hide() {
-        hideWork?.cancel()
-        hideWork = nil
+        stopIdleTimer()
+        clearCountdownUI()
         panel?.orderOut(nil)
     }
 
-    /// Restart the disappear timer from Preferences (Never = 0).
-    func scheduleAutoHide() {
-        hideWork?.cancel()
-        hideWork = nil
+    /// Full reset after real activity (type, send, answer, prefs change).
+    func bumpIdleTimer() {
         let seconds = OverlayAutoHide.seconds
-        guard seconds > 0 else { return }
-
-        let work = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            if self.shouldDeferHide() {
-                // Still engaged — wait another full interval.
-                self.scheduleAutoHide()
-                return
-            }
-            self.hide()
+        guard seconds > 0 else {
+            stopIdleTimer()
+            clearCountdownUI()
+            return
         }
-        hideWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(seconds), execute: work)
+        hideDeadline = Date().addingTimeInterval(TimeInterval(seconds))
+        model.hideCountdown = seconds
+        model.hideUrgency = false
+        model.hidePulse = false
+        startTickTimer()
     }
 
-    /// Don't auto-hide while busy, focused, hovering, or selecting text.
-    private func shouldDeferHide() -> Bool {
-        if model.busy { return true }
-        if pointerInside { return true }
-        guard let panel, panel.isVisible else { return false }
-        if panel.isKeyWindow { return true }
-        // Mouse still over the panel frame (tracking area can miss some cases).
-        let mouse = NSEvent.mouseLocation
-        if panel.frame.contains(mouse) {
-            pointerInside = true
-            return true
+    private func clearCountdownUI() {
+        model.hideCountdown = nil
+        model.hideUrgency = false
+        model.hidePulse = false
+    }
+
+    private func stopIdleTimer() {
+        tickTimer?.invalidate()
+        tickTimer = nil
+        hideDeadline = nil
+    }
+
+    private func startTickTimer() {
+        tickTimer?.invalidate()
+        let timer = Timer(timeInterval: 0.2, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.tickIdle()
+            }
         }
-        return false
+        RunLoop.main.add(timer, forMode: .common)
+        tickTimer = timer
+    }
+
+    private func tickIdle() {
+        guard let panel, panel.isVisible else {
+            stopIdleTimer()
+            clearCountdownUI()
+            return
+        }
+
+        let configured = OverlayAutoHide.seconds
+        guard configured > 0 else {
+            stopIdleTimer()
+            clearCountdownUI()
+            return
+        }
+
+        // Always re-sample mouse — enter/exit events are unreliable on borderless panels.
+        let mouseOver = panel.frame.contains(NSEvent.mouseLocation)
+        let paused = model.busy || model.pendingConfirm != nil || mouseOver
+
+        if hideDeadline == nil {
+            // Out of focus / mouse left while we had no deadline — start fresh.
+            hideDeadline = Date().addingTimeInterval(TimeInterval(configured))
+        }
+
+        guard let deadline = hideDeadline else { return }
+
+        if paused {
+            // Freeze remaining time (do not heartbeat while paused).
+            let remaining = max(1, Int(ceil(deadline.timeIntervalSinceNow)))
+            hideDeadline = Date().addingTimeInterval(TimeInterval(remaining))
+            model.hideCountdown = remaining
+            model.hideUrgency = false
+            model.hidePulse = false
+            return
+        }
+
+        let left = max(0, Int(ceil(deadline.timeIntervalSinceNow)))
+        model.hideCountdown = left
+
+        // Heartbeat ONLY in the final 3 seconds.
+        if left > 0 && left <= 3 {
+            model.hideUrgency = true
+            // ~2Hz pulse from wall clock — no sticky forever animation.
+            model.hidePulse = Int(Date().timeIntervalSince1970 * 2.2) % 2 == 0
+        } else {
+            model.hideUrgency = false
+            model.hidePulse = false
+        }
+
+        if left <= 0 {
+            hide()
+        }
     }
 
     private func setupPanel() {
+        let saved = UserDefaults.standard.string(forKey: "overlayFrame")
+        var rect = NSRect(x: 0, y: 0, width: 560, height: 480)
+        if let saved {
+            let r = NSRectFromString(saved)
+            if r.width > 100, r.height > 100 {
+                rect = r
+            }
+        }
+
         let panel = KeyablePanel(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 480),
-            styleMask: [.borderless, .fullSizeContentView],
+            contentRect: rect,
+            styleMask: [.borderless, .fullSizeContentView, .resizable],
             backing: .buffered,
             defer: false
         )
@@ -105,6 +171,9 @@ final class OverlayController {
         panel.isMovableByWindowBackground = true
         panel.becomesKeyOnlyIfNeeded = false
         panel.acceptsMouseMovedEvents = true
+        panel.minSize = NSSize(width: 420, height: 300)
+        panel.maxSize = NSSize(width: 1200, height: 900)
+        panel.setContentSize(rect.size)
 
         let root = OverlayView(
             model: model,
@@ -116,69 +185,65 @@ final class OverlayController {
                 AppDelegate.shared?.quitApp()
             },
             onInteract: { [weak self] in
-                self?.pointerInside = true
-                self?.scheduleAutoHide()
+                self?.bumpIdleTimer()
             }
         )
-        let host = TrackingHostingView(rootView: root)
-        host.frame = NSRect(x: 0, y: 0, width: 560, height: 480)
-        host.onPointerInside = { [weak self] inside in
-            Task { @MainActor in
-                self?.pointerInside = inside
-                if inside {
-                    self?.scheduleAutoHide()
-                }
-            }
-        }
+        let host = NSHostingView(rootView: root)
+        host.frame = NSRect(origin: .zero, size: rect.size)
+        host.autoresizingMask = [.width, .height]
         panel.contentView = host
         self.panel = panel
+
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.didResizeNotification,
+            object: panel,
+            queue: .main
+        ) { [weak panel] _ in
+            guard let panel else { return }
+            UserDefaults.standard.set(NSStringFromRect(panel.frame), forKey: "overlayFrame")
+        }
+
+        // Clicking away (lose key) → resume idle countdown immediately.
+        resignObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didResignKeyNotification,
+            object: panel,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.tickIdle()
+            }
+        }
+        activateObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didResignActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.tickIdle()
+            }
+        }
     }
 
     private func position(_ panel: NSPanel) {
+        if let saved = UserDefaults.standard.string(forKey: "overlayFrame") {
+            var frame = NSRectFromString(saved)
+            if frame.width >= 100, frame.height >= 100,
+               let screen = NSScreen.main {
+                let vis = screen.visibleFrame
+                frame.size.width = min(max(frame.width, 420), vis.width)
+                frame.size.height = min(max(frame.height, 300), vis.height)
+                frame.origin.x = min(max(frame.origin.x, vis.minX), vis.maxX - frame.width)
+                frame.origin.y = min(max(frame.origin.y, vis.minY), vis.maxY - frame.height)
+                panel.setFrame(frame, display: false)
+                UserDefaults.standard.set(NSStringFromRect(frame), forKey: "overlayFrame")
+            }
+            return
+        }
         guard let screen = NSScreen.main else { return }
         let frame = screen.visibleFrame
         let size = panel.frame.size
         let x = frame.midX - size.width / 2
         let y = frame.midY - size.height / 2 + 40
         panel.setFrameOrigin(NSPoint(x: x, y: y))
-    }
-}
-
-/// Reports mouse enter/exit so auto-hide pauses while the cursor is over the overlay.
-final class TrackingHostingView<Content: View>: NSHostingView<Content> {
-    var onPointerInside: ((Bool) -> Void)?
-    private var area: NSTrackingArea?
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let area {
-            removeTrackingArea(area)
-        }
-        let options: NSTrackingArea.Options = [
-            .mouseEnteredAndExited,
-            .mouseMoved,
-            .activeAlways,
-            .inVisibleRect,
-        ]
-        let tracking = NSTrackingArea(rect: bounds, options: options, owner: self, userInfo: nil)
-        addTrackingArea(tracking)
-        area = tracking
-    }
-
-    override func mouseEntered(with event: NSEvent) {
-        onPointerInside?(true)
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        onPointerInside?(false)
-    }
-
-    override func mouseMoved(with event: NSEvent) {
-        onPointerInside?(true)
-    }
-
-    override func scrollWheel(with event: NSEvent) {
-        onPointerInside?(true)
-        super.scrollWheel(with: event)
     }
 }

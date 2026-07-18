@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -14,6 +15,7 @@ from memory.user_context import (
     save_user_notes,
 )
 from tools.duckduckgo import build_grounded_context
+from tools.run_bash import run_bash
 from tools.run_code import run_python
 
 logger = logging.getLogger(__name__)
@@ -47,17 +49,24 @@ _SYSTEM_SETTINGS_PANES: dict[str, str] = {
 
 TOOL_CATALOG = """
 Available tools (reply with ONE JSON object: {"tool":"...","args":{...}}):
-- find_files: {"query":"invoice pdf","limit":10} — Spotlight search under user home
-- get_user_context: {} — read MacAgent user notes / runtime context
-- update_user_context: {"notes":"..."} — replace user notes (facts/preferences)
-- list_apps: {} — list known app aliases
-- open_app: {"name":"Safari"} — launch a native app or alias
-- list_sites: {} — list purpose sites
-- open_url: {"url":"https://..."} — open URL in Chrome (only when user wants to open)
-- web_search: {"query":"..."} — DuckDuckGo search + page extract; does NOT open browser
-- open_system_settings: {"pane":"wifi|bluetooth|accessibility|..."} — open a Settings pane
-- run_python: {"code":"print(2+4)"} — write & run short Python; use for math, transforms, quick scripts
+- run_bash: {"command":"ls -lt ~/Downloads | head -15"} — preferred for files, folders, downloads, open paths, system queries. Write a real bash command; stdout is shown to the user.
+  Destructive commands (rm, empty Trash) pause for user Approve/Deny in the UI.
+  Empty Trash/Bin: osascript -e 'tell application "Finder" to empty the trash' — NEVER rm /bin
+- run_python: {"code":"print(2+4)"} — math / short scripts that print a result
+- get_user_context: {} — read MacAgent user notes
+- update_user_context: {"notes":"..."} — replace user notes
+- list_apps: {} / open_app: {"name":"Safari"} — app aliases (apps only, not folders)
+- list_sites: {} / open_url: {"url":"https://..."} — sites
+- web_search: {"query":"..."} — DuckDuckGo grounded Q&A (no auto-open)
+- open_system_settings: {"pane":"wifi|bluetooth|..."} — Settings panes only
+- find_files: {"query":"..."} — optional Spotlight helper (prefer run_bash)
+- open_folder: {"query":"..."} — optional Finder helper (prefer: open \"~/path\")
 - respond: {"text":"..."} — final user-visible answer (always end with this)
+Examples for run_bash:
+- recent downloads: ls -lt ~/Downloads | head -20
+- open a folder: open ~/Downloads
+- find a folder by name: mdfind -onlyin ~ 'kind:folder comp3370' | head -5
+- open newest download: open \"$(ls -t ~/Downloads/* 2>/dev/null | head -1)\"
 """.strip()
 
 
@@ -67,6 +76,7 @@ class ToolRegistry:
         self.router = router
         self._handlers: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
             "find_files": self._find_files,
+            "open_folder": self._open_folder,
             "get_user_context": self._get_user_context,
             "update_user_context": self._update_user_context,
             "list_apps": self._list_apps,
@@ -76,6 +86,7 @@ class ToolRegistry:
             "web_search": self._web_search,
             "open_system_settings": self._open_system_settings,
             "run_python": self._run_python,
+            "run_bash": self._run_bash,
             "respond": self._respond,
         }
 
@@ -104,10 +115,156 @@ class ToolRegistry:
         if not query:
             return {"ok": False, "error": "query required"}
         limit = min(int(args.get("limit") or 10), _MAX_FIND)
+
+        # "recently downloaded" / Downloads folder — sort by newest first.
+        if self._is_recent_downloads_query(query):
+            items = self._list_recent_downloads(limit=limit)
+            return {
+                "ok": True,
+                "count": len(items),
+                "paths": [i["path"] for i in items],
+                "items": items,
+                "scope": "Downloads",
+            }
+
         paths = self._mdfind(query, limit=limit)
         if not paths:
             paths = self._fallback_find(query, limit=limit)
         return {"ok": True, "count": len(paths), "paths": paths}
+
+    @staticmethod
+    def _is_recent_downloads_query(query: str) -> bool:
+        q = (query or "").lower()
+        return bool(
+            re.search(
+                r"(recent(ly)?\s+download|download(ed|s)?\s+(item|file|folder)?|"
+                r"last\s+download|newest\s+download|in\s+downloads|"
+                r"^downloads?\b)",
+                q,
+            )
+        )
+
+    def _list_recent_downloads(self, limit: int = 10) -> list[dict[str, Any]]:
+        downloads = _HOME / "Downloads"
+        if not downloads.is_dir():
+            return []
+        entries: list[tuple[float, Path]] = []
+        try:
+            for p in downloads.iterdir():
+                name = p.name
+                if name.startswith("."):
+                    continue
+                try:
+                    st = p.stat()
+                except OSError:
+                    continue
+                # Prefer birth/creation time when available, else mtime.
+                ts = getattr(st, "st_birthtime", None) or st.st_mtime
+                entries.append((float(ts), p))
+        except OSError:
+            return []
+        entries.sort(key=lambda t: t[0], reverse=True)
+        out: list[dict[str, Any]] = []
+        for ts, p in entries[:limit]:
+            kind = "folder" if p.is_dir() else "file"
+            out.append(
+                {
+                    "path": str(p),
+                    "name": p.name,
+                    "kind": kind,
+                    "modified": ts,
+                }
+            )
+        return out
+
+    def _open_folder(self, args: dict[str, Any]) -> dict[str, Any]:
+        query = str(
+            args.get("query") or args.get("name") or args.get("path") or ""
+        ).strip()
+        if not query:
+            return {"ok": False, "error": "query required"}
+
+        direct = Path(query).expanduser()
+        if direct.is_dir():
+            subprocess.run(["open", str(direct)], check=False)
+            return {
+                "ok": True,
+                "path": str(direct),
+                "message": f"Opened folder {direct}",
+            }
+
+        folders = self._mdfind_folders(query, limit=8)
+        if not folders:
+            folders = self._fallback_find_dirs(query, limit=8)
+        if not folders:
+            return {"ok": False, "error": f"no folder matching {query!r}", "paths": []}
+
+        exact = [p for p in folders if Path(p).name.lower() == query.lower()]
+        chosen = sorted(exact or folders, key=lambda p: (len(p), p.lower()))[0]
+        subprocess.run(["open", chosen], check=False)
+        return {
+            "ok": True,
+            "path": chosen,
+            "message": f"Opened folder {chosen}",
+            "candidates": folders[:5],
+        }
+
+    def _mdfind_folders(self, query: str, limit: int) -> list[str]:
+        safe = query.replace('"', "")
+        spotlight = f"kind:folder {safe}"
+        cmd = ["mdfind", "-onlyin", str(_HOME), spotlight]
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=12, check=False
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            logger.warning("mdfind folders failed: %s", exc)
+            return []
+        out: list[str] = []
+        for ln in (proc.stdout or "").splitlines():
+            p = ln.strip()
+            if not p or not Path(p).is_dir():
+                continue
+            lower = p.lower()
+            if "/library/caches/" in lower or "/.trash/" in lower:
+                continue
+            out.append(p)
+            if len(out) >= limit:
+                break
+        return out
+
+    def _fallback_find_dirs(self, query: str, limit: int) -> list[str]:
+        safe = "".join(c for c in query if c.isalnum() or c in " ._-+")[:80].strip()
+        if not safe:
+            return []
+        cmd = [
+            "find",
+            str(_HOME),
+            "-maxdepth",
+            "6",
+            "-iname",
+            f"*{safe}*",
+            "-type",
+            "d",
+        ]
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=12, check=False
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return []
+        paths: list[str] = []
+        for ln in (proc.stdout or "").splitlines():
+            p = ln.strip()
+            if not p:
+                continue
+            lower = p.lower()
+            if "/library/" in lower or "/.git/" in lower or "/node_modules/" in lower:
+                continue
+            paths.append(p)
+            if len(paths) >= limit:
+                break
+        return paths
 
     def _mdfind(self, query: str, limit: int) -> list[str]:
         # Prefer Spotlight scoped to home.
@@ -273,6 +430,11 @@ class ToolRegistry:
     def _run_python(self, args: dict[str, Any]) -> dict[str, Any]:
         code = str(args.get("code") or args.get("source") or args.get("script") or "")
         return run_python(code)
+
+    def _run_bash(self, args: dict[str, Any]) -> dict[str, Any]:
+        cmd = str(args.get("command") or args.get("cmd") or args.get("bash") or "")
+        confirmed = bool(args.get("confirmed") or args.get("approved"))
+        return run_bash(cmd, confirmed=confirmed)
 
     def _respond(self, args: dict[str, Any]) -> dict[str, Any]:
         text = str(args.get("text") or args.get("message") or "").strip()

@@ -375,6 +375,56 @@ class LocalIntentParser:
             trace_step("answer_from_search_error", error=str(exc))
             return fallback
 
+    def answer_from_command(
+        self, utterance: str, command: str, stdout: str
+    ) -> str:
+        """Turn raw shell/python stdout into a user-facing answer for the question."""
+        fallback = (stdout or "").strip()[:2500] or "Done."
+        try:
+            self._ensure_loaded()
+        except (FileNotFoundError, RuntimeError) as exc:
+            logger.warning("Command answer skipped: %s", exc)
+            return fallback
+
+        system_prompt = (
+            "You are MacAgent. The user asked a question; a shell/python command already ran. "
+            "Rewrite the command output into a clear answer for THAT question. "
+            "Rules: do not dump raw ls columns (permissions, owner, size numbers) unless asked; "
+            "for file lists, use a short numbered list of names with dates when useful; "
+            "do not invent files that are not in the output; keep it concise (under ~12 lines)."
+        )
+        out = (stdout or "")[:4500]
+        user_prompt = (
+            f"User question: {utterance}\n\n"
+            f"Command: {command}\n\n"
+            f"Command output:\n{out}\n\n"
+            "Formatted answer:"
+        )
+        prompt = (
+            f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+            f"<|im_start|>user\n{user_prompt}<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
+        assert self._llm is not None
+        try:
+            response = self._llm(
+                prompt,
+                max_tokens=280,
+                temperature=0.1,
+                stop=["<|im_end|>", "<|im_start|>"],
+            )
+            text = (response["choices"][0]["text"] or "").strip()
+            trace_step(
+                "answer_from_command",
+                user=utterance,
+                command=command[:300],
+                raw_output=text[:1000],
+            )
+            return text or fallback
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("answer_from_command failed: %s", exc)
+            return fallback
+
     def plan_tool_call(
         self,
         utterance: str,
@@ -415,11 +465,14 @@ class LocalIntentParser:
             "Reply with ONLY a JSON object: {\"tool\":\"name\",\"args\":{...}}. "
             "No markdown. No explanation. "
             "After tools have enough info, finish with tool=respond. "
-            "Use run_python for math, calculations, data transforms, or short scripts "
-            "(put complete Python in args.code; it must print the answer). "
+            "Prefer run_bash for files, folders, downloads, listing, opening paths, "
+            "and local shell tasks — put a real bash command in args.command "
+            "(examples: ls -lt ~/Downloads | head -20; open ~/Downloads; "
+            "mdfind -onlyin ~ 'kind:folder name:comp3370' | head -5). "
+            "Use run_python for math or short Python scripts (args.code must print). "
+            "Use open_app only for real macOS apps (Safari, Slack), never for folders. "
             "Use web_search for factual/live questions (do not open_url unless asked). "
-            "Use find_files for locating files. "
-            "Use open_app / open_url / open_system_settings only when the user wants something opened."
+            "Use open_url / open_system_settings only when the user wants something opened."
         )
         user_prompt = (
             f"CONTEXT:\n{runtime}\n\n"
@@ -491,6 +544,55 @@ class LocalIntentParser:
             return text or fallback
         except Exception as exc:  # noqa: BLE001
             logger.warning("generate_python failed: %s", exc)
+            return fallback
+
+    def generate_bash(self, utterance: str) -> str:
+        """Write a short bash command for a local macOS file/shell task."""
+        fallback = "ls -lt ~/Downloads | head -20"
+        try:
+            self._ensure_loaded()
+        except (FileNotFoundError, RuntimeError) as exc:
+            logger.warning("generate_bash skipped: %s", exc)
+            return fallback
+
+        system_prompt = (
+            "You write ONE short bash command for macOS (zsh/bash). "
+            "Reply with ONLY the command — no markdown, no explanation, no leading $. "
+            "Prefer: ls, find, mdfind, open, head, sort, stat, du, pwd, echo. "
+            "Home is ~. Print useful stdout. Do not use sudo, rm -rf /, curl|sh, or disk erase. "
+            "To empty the macOS Trash/Bin use: "
+            "osascript -e 'tell application \"Finder\" to empty the trash' "
+            "— never rm /bin or touch system paths."
+        )
+        user_prompt = (
+            f"Write one bash command that accomplishes this and prints useful output:\n"
+            f"{utterance}"
+        )
+        prompt = (
+            f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+            f"<|im_start|>user\n{user_prompt}<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
+        assert self._llm is not None
+        try:
+            response = self._llm(
+                prompt,
+                max_tokens=160,
+                temperature=0.1,
+                stop=["<|im_end|>", "<|im_start|>", "\n\n"],
+            )
+            text = (response["choices"][0]["text"] or "").strip()
+            text = _strip_code_fences(text)
+            # Take first non-empty line; strip prompt junk.
+            for line in text.splitlines():
+                line = line.strip().lstrip("$").strip()
+                if line and not line.lower().startswith("bash"):
+                    text = line
+                    break
+            trace_step("generate_bash", user=utterance, raw_output=text[:1000])
+            return text or fallback
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("generate_bash failed: %s", exc)
             return fallback
 
 

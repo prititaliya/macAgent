@@ -20,7 +20,9 @@ from memory.user_context import context_payload, save_user_notes
 from planner.router import CoreRouter
 from tools.agent_loop import AgentLoop
 from tools.duckduckgo import build_grounded_context
+from tools.pending_actions import take_pending
 from tools.registry import ToolRegistry
+from tools.run_bash import run_bash
 
 logging.basicConfig(
     level=logging.INFO,
@@ -257,6 +259,11 @@ class AskBody(BaseModel):
     text: str = Field(..., min_length=1)
 
 
+class ConfirmBody(BaseModel):
+    id: str = Field(..., min_length=1)
+    approve: bool = False
+
+
 class ContextBody(BaseModel):
     notes: str = ""
 
@@ -280,6 +287,66 @@ async def ask_typed(body: AskBody) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="empty text")
     accepted = await _dispatch_spoken(spoken)
     return {"ok": accepted, "utterance": spoken}
+
+
+@app.post("/v1/confirm")
+async def confirm_action(body: ConfirmBody) -> dict[str, Any]:
+    """Approve or deny a destructive action (empty Trash, rm, etc.)."""
+    pending = take_pending(body.id)
+    if not pending:
+        raise HTTPException(status_code=404, detail="pending action not found or expired")
+
+    utterance = str(pending.get("utterance") or "")
+    summary = str(pending.get("summary") or "")
+    command = str(pending.get("command") or "")
+
+    if not body.approve:
+        event_bus.publish(
+            utterance=utterance,
+            kind="answer",
+            text="Cancelled — nothing was deleted.",
+            detail="confirm_denied",
+            step="confirm",
+            tool_input={"id": body.id, "approve": False},
+        )
+        get_memory().log_activity(utterance, "confirm", "denied", summary[:300])
+        return {"ok": True, "approved": False, "id": body.id}
+
+    event_bus.publish(
+        utterance=utterance,
+        kind="action",
+        text="Approved — running…",
+        detail="pending",
+        step="confirm",
+    )
+    result = run_bash(command, confirmed=True)
+    if result.get("ok"):
+        msg = (result.get("stdout") or "").strip() or "Done."
+        if "empty the trash" in command.lower():
+            msg = "Trash emptied."
+        event_bus.publish(
+            utterance=utterance,
+            kind="answer",
+            text=msg,
+            detail="confirm_approved",
+            step="confirm",
+            tool="run_bash",
+            tool_input={"id": body.id, "command": command},
+            tool_output=result,
+        )
+        get_memory().log_activity(utterance, "confirm", "approved", msg[:300])
+        return {"ok": True, "approved": True, "id": body.id, "result": result}
+
+    err = result.get("error") or result.get("stderr") or "command failed"
+    event_bus.publish(
+        utterance=utterance,
+        kind="answer",
+        text=f"Could not complete that: {err}",
+        detail="confirm_failed",
+        step="confirm",
+        tool_output=result,
+    )
+    return {"ok": False, "approved": True, "id": body.id, "error": err}
 
 
 @app.post("/v1/history/harvest")
@@ -543,6 +610,13 @@ def _handle_spoken_inner(spoken: str) -> None:
     trace_step("route", decision="agent_loop")
     logger.info("Agent loop for %r", text)
     result = get_agent().run(text)
+    if result.get("action") == "confirm":
+        logger.info(
+            "Waiting for user confirm id=%s cmd=%r",
+            result.get("pending_id"),
+            (result.get("command") or "")[:120],
+        )
+        return
     logger.info(
         "Agent finished steps=%s answer_chars=%s",
         result.get("steps"),
