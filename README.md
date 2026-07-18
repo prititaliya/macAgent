@@ -1,22 +1,38 @@
 # MacAgent
 
-One native **SwiftUI desktop app** for voice-driven macOS help on 8GB Apple Silicon.
+Transparent **overlay agent** for macOS (8GB Apple Silicon): summon it over whatever you are doing, type or speak, and it uses **tools** (files, notes, apps, sites, web, System Settings panes).
 
-- **Live** — you speak (FreeFlow Fn) → local Qwen classifies → answer in the app, or open an app/site
-- **History** — activity log (you said → result)
-- **Sites** — purpose-tagged URLs (“watch football” → your ESPN URL)
-- **Status** — daemon + model health
+## Primary UI (Xcode)
 
-Opening the app starts the local FastAPI daemon (`:8081`) if it is not already running. Quitting stops a daemon the app started.
+Open and run the Xcode app:
+
+```bash
+open /Users/jatin/Projects/MacAgent/MacAgentApp/MacAgent.xcodeproj
+```
+
+Or from the terminal:
+
+```bash
+./automation/open_macagent.sh
+```
+
+- **⌃⌥Space** — show/hide the floating overlay (grant **Accessibility** when prompted)
+- Menu bar icon — Show Agent / Preferences / Quit
+- **Preferences** — Sites, Apps, Settings notes, Debug, History (secondary; not the main experience)
+- Overlay talks to the Python daemon via `POST /v1/ask` + SSE `/v1/events`
+- Voice still uses **FreeFlow** → `http://127.0.0.1:8081/v1`
+
+App Sandbox is **off** so the agent can spawn the daemon, search files (Spotlight), and open apps/URLs.
 
 ## Requirements
 
 - macOS 13+ Apple Silicon
-- Python 3.10+
-- Xcode Command Line Tools (`swiftc`)
+- Xcode (or XcodeGen + `xcodebuild`)
+- Python 3.10+ + project `venv`
 - [FreeFlow](https://github.com/zachlatta/freeflow) for speech-to-text
 - Qwen2.5-1.5B-Instruct Q4_K_M GGUF (default `~/Models/qwen2.5-1.5b-instruct-q4_k_m.gguf`)
-- Google Chrome (for site opens + optional login fill)
+- Google Chrome (for site opens)
+- **Full Disk / Spotlight** access helps `find_files` (mdfind)
 
 ## Boot (once)
 
@@ -25,25 +41,19 @@ cd /Users/jatin/Projects/MacAgent
 python3 -m venv venv && source venv/bin/activate
 CMAKE_ARGS="-DGGML_METAL=on -DCMAKE_OSX_ARCHITECTURES=arm64" ARCHFLAGS="-arch arm64" \
   pip install -r requirements.txt
-chmod +x automation/*.sh MacAgent/build.sh
-./MacAgent/build.sh
 ```
 
-## Open the app
+Regenerate the Xcode project after `project.yml` changes (optional):
 
 ```bash
-./automation/open_macagent.sh
+cd MacAgentApp && xcodegen generate
 ```
-
-Or open `MacAgent/build/MacAgent.app` from Finder.
-
-**Hotkey (optional):** Shortcuts → Run Shell Script → `/Users/jatin/Projects/MacAgent/automation/open_macagent.sh`
 
 ## FreeFlow wiring
 
 1. Transcription: Groq (or other STT) as usual.
 2. Post-processing / LLM API base: `http://127.0.0.1:8081/v1`
-3. Keep MacAgent open while you dictate (daemon stays up with the app).
+3. Keep MacAgent running while you dictate (daemon stays up with the app).
 
 ```bash
 defaults write com.zachlatta.freeflow post_processing_timeout_seconds -float 120
@@ -51,15 +61,24 @@ defaults write com.zachlatta.freeflow post_processing_timeout_seconds -float 120
 
 ## How it works
 
-1. FreeFlow sends the transcript to the local daemon.
-2. Intent: `answer` | `browse` | `open_app` | `open_site` | `search_fallback` (local model + heuristics).
-3. Questions → short local answer → Live panel + History.
-4. Questions / live info → DuckDuckGo search → **read page text** → local grounded answer in Live, with **Sources** links (Chrome is not opened automatically).
-5. Orders (`open …`) → aliases / purpose sites / history → Live + History.
+1. Overlay or FreeFlow sends text to the local FastAPI daemon (`:8081`).
+2. **Agent tool loop** (capped ~4 steps) — model emits structured tool calls:
+   - `find_files` — Spotlight / limited home search
+   - `get_user_context` / `update_user_context` — Settings notes
+   - `list_apps` / `open_app` / `list_sites` / `open_url`
+   - `web_search` — DuckDuckGo grounded Q&A (**no auto-open** unless `open_url`)
+   - `run_python` — write & run short Python (math, scripts; blocked network/system APIs)
+   - `open_system_settings` — whitelisted panes only
+   - `respond` — final answer shown in the overlay
+3. Debug traces log each tool call under Preferences → Debug.
 
-Not a ChatGPT clone — each utterance is answer-or-act for your Mac.
+Not a ChatGPT clone — each utterance is tool-use-or-answer for your Mac.
 
-DuckDuckGo access is keyless and best-effort (unofficial library; may rate-limit). There is no official unlimited DDG API key product; this uses their public search HTML/API endpoints through `ddgs`.
+DuckDuckGo access is keyless and best-effort (`ddgs`).
+
+## Deprecated: `MacAgent/build.sh`
+
+The older `swiftc` / `MacAgent/build.sh` Dock multi-tab app is **deprecated**. Prefer `MacAgentApp/` (Xcode). The `MacAgent/` folder remains as reference only.
 
 ## Optional: LaunchAgent
 
@@ -75,6 +94,7 @@ If you want the daemon without the app UI, `./automation/install_launch_agent.sh
 
 ```bash
 curl -s http://127.0.0.1:8081/health
+curl -s -X POST http://127.0.0.1:8081/v1/ask -H 'Content-Type: application/json' -d '{"text":"open wifi settings"}'
 curl -s http://127.0.0.1:8081/v1/activity?limit=20
 curl -N http://127.0.0.1:8081/v1/events
 ```

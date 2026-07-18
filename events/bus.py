@@ -23,6 +23,11 @@ class EventBus:
         kind: str,
         text: str,
         detail: str = "",
+        sources: Optional[List[Any]] = None,
+        step: Optional[str] = None,
+        tool: Optional[str] = None,
+        tool_input: Any = None,
+        tool_output: Any = None,
     ) -> Dict[str, Any]:
         event: Dict[str, Any] = {
             "id": next(self._ids),
@@ -32,6 +37,16 @@ class EventBus:
             "text": text or "",
             "detail": detail or "",
         }
+        if sources:
+            event["sources"] = sources
+        if step:
+            event["step"] = step
+        if tool:
+            event["tool"] = tool
+        if tool_input is not None:
+            event["tool_input"] = tool_input
+        if tool_output is not None:
+            event["tool_output"] = tool_output
         self._buffer.append(event)
         dead: List[asyncio.Queue] = []
         for queue in self._subscribers:

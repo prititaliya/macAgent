@@ -18,7 +18,9 @@ from memory.history_harvest import harvest_chrome_history
 from memory.sqlite import ContextMemory
 from memory.user_context import context_payload, save_user_notes
 from planner.router import CoreRouter
+from tools.agent_loop import AgentLoop
 from tools.duckduckgo import build_grounded_context
+from tools.registry import ToolRegistry
 
 logging.basicConfig(
     level=logging.INFO,
@@ -58,6 +60,7 @@ app = FastAPI(title="MacAgent", version="0.4.0")
 _parser: Optional[LocalIntentParser] = None
 _router: Optional[CoreRouter] = None
 _memory: Optional[ContextMemory] = None
+_agent: Optional[AgentLoop] = None
 
 
 def get_parser() -> LocalIntentParser:
@@ -79,6 +82,14 @@ def get_memory() -> ContextMemory:
     if _memory is None:
         _memory = ContextMemory()
     return _memory
+
+
+def get_agent() -> AgentLoop:
+    global _agent
+    if _agent is None:
+        registry = ToolRegistry(memory=get_memory(), router=get_router())
+        _agent = AgentLoop(parser=get_parser(), registry=registry)
+    return _agent
 
 
 def _looks_like_question(text: str) -> bool:
@@ -429,10 +440,34 @@ _REFUSAL_RE = re.compile(
 _LOCAL_ONLY_RE = re.compile(
     r"(?i)^\s*("
     r"hi|hello|hey|thanks|thank you|who are you|what can you do|"
-    r"what('?s| is) \d[\d\s\+\-\*\/x]+\d\s*\??|"
-    r"\d+\s*[\+\-\*\/x]\s*\d+"
+    # Math / arithmetic (spoken variants: "whats the 2+4", "what is 2 + 4")
+    r"(what('?s|s|\s+is)(\s+the)?\s+)?\d[\d\s\+\-\*\/x×÷]+\d\s*\??|"
+    r"\d+\s*[\+\-\*\/x×÷]\s*\d+\s*\??"
     r")\s*$"
 )
+
+_MATH_EXPR_RE = re.compile(
+    r"(?i)(\d+)\s*([\+\-\*\/x×÷])\s*(\d+)"
+)
+
+
+def _try_local_math(text: str) -> Optional[str]:
+    """Answer simple a±b / a×b / a÷b questions without tools."""
+    m = _MATH_EXPR_RE.search(text or "")
+    if not m:
+        return None
+    a, op, b = int(m.group(1)), m.group(2), int(m.group(3))
+    if op in {"x", "X", "×", "*"}:
+        return str(a * b)
+    if op in {"÷", "/"}:
+        if b == 0:
+            return "undefined (division by zero)"
+        return str(a / b if a % b else a // b)
+    if op == "+":
+        return str(a + b)
+    if op == "-":
+        return str(a - b)
+    return None
 
 
 def _prefer_web_context(spoken: str) -> bool:
@@ -446,7 +481,7 @@ def _prefer_web_context(spoken: str) -> bool:
 
 
 def _handle_spoken(spoken: str, trace_id: Optional[int] = None) -> None:
-    """Classify → grounded web answer, local answer, or open app/site."""
+    """Agent tool loop (with a tiny local-only fast path)."""
     set_current_trace_id(trace_id)
     try:
         _handle_spoken_inner(spoken)
@@ -455,66 +490,64 @@ def _handle_spoken(spoken: str, trace_id: Optional[int] = None) -> None:
 
 
 def _handle_spoken_inner(spoken: str) -> None:
-    """Classify → grounded web answer, local answer, or open app/site."""
-    intent = get_parser().extract_intent(spoken)
-    action = (intent.get("action") or "").strip()
-    logger.info("Parsed intent: %s", intent)
-    trace_step("parsed_intent", intent=intent, action=action)
+    """Prefer tool-calling agent; keep a local-only greeting/math fast path."""
+    text = (spoken or "").strip()
 
-    # Explicit open/launch orders — do not web-summarize; router opens things.
-    if action in {"open_app", "open_site", "workflow"}:
-        _execute_and_publish(intent, action)
-        return
-
-    # Browse / search / most questions → search + read pages + answer (no auto-open).
-    if (
-        action in {"browse", "search_fallback", "answer"}
-        or needs_browser(spoken)
-        or _prefer_web_context(spoken)
+    math = _try_local_math(text)
+    if math is not None and (
+        _LOCAL_ONLY_RE.match(text) or _MATH_EXPR_RE.search(text)
     ):
-        if action not in {"open_app", "open_site"}:
-            trace_step(
-                "route",
-                decision="try_web_grounded",
-                prefer_web=_prefer_web_context(spoken),
-                needs_browser=needs_browser(spoken),
-            )
-            if _answer_with_web_context(spoken):
-                return
-            if action in {"browse", "search_fallback"} or needs_browser(spoken):
-                logger.info("Web context failed; Chrome search fallback")
-                trace_step("route", decision="chrome_browse_fallback")
-                _execute_and_publish(
-                    {
-                        "action": "browse",
-                        "target": (intent.get("target") or "").strip() or spoken,
-                        "raw_query": spoken,
-                    },
-                    "browse",
+        # Prefer exact arithmetic for clear math questions.
+        if re.search(r"(?i)\b(what|whats|what's|is|equals?|compute|calculate)\b", text) or _LOCAL_ONLY_RE.match(text):
+            # Avoid treating "open app 2" style as math unless expression is the intent.
+            if re.search(r"(?i)[\+\-\*\/x×÷]", text):
+                reply = math
+                get_memory().log_activity(text, "answer", "local_math", reply)
+                event_bus.publish(
+                    utterance=text,
+                    kind="trace",
+                    text="Received input",
+                    detail="input",
+                    step="input",
+                    tool_input={"utterance": text},
                 )
+                event_bus.publish(
+                    utterance=text,
+                    kind="trace",
+                    text="Local math",
+                    detail="local_math",
+                    step="tool_result",
+                    tool="local_math",
+                    tool_input={"expression": text},
+                    tool_output={"result": reply},
+                )
+                event_bus.publish(
+                    utterance=text, kind="answer", text=reply, detail="local_math"
+                )
+                trace_step("final", kind="answer", detail="local_math", text=reply)
                 return
 
-    should_answer = action == "answer" or _looks_like_question(spoken)
-    if should_answer:
-        trace_step("route", decision="local_answer")
-        reply = get_parser().generate_answer(spoken)
-        if _REFUSAL_RE.search(reply) or "NEED_BROWSER" in reply.upper():
-            trace_step("route", decision="local_refused_try_web", reply=reply)
-            if _answer_with_web_context(spoken):
-                return
-        get_memory().log_activity(spoken, "answer", "local_llm", reply)
+    if text and _LOCAL_ONLY_RE.match(text):
+        trace_step("route", decision="local_only_fast")
+        reply = _try_local_math(text) or get_parser().generate_answer(text)
+        get_memory().log_activity(text, "answer", "local_llm", reply)
         event_bus.publish(
-            utterance=spoken,
+            utterance=text,
             kind="answer",
             text=reply,
             detail="local_llm",
         )
         trace_step("final", kind="answer", detail="local_llm", text=reply)
-        logger.info("Answered in HUD (%d chars)", len(reply))
         return
 
-    trace_step("route", decision="router_execute")
-    _execute_and_publish(intent, action)
+    trace_step("route", decision="agent_loop")
+    logger.info("Agent loop for %r", text)
+    result = get_agent().run(text)
+    logger.info(
+        "Agent finished steps=%s answer_chars=%s",
+        result.get("steps"),
+        len(result.get("answer") or ""),
+    )
 
 
 def _answer_with_web_context(spoken: str) -> bool:
@@ -618,13 +651,15 @@ async def intercept_freeflow_stream(request: Request) -> JSONResponse:
     # Extra guard: never treat FreeFlow template blobs as speech.
     if spoken and _is_freeflow_rewrite_request([], spoken):
         logger.info("Skipping rewrite-shaped spoken blob")
-        return _completion("")
+        # FreeFlow sentinel: do not paste into the focused app.
+        return _completion("EMPTY")
     logger.info("Intercepted FreeFlow transcript spoken=%r", spoken)
 
     if spoken:
         await _dispatch_spoken(spoken)
 
-    return _completion("")
+    # FreeFlow pastes the model output. "EMPTY" means paste nothing (see FreeFlow sanitizer).
+    return _completion("EMPTY")
 
 
 async def _dispatch_spoken(spoken: str) -> bool:

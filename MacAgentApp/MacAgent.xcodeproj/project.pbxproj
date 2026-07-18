@@ -1,0 +1,368 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		0099C779EB8AE8A5A4238A3D /* OverlayAutoHide.swift in Sources */ = {isa = PBXBuildFile; fileRef = 729347A94E175DD29821AC2B /* OverlayAutoHide.swift */; };
+		154D3EC346EF59415A669DAA /* ApplicationServices.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 7AD2DAF6E4A354DEE463180E /* ApplicationServices.framework */; };
+		3383EA4A5F0D4A8D6FC2F306 /* AgentModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 09447E68AAE10687942F7058 /* AgentModel.swift */; };
+		4C3AB0350CCC6F1B0BE7773F /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 2F84FE0D12C6CC7DCA522A87 /* Assets.xcassets */; };
+		5EACB5BCD66912337B82E660 /* OverlayController.swift in Sources */ = {isa = PBXBuildFile; fileRef = D69D18901D9440633C037AE4 /* OverlayController.swift */; };
+		7849A3FD3CE06ECB070AFB7F /* DaemonManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = E2EA5BB1BE0926DD62116B9C /* DaemonManager.swift */; };
+		78F28D8411E8E94196EAFCF0 /* Carbon.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = DF6F4E31E471543A790BF95D /* Carbon.framework */; };
+		79FD8C03CB3D627DD8FE1CA3 /* PreferencesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20F7C939A0093C0A8624AC01 /* PreferencesView.swift */; };
+		7CE92FB26DDEFCA76ECF2BE0 /* OverlayView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C64791C9045A7E87F2CFB790 /* OverlayView.swift */; };
+		87F6979CB5DA24A9E7B53DE4 /* HotkeyManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7E2CE36F376743B829ADB642 /* HotkeyManager.swift */; };
+		8F3DE8A84C63B160ECDA4AC3 /* PreferencesController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 447A36FFF6B6397D8B9B720F /* PreferencesController.swift */; };
+		9783F83B05FC6E6030ADBBBC /* MacAgentApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = C01C91F1A9E49285A42B7956 /* MacAgentApp.swift */; };
+		B3A768822048A0F8ED46626F /* MacAgentLogo.png in Resources */ = {isa = PBXBuildFile; fileRef = 2A74B0C4DEE120BE13342E3D /* MacAgentLogo.png */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		09447E68AAE10687942F7058 /* AgentModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentModel.swift; sourceTree = "<group>"; };
+		20F7C939A0093C0A8624AC01 /* PreferencesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreferencesView.swift; sourceTree = "<group>"; };
+		2A74B0C4DEE120BE13342E3D /* MacAgentLogo.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = MacAgentLogo.png; sourceTree = "<group>"; };
+		2F84FE0D12C6CC7DCA522A87 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		447A36FFF6B6397D8B9B720F /* PreferencesController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreferencesController.swift; sourceTree = "<group>"; };
+		5632241A2AF46F9F91D8929C /* MacAgent.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MacAgent.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		729347A94E175DD29821AC2B /* OverlayAutoHide.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OverlayAutoHide.swift; sourceTree = "<group>"; };
+		7AD2DAF6E4A354DEE463180E /* ApplicationServices.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = ApplicationServices.framework; path = System/Library/Frameworks/ApplicationServices.framework; sourceTree = SDKROOT; };
+		7E2CE36F376743B829ADB642 /* HotkeyManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HotkeyManager.swift; sourceTree = "<group>"; };
+		8AF965C5487C669D42350999 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		C01C91F1A9E49285A42B7956 /* MacAgentApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MacAgentApp.swift; sourceTree = "<group>"; };
+		C64791C9045A7E87F2CFB790 /* OverlayView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OverlayView.swift; sourceTree = "<group>"; };
+		D69D18901D9440633C037AE4 /* OverlayController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OverlayController.swift; sourceTree = "<group>"; };
+		DF6F4E31E471543A790BF95D /* Carbon.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Carbon.framework; path = System/Library/Frameworks/Carbon.framework; sourceTree = SDKROOT; };
+		E2EA5BB1BE0926DD62116B9C /* DaemonManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DaemonManager.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		11BB34D0BF7A7C90FC3D4B52 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				78F28D8411E8E94196EAFCF0 /* Carbon.framework in Frameworks */,
+				154D3EC346EF59415A669DAA /* ApplicationServices.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		33722F23A7A1262DC1067627 = {
+			isa = PBXGroup;
+			children = (
+				E96B4DF562FD3B831D6C6A02 /* Sources */,
+				E7BB0DEE807B706F8A81595B /* Frameworks */,
+				FB7209C417D821B58F30C40E /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		E7BB0DEE807B706F8A81595B /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				7AD2DAF6E4A354DEE463180E /* ApplicationServices.framework */,
+				DF6F4E31E471543A790BF95D /* Carbon.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		E96B4DF562FD3B831D6C6A02 /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				09447E68AAE10687942F7058 /* AgentModel.swift */,
+				2F84FE0D12C6CC7DCA522A87 /* Assets.xcassets */,
+				E2EA5BB1BE0926DD62116B9C /* DaemonManager.swift */,
+				7E2CE36F376743B829ADB642 /* HotkeyManager.swift */,
+				8AF965C5487C669D42350999 /* Info.plist */,
+				C01C91F1A9E49285A42B7956 /* MacAgentApp.swift */,
+				729347A94E175DD29821AC2B /* OverlayAutoHide.swift */,
+				D69D18901D9440633C037AE4 /* OverlayController.swift */,
+				C64791C9045A7E87F2CFB790 /* OverlayView.swift */,
+				447A36FFF6B6397D8B9B720F /* PreferencesController.swift */,
+				20F7C939A0093C0A8624AC01 /* PreferencesView.swift */,
+				F70BB9C96B9C7E95277CFAD3 /* Resources */,
+			);
+			path = Sources;
+			sourceTree = "<group>";
+		};
+		F70BB9C96B9C7E95277CFAD3 /* Resources */ = {
+			isa = PBXGroup;
+			children = (
+				2A74B0C4DEE120BE13342E3D /* MacAgentLogo.png */,
+			);
+			path = Resources;
+			sourceTree = "<group>";
+		};
+		FB7209C417D821B58F30C40E /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				5632241A2AF46F9F91D8929C /* MacAgent.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		70B8893C71B4987EAB7F0905 /* MacAgent */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 28EF85E1953B2BDD6D8E3827 /* Build configuration list for PBXNativeTarget "MacAgent" */;
+			buildPhases = (
+				285E8213465B000B56A3AC75 /* Sources */,
+				C82BE296F70CEC68C7A06BE4 /* Resources */,
+				11BB34D0BF7A7C90FC3D4B52 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = MacAgent;
+			packageProductDependencies = (
+			);
+			productName = MacAgent;
+			productReference = 5632241A2AF46F9F91D8929C /* MacAgent.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		E97BABA95269F8DED6CBD588 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+				};
+			};
+			buildConfigurationList = AF5FEAB68C6243520675B2A9 /* Build configuration list for PBXProject "MacAgent" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = 33722F23A7A1262DC1067627;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = FB7209C417D821B58F30C40E /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				70B8893C71B4987EAB7F0905 /* MacAgent */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		C82BE296F70CEC68C7A06BE4 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				4C3AB0350CCC6F1B0BE7773F /* Assets.xcassets in Resources */,
+				B3A768822048A0F8ED46626F /* MacAgentLogo.png in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		285E8213465B000B56A3AC75 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				3383EA4A5F0D4A8D6FC2F306 /* AgentModel.swift in Sources */,
+				7849A3FD3CE06ECB070AFB7F /* DaemonManager.swift in Sources */,
+				87F6979CB5DA24A9E7B53DE4 /* HotkeyManager.swift in Sources */,
+				9783F83B05FC6E6030ADBBBC /* MacAgentApp.swift in Sources */,
+				0099C779EB8AE8A5A4238A3D /* OverlayAutoHide.swift in Sources */,
+				5EACB5BCD66912337B82E660 /* OverlayController.swift in Sources */,
+				7CE92FB26DDEFCA76ECF2BE0 /* OverlayView.swift in Sources */,
+				8F3DE8A84C63B160ECDA4AC3 /* PreferencesController.swift in Sources */,
+				79FD8C03CB3D627DD8FE1CA3 /* PreferencesView.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		1BE5FFC025151B9C1B6EEC0C /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGN_IDENTITY = "-";
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_HARDENED_RUNTIME = NO;
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_BUNDLE_IDENTIFIER = com.macagent.app;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		3581B420025633FD02608029 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				COMBINE_HIDPI_IMAGES = YES;
+				INFOPLIST_FILE = Sources/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = "@executable_path/../Frameworks";
+				PRODUCT_NAME = MacAgent;
+				SDKROOT = macosx;
+			};
+			name = Debug;
+		};
+		403EACDC2D850FCA0199E388 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGN_IDENTITY = "-";
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_HARDENED_RUNTIME = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_BUNDLE_IDENTIFIER = com.macagent.app;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		AF5FBFE238B0F34EB351B8CC /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				COMBINE_HIDPI_IMAGES = YES;
+				INFOPLIST_FILE = Sources/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = "@executable_path/../Frameworks";
+				PRODUCT_NAME = MacAgent;
+				SDKROOT = macosx;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		28EF85E1953B2BDD6D8E3827 /* Build configuration list for PBXNativeTarget "MacAgent" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				3581B420025633FD02608029 /* Debug */,
+				AF5FBFE238B0F34EB351B8CC /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		AF5FEAB68C6243520675B2A9 /* Build configuration list for PBXProject "MacAgent" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				403EACDC2D850FCA0199E388 /* Debug */,
+				1BE5FFC025151B9C1B6EEC0C /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = E97BABA95269F8DED6CBD588 /* Project object */;
+}

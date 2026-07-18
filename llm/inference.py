@@ -374,3 +374,133 @@ class LocalIntentParser:
             logger.warning("Failed to summarize search: %s", exc)
             trace_step("answer_from_search_error", error=str(exc))
             return fallback
+
+    def plan_tool_call(
+        self,
+        utterance: str,
+        history: list[dict[str, Any]],
+        tool_catalog: str,
+    ) -> str:
+        """Ask the model for the next tool call as a single JSON object."""
+        fallback = json.dumps(
+            {"tool": "respond", "args": {"text": "I could not plan the next step."}}
+        )
+        try:
+            self._ensure_loaded()
+        except (FileNotFoundError, RuntimeError) as exc:
+            logger.warning("Tool plan skipped: %s", exc)
+            return fallback
+
+        runtime = build_runtime_context()
+        hist_lines: list[str] = []
+        for i, item in enumerate(history[-3:]):
+            call = item.get("call") or {}
+            result = item.get("result") or {}
+            slim = {
+                k: (v[:500] + "…" if isinstance(v, str) and len(v) > 500 else v)
+                for k, v in result.items()
+                if k != "context" or True
+            }
+            if isinstance(slim.get("context"), str) and len(slim["context"]) > 600:
+                slim["context"] = slim["context"][:600] + "…"
+            hist_lines.append(
+                f"{i+1}. called {call.get('tool')} args={json.dumps(call.get('args') or {}, ensure_ascii=False)[:200]} "
+                f"→ {json.dumps(slim, ensure_ascii=False, default=str)[:700]}"
+            )
+        history_block = "\n".join(hist_lines) if hist_lines else "(none yet)"
+
+        system_prompt = (
+            "You are MacAgent's planner on macOS. "
+            "Choose exactly ONE next tool call. "
+            "Reply with ONLY a JSON object: {\"tool\":\"name\",\"args\":{...}}. "
+            "No markdown. No explanation. "
+            "After tools have enough info, finish with tool=respond. "
+            "Use run_python for math, calculations, data transforms, or short scripts "
+            "(put complete Python in args.code; it must print the answer). "
+            "Use web_search for factual/live questions (do not open_url unless asked). "
+            "Use find_files for locating files. "
+            "Use open_app / open_url / open_system_settings only when the user wants something opened."
+        )
+        user_prompt = (
+            f"CONTEXT:\n{runtime}\n\n"
+            f"{tool_catalog}\n\n"
+            f"User request: {utterance}\n\n"
+            f"Prior tool results:\n{history_block}\n\n"
+            "Next tool JSON:"
+        )
+        prompt = (
+            f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+            f"<|im_start|>user\n{user_prompt}<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
+        assert self._llm is not None
+        try:
+            response = self._llm(
+                prompt,
+                max_tokens=160,
+                temperature=0.0,
+                stop=["<|im_end|>", "<|im_start|>", "\n\n"],
+            )
+            text = (response["choices"][0]["text"] or "").strip()
+            trace_step(
+                "plan_tool_call",
+                system_prompt=system_prompt,
+                user_prompt=user_prompt[:2500],
+                raw_output=text,
+            )
+            return text or fallback
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("plan_tool_call failed: %s", exc)
+            trace_step("plan_tool_call_error", error=str(exc))
+            return fallback
+
+    def generate_python(self, utterance: str) -> str:
+        """Write a short Python script that prints the answer to utterance."""
+        fallback = "print('unable to generate code')"
+        try:
+            self._ensure_loaded()
+        except (FileNotFoundError, RuntimeError) as exc:
+            logger.warning("generate_python skipped: %s", exc)
+            return fallback
+
+        system_prompt = (
+            "You write short Python 3 scripts. "
+            "Reply with ONLY executable Python code — no markdown fences, no explanation. "
+            "The script must print the final answer with print(...). "
+            "Use only the standard library. No network, no files outside /tmp, no subprocess."
+        )
+        user_prompt = (
+            f"Write a Python script that solves this and prints the result:\n{utterance}"
+        )
+        prompt = (
+            f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+            f"<|im_start|>user\n{user_prompt}<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
+        assert self._llm is not None
+        try:
+            response = self._llm(
+                prompt,
+                max_tokens=320,
+                temperature=0.1,
+                stop=["<|im_end|>", "<|im_start|>"],
+            )
+            text = (response["choices"][0]["text"] or "").strip()
+            text = _strip_code_fences(text)
+            trace_step("generate_python", user=utterance, raw_output=text[:1000])
+            return text or fallback
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("generate_python failed: %s", exc)
+            return fallback
+
+
+def _strip_code_fences(text: str) -> str:
+    t = (text or "").strip()
+    if t.startswith("```"):
+        lines = t.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        t = "\n".join(lines).strip()
+    return t

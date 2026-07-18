@@ -5,3 +5,7 @@ __pycache__/
 database/assistant.db
 .DS_Store
 MacAgent/build/
+MacAgentApp/DerivedData/
+/tmp/MacAgentDerived/
+dist/
+MacAgentApp/DerivedDataRelease/

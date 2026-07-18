@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Build MacAgent.app (SwiftUI desktop) without opening Xcode.
+# DEPRECATED: use MacAgentApp/ (Xcode) instead — see README.md
+# Legacy swiftc packaging for the multi-tab Dock app. Kept for reference only.
+echo "WARNING: MacAgent/build.sh is deprecated. Prefer: open MacAgentApp/MacAgent.xcodeproj" >&2
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
