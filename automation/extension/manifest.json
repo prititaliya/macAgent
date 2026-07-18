@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "MacAgent Browser Bridge",
+  "version": "0.2.0",
+  "description": "Native Messaging bridge for MacAgent Keychain login fill (Chrome).",
+  "permissions": ["nativeMessaging", "activeTab", "scripting"],
+  "host_permissions": ["http://*/*", "https://*/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

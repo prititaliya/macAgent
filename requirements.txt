@@ -1,0 +1,6 @@
+ddgs>=9.0.0
+fastapi==0.111.0
+uvicorn==0.30.1
+llama-cpp-python==0.3.8
+pydantic==2.7.4
+pyobjc-framework-Cocoa>=10.0

@@ -1,0 +1,5 @@
+root   ::= object
+object ::= "{" ws "\"action\":" ws action "," ws "\"target\":" ws string "," ws "\"raw_query\":" ws string "}"
+action ::= "\"open_site\"" | "\"open_app\"" | "\"workflow\"" | "\"search_fallback\"" | "\"answer\"" | "\"browse\""
+string ::= "\"" [^"\\]* "\""
+ws     ::= [ \t\n\r]*
