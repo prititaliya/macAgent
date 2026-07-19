@@ -49,6 +49,9 @@ final class OverlayController {
     }
 
     func hide() {
+        if model.isDictating {
+            model.isDictating = false
+        }
         stopIdleTimer()
         clearCountdownUI()
         panel?.orderOut(nil)
@@ -108,7 +111,7 @@ final class OverlayController {
 
         // Always re-sample mouse — enter/exit events are unreliable on borderless panels.
         let mouseOver = panel.frame.contains(NSEvent.mouseLocation)
-        let paused = model.busy || model.pendingConfirm != nil || mouseOver
+        let paused = model.busy || model.isDictating || model.pendingConfirm != nil || mouseOver
 
         if hideDeadline == nil {
             // Out of focus / mouse left while we had no deadline — start fresh.

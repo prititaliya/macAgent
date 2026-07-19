@@ -7,9 +7,25 @@ from typing import Any, List, Optional
 from llama_cpp import Llama, LlamaGrammar
 
 from events.debug_trace import trace_step
-from memory.user_context import build_runtime_context
+from memory.user_context import build_runtime_context, load_user_notes_for_llm
 
 logger = logging.getLogger(__name__)
+
+_EMPTY_REFUSAL_RE = re.compile(
+    r"(?i)\b("
+    r"could not find|couldn'?t find|cannot find|can'?t find|"
+    r"no information|not (enough )?information|"
+    r"does not contain|do(?:es)?n'?t (?:have|contain)|"
+    r"unable to find|not (?:mentioned|available|provided) in|"
+    r"i don'?t know (?:anything )?about you|"
+    r"sources provided|"
+    r"not enough context|insufficient (?:context|information|detail)|"
+    r"would need to search|need (?:more|to) (?:search|information|context)|"
+    r"web context does not|provided web context|"
+    r"i('m| am) sorry.? but|"
+    r"cannot (?:provide|answer)|can'?t (?:provide|answer) "
+    r")\b"
+)
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _SETTINGS_PATH = _PROJECT_ROOT / "config" / "settings.json"
@@ -319,9 +335,69 @@ class LocalIntentParser:
             trace_step("generate_answer_error", error=str(exc))
             return fallback
 
+    def answer_about_user(self, utterance: str) -> str:
+        """Summarize Preferences / user notes for “what do you know about me?”."""
+        notes = load_user_notes_for_llm()
+        if not notes.strip():
+            return (
+                "I don't have saved notes about you yet. "
+                "Add profile details in Preferences → User context and I'll remember them."
+            )
+        fallback = _notes_extractive_summary(notes)
+        try:
+            self._ensure_loaded()
+        except (FileNotFoundError, RuntimeError) as exc:
+            logger.warning("About-user answer skipped: %s", exc)
+            return fallback
+
+        system_prompt = (
+            "You are MacAgent. The user asked what you know about them. "
+            "Answer ONLY from CONTEXT notes. Speak in second person (you/your). "
+            "Give a clear 4–8 sentence summary of the most important facts "
+            "(name, school/work, location, interests, recent plans). "
+            "If notes have facts, you MUST use them — never say you lack information. "
+            "Do not invent facts that are not in the notes."
+        )
+        user_prompt = (
+            f"CONTEXT notes:\n{notes[:5000]}\n\n"
+            f"User question: {utterance}\n\n"
+            "Summary of what I know about you:"
+        )
+        prompt = (
+            f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+            f"<|im_start|>user\n{user_prompt}<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
+        assert self._llm is not None
+        try:
+            response = self._llm(
+                prompt,
+                max_tokens=320,
+                temperature=0.2,
+                stop=["<|im_end|>", "<|im_start|>"],
+            )
+            text = (response["choices"][0]["text"] or "").strip()
+            out = text or fallback
+            if _is_empty_refusal(out):
+                out = fallback
+            trace_step(
+                "answer_about_user",
+                system_prompt=system_prompt,
+                user_prompt=user_prompt[:2000],
+                raw_output=out,
+            )
+            return out
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to summarize user notes: %s", exc)
+            trace_step("answer_about_user_error", error=str(exc))
+            return fallback
+
     def answer_from_search(self, utterance: str, search_context: str) -> str:
         """Answer using search hits + fetched page text (grounded; less hallucination)."""
-        fallback = "I searched the web but could not form a reliable answer from the pages."
+        extractive = _search_extractive_summary(search_context)
+        fallback = extractive or (
+            "I searched the web but could not form a reliable answer from the pages."
+        )
         try:
             self._ensure_loaded()
         except (FileNotFoundError, RuntimeError) as exc:
@@ -330,14 +406,20 @@ class LocalIntentParser:
 
         runtime = build_runtime_context()
         system_prompt = (
-            "You are MacAgent. Answer using the web context "
-            "(search hits and page content), and use CONTEXT "
-            "(current time and user notes) for personalization and relative dates "
-            "(e.g. 'today', 'this weekend'). "
-            "Prefer facts from the page content sections over short snippets. "
-            "If the web context does not contain the answer, say you could not find it "
-            "in the sources — do not invent dates, scores, or names. "
-            "Reply in 2-5 short sentences."
+            "You are MacAgent. Answer the user using the web context "
+            "(search hits and page content) plus CONTEXT (time and user notes). "
+            "Rules:\n"
+            "- Treat search-hit titles and snippets as valid evidence — summarize them.\n"
+            "- If the question is about the user (“me”/“about me”) and hits describe "
+            "a person matching the name in CONTEXT notes, answer about that person "
+            "in second person (you/your).\n"
+            "- Prefer concrete facts (school, job, location, projects, prices, model names) "
+            "from the hits.\n"
+            "- For compare/pricing questions, list every model/price figure present in the "
+            "web context. Partial answers are OK — say what is known vs missing.\n"
+            "- Only refuse if the web context is empty or clearly unrelated.\n"
+            "- Do not invent dates, scores, prices, or names missing from context.\n"
+            "- Reply in 2–8 short sentences."
         )
         # Keep prompt bounded for the small model.
         ctx = (search_context or "")[:6000]
@@ -345,7 +427,9 @@ class LocalIntentParser:
             f"CONTEXT:\n{runtime}\n\n"
             f"User question: {utterance}\n\n"
             f"Web context:\n{ctx}\n\n"
-            "Answer from the context only:"
+            "Write a helpful answer from the web context (and notes if relevant). "
+            "Use any prices, model names, or comparison facts present. "
+            "Do not claim the sources lack information if they contain relevant facts:"
         )
         prompt = (
             f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
@@ -357,11 +441,15 @@ class LocalIntentParser:
             response = self._llm(
                 prompt,
                 max_tokens=256,
-                temperature=0.1,
+                temperature=0.2,
                 stop=["<|im_end|>", "<|im_start|>"],
             )
             text = (response["choices"][0]["text"] or "").strip()
             out = text or fallback
+            # Small models often refuse “about me” even when LinkedIn/snippets are rich.
+            if _is_empty_refusal(out) and extractive:
+                logger.info("answer_from_search: replacing empty refusal with extractive")
+                out = extractive
             trace_step(
                 "answer_from_search",
                 system_prompt=system_prompt,
@@ -461,18 +549,22 @@ class LocalIntentParser:
 
         system_prompt = (
             "You are MacAgent's planner on macOS. "
-            "Choose exactly ONE next tool call. "
-            "Reply with ONLY a JSON object: {\"tool\":\"name\",\"args\":{...}}. "
+            "Choose exactly ONE next tool call as JSON: {\"tool\":\"name\",\"args\":{...}}. "
             "No markdown. No explanation. "
-            "After tools have enough info, finish with tool=respond. "
-            "Prefer run_bash for files, folders, downloads, listing, opening paths, "
-            "and local shell tasks — put a real bash command in args.command "
-            "(examples: ls -lt ~/Downloads | head -20; open ~/Downloads; "
-            "mdfind -onlyin ~ 'kind:folder name:comp3370' | head -5). "
-            "Use run_python for math or short Python scripts (args.code must print). "
-            "Use open_app only for real macOS apps (Safari, Slack), never for folders. "
-            "Use web_search for factual/live questions (do not open_url unless asked). "
-            "Use open_url / open_system_settings only when the user wants something opened."
+            "CRITICAL: Match the user's words. "
+            "Multi-step is expected: one tool per step, keep going until the GOAL is done. "
+            "After listing/search, if the user asked to delete/move/open/act on that result, "
+            "call the next tool — do NOT respond with only the listing. "
+            "If a prior web_search answer said context was insufficient / missing prices, "
+            "call web_search again with a sharper query (include model names + pricing + year). "
+            "Use tool=respond only when the goal is finished or you must ask a clarifying question. "
+            "For greetings or small talk (hi, yo, hey, thanks) use tool=respond with a short friendly reply. "
+            "NEVER call shut down, restart, empty trash, rm, or ui_* unless the user explicitly asked. "
+            "Do not invent destructive actions from the catalog examples. "
+            "For factual questions use web_search then respond. "
+            "For explicit open/launch use open_app or open_url. "
+            "For explicit file tasks use run_bash. "
+            "Only when the user wants something done on the Mac should you use action tools."
         )
         user_prompt = (
             f"CONTEXT:\n{runtime}\n\n"
@@ -559,6 +651,8 @@ class LocalIntentParser:
             "You write ONE short bash command for macOS (zsh/bash). "
             "Reply with ONLY the command — no markdown, no explanation, no leading $. "
             "Prefer: ls, find, mdfind, open, head, sort, stat, du, pwd, echo. "
+            "If the user asked to DELETE/REMOVE the latest download, emit a command that "
+            "resolves the newest file in ~/Downloads and rm's it (print Deleted: path). "
             "Home is ~. Print useful stdout. Do not use sudo, rm -rf /, curl|sh, or disk erase. "
             "To empty the macOS Trash/Bin use: "
             "osascript -e 'tell application \"Finder\" to empty the trash' "
@@ -595,6 +689,71 @@ class LocalIntentParser:
             logger.warning("generate_bash failed: %s", exc)
             return fallback
 
+    def check_goal_done(
+        self, utterance: str, history_summary: str, candidate: str
+    ) -> dict[str, Any]:
+        """Critic: did the candidate answer / tool history finish the user's goal?"""
+        fallback = {"done": True, "reason": "assumed done", "next_hint": ""}
+        try:
+            self._ensure_loaded()
+        except (FileNotFoundError, RuntimeError) as exc:
+            logger.warning("check_goal_done skipped: %s", exc)
+            return fallback
+
+        system_prompt = (
+            "You verify whether a Mac assistant finished the user's request. "
+            "Reply with ONLY JSON: "
+            '{"done":true|false,"reason":"…","next_hint":"tool or action to try next"}. '
+            "done=false if they only listed/found something but the user asked to "
+            "delete/remove/open/move/empty/change it. "
+            "done=true if the action is complete or the user only asked a question."
+        )
+        user_prompt = (
+            f"User request: {utterance}\n\n"
+            f"Tool history:\n{history_summary or '(none)'}\n\n"
+            f"Candidate answer:\n{(candidate or '')[:800]}\n\n"
+            "JSON:"
+        )
+        prompt = (
+            f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+            f"<|im_start|>user\n{user_prompt}<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
+        assert self._llm is not None
+        try:
+            response = self._llm(
+                prompt,
+                max_tokens=120,
+                temperature=0.0,
+                stop=["<|im_end|>", "<|im_start|>"],
+            )
+            text = (response["choices"][0]["text"] or "").strip()
+            data = None
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                m = re.search(r"\{.*\}", text, re.DOTALL)
+                if m:
+                    try:
+                        data = json.loads(m.group(0))
+                    except json.JSONDecodeError:
+                        data = None
+            if not isinstance(data, dict):
+                trace_step("check_goal_done_parse_fail", raw_output=text[:500])
+                return fallback
+            done = bool(data.get("done"))
+            out = {
+                "done": done,
+                "reason": str(data.get("reason") or ""),
+                "next_hint": str(data.get("next_hint") or ""),
+            }
+            trace_step("check_goal_done", raw_output=text[:500], parsed=out)
+            return out
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("check_goal_done failed: %s", exc)
+            trace_step("check_goal_done_error", error=str(exc))
+            return fallback
+
 
 def _strip_code_fences(text: str) -> str:
     t = (text or "").strip()
@@ -606,3 +765,88 @@ def _strip_code_fences(text: str) -> str:
             lines = lines[:-1]
         t = "\n".join(lines).strip()
     return t
+
+
+def _is_empty_refusal(text: str) -> bool:
+    """True when the model admitted it lacks an answer (any length)."""
+    t = (text or "").strip()
+    if not t:
+        return True
+    return bool(_EMPTY_REFUSAL_RE.search(t))
+
+
+def _notes_extractive_summary(notes: str, limit: int = 8) -> str:
+    """Fallback: pull bullet facts from user notes without the LLM."""
+    facts: list[str] = []
+    for ln in (notes or "").splitlines():
+        s = ln.strip().lstrip("*•-").strip()
+        if not s or s.startswith("---") or s.lower().startswith("evidence:"):
+            continue
+        # Prefer the main claim lines (usually “The user …”).
+        if re.match(r"(?i)^the user\b", s) or len(facts) < 3:
+            # Drop trailing evidence clauses if jammed onto the same line.
+            s = re.split(r"(?i)\bevidence\s*:", s, maxsplit=1)[0].strip().rstrip(".")
+            if s:
+                s = _to_second_person(s)
+                facts.append(s)
+        if len(facts) >= limit:
+            break
+    if not facts:
+        return notes.strip()[:900]
+    return "Here's what I know about you:\n• " + "\n• ".join(facts)
+
+
+def _to_second_person(sentence: str) -> str:
+    s = sentence.strip()
+    s = re.sub(r"(?i)^the user'?s\b", "Your", s)
+    s = re.sub(r"(?i)^the user\b", "You", s)
+    s = re.sub(r"(?i)\bthe user'?s\b", "your", s)
+    s = re.sub(r"(?i)\bthe user\b", "you", s)
+    # Fix common leftover agreement after “The user is/has/…” → “You is/has…”
+    s = re.sub(r"(?i)^You is\b", "You are", s)
+    s = re.sub(r"(?i)^You has\b", "You have", s)
+    s = re.sub(r"(?i)^You was\b", "You were", s)
+    s = re.sub(r"(?i)^You resides\b", "You reside", s)
+    s = re.sub(r"(?i)^You plays\b", "You play", s)
+    s = re.sub(r"(?i)^You maintains\b", "You maintain", s)
+    s = re.sub(r"(?i)^You collaborates\b", "You collaborate", s)
+    s = re.sub(r"(?i)^You shares\b", "You share", s)
+    s = re.sub(r"(?i)^You concluded\b", "You concluded", s)
+    return s
+
+
+def _search_extractive_summary(context: str, max_hits: int = 3) -> str:
+    """Fallback: turn search-hit snippets into a short answer when the LLM refuses."""
+    if not (context or "").strip():
+        return ""
+    hits: list[tuple[str, str]] = []
+    # Match: "1. Title\n   body\n   URL: ..."
+    for m in re.finditer(
+        r"(?m)^\d+\.\s+(.+?)\n\s+(.+?)(?:\n\s+URL:|\n\n|\Z)",
+        context,
+        re.DOTALL,
+    ):
+        title = " ".join(m.group(1).split())
+        body = " ".join(m.group(2).split())
+        # Skip generic listicle junk when better hits exist.
+        if re.search(r"(?i)resume examples|cv compiler", title) and hits:
+            continue
+        if body and len(body) > 40:
+            hits.append((title, body))
+        if len(hits) >= max_hits:
+            break
+    if not hits:
+        # Last resort: first non-empty paragraph after "Search hits:".
+        chunk = context.split("Page content from", 1)[0]
+        plain = " ".join(chunk.split())
+        return plain[:700] if len(plain) > 80 else ""
+
+    parts = []
+    for title, body in hits:
+        snippet = body if len(body) <= 320 else body[:317].rstrip() + "…"
+        parts.append(f"• {title}: {snippet}")
+    return (
+        "From the sources I found:\n"
+        + "\n".join(parts)
+        + "\n\n(Ask if you want me to go deeper on any of these.)"
+    )

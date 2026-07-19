@@ -17,6 +17,7 @@ from memory.user_context import (
 from tools.duckduckgo import build_grounded_context
 from tools.run_bash import run_bash
 from tools.run_code import run_python
+from automation import ui_control
 
 logger = logging.getLogger(__name__)
 
@@ -49,24 +50,18 @@ _SYSTEM_SETTINGS_PANES: dict[str, str] = {
 
 TOOL_CATALOG = """
 Available tools (reply with ONE JSON object: {"tool":"...","args":{...}}):
-- run_bash: {"command":"ls -lt ~/Downloads | head -15"} — preferred for files, folders, downloads, open paths, system queries. Write a real bash command; stdout is shown to the user.
-  Destructive commands (rm, empty Trash) pause for user Approve/Deny in the UI.
-  Empty Trash/Bin: osascript -e 'tell application "Finder" to empty the trash' — NEVER rm /bin
-- run_python: {"code":"print(2+4)"} — math / short scripts that print a result
-- get_user_context: {} — read MacAgent user notes
-- update_user_context: {"notes":"..."} — replace user notes
-- list_apps: {} / open_app: {"name":"Safari"} — app aliases (apps only, not folders)
-- list_sites: {} / open_url: {"url":"https://..."} — sites
-- web_search: {"query":"..."} — DuckDuckGo grounded Q&A (no auto-open)
-- open_system_settings: {"pane":"wifi|bluetooth|..."} — Settings panes only
-- find_files: {"query":"..."} — optional Spotlight helper (prefer run_bash)
-- open_folder: {"query":"..."} — optional Finder helper (prefer: open \"~/path\")
-- respond: {"text":"..."} — final user-visible answer (always end with this)
-Examples for run_bash:
-- recent downloads: ls -lt ~/Downloads | head -20
-- open a folder: open ~/Downloads
-- find a folder by name: mdfind -onlyin ~ 'kind:folder comp3370' | head -5
-- open newest download: open \"$(ls -t ~/Downloads/* 2>/dev/null | head -1)\"
+- respond: {"text":"…"} — greetings, Q&A, or ONLY when the user goal is fully done
+- web_search: {"query":"…"} — factual / live questions; if prior search lacked prices/facts, search again with a sharper query
+- open_app: {"name":"Safari"} — only if user asked to open an app
+- open_url: {"url":"https://…"} — only if user asked to open a site (Chrome)
+- open_system_settings: {"pane":"wifi|bluetooth|…"} — only if user asked for Settings
+- run_bash: {"command":"…"} — file/shell tasks; multi-step OK (list then delete/open)
+- run_python: {"code":"print(2+4)"} — math / short scripts
+- ui_snapshot / ui_click / ui_type / ui_key / ui_menu — only for explicit on-screen control
+- get_user_context / update_user_context — notes
+Multi-step: after listing/search, if the user asked to delete/move/open that item, call the next tool — do not respond with only the listing.
+If a web_search answer said the context was insufficient, call web_search again with a more specific query (pricing, model names, year).
+NEVER invent shut down / restart / empty trash / rm unless the user clearly asked for that (delete/remove/rm).
 """.strip()
 
 
@@ -87,6 +82,11 @@ class ToolRegistry:
             "open_system_settings": self._open_system_settings,
             "run_python": self._run_python,
             "run_bash": self._run_bash,
+            "ui_snapshot": self._ui_snapshot,
+            "ui_click": self._ui_click,
+            "ui_type": self._ui_type,
+            "ui_key": self._ui_key,
+            "ui_menu": self._ui_menu,
             "respond": self._respond,
         }
 
@@ -357,8 +357,33 @@ class ToolRegistry:
             msg = self.router.execute(
                 {"action": "open_app", "target": name, "raw_query": f"open {name}"}
             )
+            if isinstance(msg, str) and msg.startswith("__NOT_FOUND__:"):
+                missing = msg.split(":", 1)[-1]
+                return {
+                    "ok": False,
+                    "not_found": True,
+                    "name": missing,
+                    "message": (
+                        f"I couldn't find an app named “{missing}” on this Mac. "
+                        "Which app did you mean, or try another name?"
+                    ),
+                }
+            if isinstance(msg, str) and msg.startswith("Failed to open"):
+                return {"ok": False, "error": msg}
             return {"ok": True, "message": msg}
-        subprocess.run(["open", "-a", name], check=False)
+        result = subprocess.run(
+            ["open", "-a", name], capture_output=True, text=True, check=False
+        )
+        if result.returncode != 0:
+            return {
+                "ok": False,
+                "not_found": True,
+                "name": name,
+                "message": (
+                    f"I couldn't find an app named “{name}” on this Mac. "
+                    "Which app did you mean, or try another name?"
+                ),
+            }
         return {"ok": True, "message": f"Launched {name}"}
 
     def _list_sites(self, _args: dict[str, Any]) -> dict[str, Any]:
@@ -375,8 +400,25 @@ class ToolRegistry:
             msg = self.router.execute(
                 {"action": "open_site", "target": url, "raw_query": f"open {url}"}
             )
+            if not msg or (isinstance(msg, str) and msg.startswith("Failed")):
+                return {
+                    "ok": False,
+                    "error": msg or "Failed to open URL in Chrome",
+                    "url": url,
+                }
             return {"ok": True, "message": msg, "url": url}
-        subprocess.run(["open", "-a", "Google Chrome", url], check=False)
+        result = subprocess.run(
+            ["open", "-a", "Google Chrome", url],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            return {
+                "ok": False,
+                "error": (result.stderr or "Chrome open failed").strip(),
+                "url": url,
+            }
         return {"ok": True, "message": f"Opened {url}", "url": url}
 
     def _web_search(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -384,7 +426,7 @@ class ToolRegistry:
         if not query:
             return {"ok": False, "error": "query required"}
         context, sources = build_grounded_context(
-            query, max_results=4, pages_to_read=2, max_chars_per_page=2400
+            query, max_results=5, pages_to_read=3, max_chars_per_page=2400
         )
         return {
             "ok": bool(context.strip()),
@@ -435,6 +477,31 @@ class ToolRegistry:
         cmd = str(args.get("command") or args.get("cmd") or args.get("bash") or "")
         confirmed = bool(args.get("confirmed") or args.get("approved"))
         return run_bash(cmd, confirmed=confirmed)
+
+    def _ui_snapshot(self, args: dict[str, Any]) -> dict[str, Any]:
+        return ui_control.ui_snapshot(max_elements=int(args.get("limit") or 40))
+
+    def _ui_click(self, args: dict[str, Any]) -> dict[str, Any]:
+        return ui_control.ui_click(
+            name=str(args.get("name") or args.get("label") or ""),
+            role=str(args.get("role") or "button"),
+            index=int(args.get("index") or 1),
+        )
+
+    def _ui_type(self, args: dict[str, Any]) -> dict[str, Any]:
+        return ui_control.ui_type(str(args.get("text") or args.get("string") or ""))
+
+    def _ui_key(self, args: dict[str, Any]) -> dict[str, Any]:
+        return ui_control.ui_key(
+            key=str(args.get("key") or "return"),
+            modifiers=str(args.get("modifiers") or ""),
+        )
+
+    def _ui_menu(self, args: dict[str, Any]) -> dict[str, Any]:
+        return ui_control.ui_menu(
+            app=str(args.get("app") or ""),
+            menu_path=str(args.get("menu_path") or args.get("path") or ""),
+        )
 
     def _respond(self, args: dict[str, Any]) -> dict[str, Any]:
         text = str(args.get("text") or args.get("message") or "").strip()

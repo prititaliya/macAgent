@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 struct PreferencesView: View {
     @EnvironmentObject var model: AgentModel
@@ -113,6 +114,49 @@ struct SettingsPrefsView: View {
                          : "Hides \(autoHideSeconds)s after the last activity (typing, answer, or show).")
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
+                }
+                .padding(6)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            GroupBox("Permissions") {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(
+                        "Accessibility is requested once. Enable MacAgent.app "
+                        + "(not AEServer). Screen control uses the running MacAgent app."
+                    )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button("Open Accessibility Settings") {
+                        if let url = URL(
+                            string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+                        ) {
+                            NSWorkspace.shared.open(url)
+                        }
+                    }
+                    Text(
+                        "Voice in the overlay uses the MacBook mic + macOS Speech Recognition. "
+                        + "FreeFlow still works separately if you prefer it."
+                    )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.top, 4)
+                    HStack(spacing: 10) {
+                        Button("Microphone Settings") {
+                            if let url = URL(
+                                string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
+                            ) {
+                                NSWorkspace.shared.open(url)
+                            }
+                        }
+                        Button("Speech Recognition Settings") {
+                            if let url = URL(
+                                string: "x-apple.systempreferences:com.apple.preference.security?Privacy_SpeechRecognition"
+                            ) {
+                                NSWorkspace.shared.open(url)
+                            }
+                        }
+                    }
                 }
                 .padding(6)
                 .frame(maxWidth: .infinity, alignment: .leading)

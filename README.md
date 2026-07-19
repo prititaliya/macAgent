@@ -1,102 +1,138 @@
 # MacAgent
 
-Transparent **overlay agent** for macOS (8GB Apple Silicon): summon it over whatever you are doing, type or speak, and it uses **tools** (files, notes, apps, sites, web, System Settings panes).
+**A local macOS overlay agent** — press a shortcut, ask in plain English (type or speak), and it *does things on your Mac*: opens apps, finds and deletes files, searches the web with retries, controls the UI, and asks you to Approve before anything destructive.
 
-## Primary UI (Xcode)
+Runs entirely on your machine (small local LLM + Python tools). Not a cloud chatbot pasted into a window.
 
-Open and run the Xcode app:
+---
 
-```bash
-open /Users/jatin/Projects/MacAgent/MacAgentApp/MacAgent.xcodeproj
+## What it can do
+
+| Capability | Example asks |
+|---|---|
+| **Answer + act in a loop** | Multi-step goals: find → act → confirm. Won’t stop at “here’s the filename” when you asked to delete it. |
+| **Files & Downloads** | “What’s my latest download?” · “Delete the file I downloaded last” *(Approve first)* · “Open my Downloads folder” |
+| **Apps & Chrome** | “Open Slack” · “Open https://github.com in Chrome” |
+| **Web research** | “Compare frontier LLM models and their prices” — searches, scrapes pages, **retries with a sharper query** if the first answer lacks facts |
+| **System power / Trash** | “Empty the bin” · “Shut down my Mac” · “Put my computer to sleep” — always **Approve / Deny** first |
+| **System Settings** | “Open Wi‑Fi settings” · “Open Accessibility settings” |
+| **Screen control** | Click, type, menus via Accessibility *(MacAgent.app must be enabled once)* |
+| **Shell & Python** | Short local bash / Python for compute and file tasks |
+| **Personal memory** | Notes in Preferences (“what do you know about me?”) |
+| **Voice** | Mic in the overlay (macOS speech) **or** FreeFlow → same agent |
+
+### Safety
+
+Destructive actions (`rm`, empty Trash, shut down, restart, sleep) never run silently. The overlay shows an **Approve / Deny** card with the exact command.
+
+Casual chat (“yo”, “hey”) does **not** invent shutdowns or deletes.
+
+---
+
+## Demo script (show someone in ~2 minutes)
+
+1. Launch MacAgent → **⌃⌥Space** to show the overlay.
+2. **Ask:** `what's my latest download?` → names the newest file in Downloads.
+3. **Ask:** `delete the file I downloaded latest` → Approve card → Approve → file gone.
+4. **Ask:** `compare frontier LLM models and their prices` → watch activity logs: search → maybe “searching again…” → answer with sources.
+5. **Ask:** `open Slack` → app launches.
+6. **Ask:** `yo` → friendly reply, no tools.
+
+Optional: tap the **mic** and dictate instead of typing.
+
+---
+
+## How it works (one picture)
+
+```text
+  You (⌃⌥Space overlay / mic / FreeFlow)
+              │
+              ▼
+     Local FastAPI daemon (:8081)
+              │
+              ▼
+   Multi-step agent loop (local Qwen)
+      ├─ web_search  (DuckDuckGo + page scrape, retries if thin)
+      ├─ run_bash / run_python
+      ├─ open_app / open_url / Settings
+      ├─ ui_click / ui_type / …
+      └─ respond  (only when the goal is done)
+              │
+              ▼
+   Overlay: answer · sources · Approve card · activity logs
 ```
 
-Or from the terminal:
+Everything stays on-device except outbound web search when needed.
+
+---
+
+## Quick start
+
+**Requirements:** macOS 13+ Apple Silicon, Xcode (or XcodeGen), Python 3.10+, project `venv`, Qwen2.5-1.5B-Instruct Q4_K_M GGUF (default `~/Models/qwen2.5-1.5b-instruct-q4_k_m.gguf`). Chrome recommended for URL opens.
 
 ```bash
-./automation/open_macagent.sh
-```
-
-- **⌃⌥Space** — show/hide the floating overlay (grant **Accessibility** when prompted)
-- Menu bar icon — Show Agent / Preferences / Quit
-- **Preferences** — Sites, Apps, Settings notes, Debug, History (secondary; not the main experience)
-- Overlay talks to the Python daemon via `POST /v1/ask` + SSE `/v1/events`
-- Voice still uses **FreeFlow** → `http://127.0.0.1:8081/v1`
-
-App Sandbox is **off** so the agent can spawn the daemon, search files (Spotlight), and open apps/URLs.
-
-## Requirements
-
-- macOS 13+ Apple Silicon
-- Xcode (or XcodeGen + `xcodebuild`)
-- Python 3.10+ + project `venv`
-- [FreeFlow](https://github.com/zachlatta/freeflow) for speech-to-text
-- Qwen2.5-1.5B-Instruct Q4_K_M GGUF (default `~/Models/qwen2.5-1.5b-instruct-q4_k_m.gguf`)
-- Google Chrome (for site opens)
-- **Full Disk / Spotlight** access helps `find_files` (mdfind)
-
-## Boot (once)
-
-```bash
-cd /Users/jatin/Projects/MacAgent
+cd /path/to/MacAgent
 python3 -m venv venv && source venv/bin/activate
 CMAKE_ARGS="-DGGML_METAL=on -DCMAKE_OSX_ARCHITECTURES=arm64" ARCHFLAGS="-arch arm64" \
   pip install -r requirements.txt
+
+./automation/open_macagent.sh   # build + launch overlay
 ```
 
-Regenerate the Xcode project after `project.yml` changes (optional):
+- **⌃⌥Space** — show/hide overlay (grant **Accessibility** when prompted; enable **MacAgent.app**, not AEServer)
+- First mic use: allow **Microphone** + **Speech Recognition**
+- Menu bar sparkles → Preferences (sites, apps, notes, history)
 
-```bash
-cd MacAgentApp && xcodegen generate
-```
+### FreeFlow (optional voice)
 
-## FreeFlow wiring
-
-1. Transcription: Groq (or other STT) as usual.
-2. Post-processing / LLM API base: `http://127.0.0.1:8081/v1`
-3. Keep MacAgent running while you dictate (daemon stays up with the app).
+1. STT as usual (e.g. Groq).
+2. Post-processing / LLM base URL: `http://127.0.0.1:8081/v1`
+3. Keep MacAgent running while you dictate.
 
 ```bash
 defaults write com.zachlatta.freeflow post_processing_timeout_seconds -float 120
 ```
 
-## How it works
+---
 
-1. Overlay or FreeFlow sends text to the local FastAPI daemon (`:8081`).
-2. **Agent tool loop** (capped ~4 steps) — model emits structured tool calls:
-   - `find_files` — Spotlight / limited home search
-   - `get_user_context` / `update_user_context` — Settings notes
-   - `list_apps` / `open_app` / `list_sites` / `open_url`
-   - `web_search` — DuckDuckGo grounded Q&A (**no auto-open** unless `open_url`)
-   - `run_python` — write & run short Python (math, scripts; blocked network/system APIs)
-   - `open_system_settings` — whitelisted panes only
-   - `respond` — final answer shown in the overlay
-3. Debug traces log each tool call under Preferences → Debug.
+## Permissions checklist
 
-Not a ChatGPT clone — each utterance is tool-use-or-answer for your Mac.
+| Permission | Why |
+|---|---|
+| Accessibility | Global hotkey + UI click/type |
+| Microphone + Speech Recognition | In-overlay dictation |
+| Full Disk / Spotlight (helpful) | Better file find via `mdfind` |
 
-DuckDuckGo access is keyless and best-effort (`ddgs`).
+---
 
-## Deprecated: `MacAgent/build.sh`
-
-The older `swiftc` / `MacAgent/build.sh` Dock multi-tab app is **deprecated**. Prefer `MacAgentApp/` (Xcode). The `MacAgent/` folder remains as reference only.
-
-## Optional: LaunchAgent
-
-If you want the daemon without the app UI, `./automation/install_launch_agent.sh install` still works. Prefer the app-managed daemon for day-to-day use.
-
-## Chrome login autofill (optional)
-
-1. `./automation/install_native_host.sh`
-2. Chrome → Load unpacked → `automation/extension`
-3. `./automation/install_native_host.sh --extension-id=<ID>`
-
-## CLI
+## CLI smoke test
 
 ```bash
 curl -s http://127.0.0.1:8081/health
-curl -s -X POST http://127.0.0.1:8081/v1/ask -H 'Content-Type: application/json' -d '{"text":"open wifi settings"}'
-curl -s http://127.0.0.1:8081/v1/activity?limit=20
+curl -s -X POST http://127.0.0.1:8081/v1/ask \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"what can you do?"}'
 curl -N http://127.0.0.1:8081/v1/events
 ```
 
 Logs: `~/Library/Logs/MacAgent/`.
+
+---
+
+## Project layout
+
+| Path | Role |
+|---|---|
+| `MacAgentApp/` | SwiftUI overlay (primary UI) |
+| `main.py` | FastAPI daemon |
+| `tools/agent_loop.py` | Multi-step agent + goal checks + search retries |
+| `llm/inference.py` | Local GGUF planner / answers |
+| `automation/` | open/kill scripts, optional Chrome host |
+
+The older `MacAgent/` Dock UI is **deprecated** — use `MacAgentApp/`.
+
+---
+
+## One-liner pitch
+
+> MacAgent is a **local tool-using agent for your Mac**: summon it over any app, talk or type, and it completes multi-step tasks (files, apps, web, UI) with an Approve gate for anything destructive — without sending your desktop to a cloud assistant.

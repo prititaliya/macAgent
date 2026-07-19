@@ -48,12 +48,24 @@ _NEEDS_CONFIRM = re.compile(
     r"\bkillall\b|"
     r"\bpkill\b|"
     r"\bmv\b.+\s+/dev/null|"
-    r">\s*/dev/null\s+2>&1\s*;\s*rm\b"
+    r">\s*/dev/null\s+2>&1\s*;\s*rm\b|"
+    r"\bshut\s*down\b|\brestart\b|\breboot\b|\bsleep\b|\blog\s*out\b|"
+    r"osascript.+\b(shut down|restart|sleep|log out)\b|"
+    r"System Events.+\b(shut down|restart|sleep|log out)\b"
     r")"
 )
 
 _EMPTY_TRASH_CMD = (
     "osascript -e 'tell application \"Finder\" to empty the trash'"
+)
+_SHUTDOWN_CMD = (
+    "osascript -e 'tell application \"System Events\" to shut down'"
+)
+_RESTART_CMD = (
+    "osascript -e 'tell application \"System Events\" to restart'"
+)
+_SLEEP_CMD = (
+    "osascript -e 'tell application \"System Events\" to sleep'"
 )
 
 
@@ -61,11 +73,31 @@ def empty_trash_command() -> str:
     return _EMPTY_TRASH_CMD
 
 
+def shutdown_command() -> str:
+    return _SHUTDOWN_CMD
+
+
+def restart_command() -> str:
+    return _RESTART_CMD
+
+
+def sleep_command() -> str:
+    return _SLEEP_CMD
+
+
 def summarize_command(command: str) -> str:
     cmd = (command or "").strip()
     lower = cmd.lower()
     if "empty the trash" in lower or ".trash" in lower:
         return "Empty the Trash (permanently delete everything in Bin)"
+    if "shut down" in lower:
+        return "Shut down this Mac"
+    if "restart" in lower or "reboot" in lower:
+        return "Restart this Mac"
+    if re.search(r"(?i)\bsleep\b", lower) and "osascript" in lower:
+        return "Put this Mac to sleep"
+    if "log out" in lower:
+        return "Log out of this Mac"
     if re.search(r"(?i)\brm\b", cmd):
         return f"Delete files via shell:\n{cmd}"
     if re.search(r"(?i)\bkillall\b|\bpkill\b", cmd):

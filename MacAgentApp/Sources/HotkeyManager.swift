@@ -109,10 +109,20 @@ final class HotkeyManager {
     }
 
     private func promptAccessibilityIfNeeded() {
-        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-        let trusted = AXIsProcessTrustedWithOptions(opts)
-        if !trusted {
-            NSLog("MacAgent: Accessibility not granted — ⌃⌥Space may only work when MacAgent is focused. Enable in System Settings → Privacy & Security → Accessibility.")
+        let trustedSilent = AXIsProcessTrusted()
+        if trustedSilent {
+            return
         }
+        let defaults = UserDefaults.standard
+        let promptedKey = "didPromptAccessibility"
+        // Only show the system dialog once (first launch / first need).
+        if defaults.bool(forKey: promptedKey) {
+            NSLog("MacAgent: Accessibility still off — enable in System Settings → Privacy & Security → Accessibility.")
+            return
+        }
+        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(opts)
+        defaults.set(true, forKey: promptedKey)
+        NSLog("MacAgent: Prompted for Accessibility (once). Grant it for ⌃⌥Space + UI control.")
     }
 }

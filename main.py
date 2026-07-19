@@ -322,8 +322,15 @@ async def confirm_action(body: ConfirmBody) -> dict[str, Any]:
     result = run_bash(command, confirmed=True)
     if result.get("ok"):
         msg = (result.get("stdout") or "").strip() or "Done."
-        if "empty the trash" in command.lower():
+        cmd_l = command.lower()
+        if "empty the trash" in cmd_l:
             msg = "Trash emptied."
+        elif "shut down" in cmd_l:
+            msg = "Shutting down…"
+        elif "restart" in cmd_l:
+            msg = "Restarting…"
+        elif re.search(r"\bsleep\b", cmd_l):
+            msg = "Sleeping…"
         event_bus.publish(
             utterance=utterance,
             kind="answer",

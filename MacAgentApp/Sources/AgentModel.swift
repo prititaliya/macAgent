@@ -35,6 +35,8 @@ final class AgentModel: ObservableObject {
     /// Alternates only while hideUrgency — drives the heartbeat.
     @Published var hidePulse = false
     @Published var busy = false
+    /// True while the overlay mic is recording (pauses auto-hide).
+    @Published var isDictating = false
     @Published var statusLine = ""
     @Published var daemonOnline = false
     @Published var history: [[String: Any]] = []

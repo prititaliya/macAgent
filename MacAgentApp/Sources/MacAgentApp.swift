@@ -53,13 +53,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.overlay?.toggle()
         }
         HotkeyManager.shared.registerDefault()
+        UIBridgeServer.shared.start()
 
         NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification,
             object: nil,
             queue: .main
         ) { _ in
-            Task { @MainActor in AgentModel.shared.shutdown() }
+            Task { @MainActor in
+                UIBridgeServer.shared.stop()
+                AgentModel.shared.shutdown()
+            }
         }
 
         Task {
@@ -75,7 +79,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard app.processIdentifier != myPID else { continue }
             let matchBundle = app.bundleIdentifier == mine
             let matchName = (app.localizedName ?? "") == "MacAgent"
-                || (app.bundleURL?.lastPathComponent == "MacAgent.app")
+                || (app.bundleURL?.lastPathCompo₹nent == "MacAgent.app")
             guard matchBundle || matchName else { continue }
             app.forceTerminate()
         }

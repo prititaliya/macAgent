@@ -23,6 +23,7 @@ targets:
     dependencies:
       - sdk: Carbon.framework
       - sdk: ApplicationServices.framework
+      - sdk: Network.framework
     settings:
       base:
         INFOPLIST_FILE: Sources/Info.plist
@@ -41,3 +42,5 @@ targets:
         LSMinimumSystemVersion: "13.0"
         LSUIElement: true
         NSHighResolutionCapable: true
+        NSMicrophoneUsageDescription: MacAgent uses the microphone so you can dictate questions and commands in the overlay.
+        NSSpeechRecognitionUsageDescription: MacAgent turns your speech into text with on-device macOS recognition, then runs the same local agent as typed input.

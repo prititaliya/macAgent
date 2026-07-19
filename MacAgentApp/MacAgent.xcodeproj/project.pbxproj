@@ -20,10 +20,14 @@
 		8F3DE8A84C63B160ECDA4AC3 /* PreferencesController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 447A36FFF6B6397D8B9B720F /* PreferencesController.swift */; };
 		9783F83B05FC6E6030ADBBBC /* MacAgentApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = C01C91F1A9E49285A42B7956 /* MacAgentApp.swift */; };
 		B3A768822048A0F8ED46626F /* MacAgentLogo.png in Resources */ = {isa = PBXBuildFile; fileRef = 2A74B0C4DEE120BE13342E3D /* MacAgentLogo.png */; };
+		DEBB2EBAF2B08F2D061B6C00 /* SpeechCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9FA6F1D12BCA27AD18F60FE7 /* SpeechCapture.swift */; };
+		E5CE12CE15AFEC2729CA116A /* UIBridgeServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = BDEC0568726266E5418F1542 /* UIBridgeServer.swift */; };
+		E7CA8F3517F1ACD6959D2269 /* Network.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 0EAF4E441A0123C855817320 /* Network.framework */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		09447E68AAE10687942F7058 /* AgentModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentModel.swift; sourceTree = "<group>"; };
+		0EAF4E441A0123C855817320 /* Network.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Network.framework; path = System/Library/Frameworks/Network.framework; sourceTree = SDKROOT; };
 		20F7C939A0093C0A8624AC01 /* PreferencesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreferencesView.swift; sourceTree = "<group>"; };
 		2A74B0C4DEE120BE13342E3D /* MacAgentLogo.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = MacAgentLogo.png; sourceTree = "<group>"; };
 		2F84FE0D12C6CC7DCA522A87 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
@@ -33,6 +37,8 @@
 		7AD2DAF6E4A354DEE463180E /* ApplicationServices.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = ApplicationServices.framework; path = System/Library/Frameworks/ApplicationServices.framework; sourceTree = SDKROOT; };
 		7E2CE36F376743B829ADB642 /* HotkeyManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HotkeyManager.swift; sourceTree = "<group>"; };
 		8AF965C5487C669D42350999 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		9FA6F1D12BCA27AD18F60FE7 /* SpeechCapture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeechCapture.swift; sourceTree = "<group>"; };
+		BDEC0568726266E5418F1542 /* UIBridgeServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UIBridgeServer.swift; sourceTree = "<group>"; };
 		C01C91F1A9E49285A42B7956 /* MacAgentApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MacAgentApp.swift; sourceTree = "<group>"; };
 		C64791C9045A7E87F2CFB790 /* OverlayView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OverlayView.swift; sourceTree = "<group>"; };
 		D69D18901D9440633C037AE4 /* OverlayController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OverlayController.swift; sourceTree = "<group>"; };
@@ -47,6 +53,7 @@
 			files = (
 				78F28D8411E8E94196EAFCF0 /* Carbon.framework in Frameworks */,
 				154D3EC346EF59415A669DAA /* ApplicationServices.framework in Frameworks */,
+				E7CA8F3517F1ACD6959D2269 /* Network.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -67,6 +74,7 @@
 			children = (
 				7AD2DAF6E4A354DEE463180E /* ApplicationServices.framework */,
 				DF6F4E31E471543A790BF95D /* Carbon.framework */,
+				0EAF4E441A0123C855817320 /* Network.framework */,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";
@@ -85,6 +93,8 @@
 				C64791C9045A7E87F2CFB790 /* OverlayView.swift */,
 				447A36FFF6B6397D8B9B720F /* PreferencesController.swift */,
 				20F7C939A0093C0A8624AC01 /* PreferencesView.swift */,
+				9FA6F1D12BCA27AD18F60FE7 /* SpeechCapture.swift */,
+				BDEC0568726266E5418F1542 /* UIBridgeServer.swift */,
 				F70BB9C96B9C7E95277CFAD3 /* Resources */,
 			);
 			path = Sources;
@@ -184,6 +194,8 @@
 				7CE92FB26DDEFCA76ECF2BE0 /* OverlayView.swift in Sources */,
 				8F3DE8A84C63B160ECDA4AC3 /* PreferencesController.swift in Sources */,
 				79FD8C03CB3D627DD8FE1CA3 /* PreferencesView.swift in Sources */,
+				DEBB2EBAF2B08F2D061B6C00 /* SpeechCapture.swift in Sources */,
+				E5CE12CE15AFEC2729CA116A /* UIBridgeServer.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

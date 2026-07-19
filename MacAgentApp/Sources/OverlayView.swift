@@ -11,6 +11,7 @@ struct OverlayView: View {
     @State private var draft = ""
     @State private var logsExpanded = false
     @FocusState private var focused: Bool
+    @StateObject private var speech = SpeechCapture()
 
     private var logSteps: [TraceStep] {
         model.traceSteps.filter { $0.title != "Answer" && $0.title != "Input" }
@@ -42,6 +43,25 @@ struct OverlayView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+            } else if speech.isListening {
+                HStack(spacing: 8) {
+                    TimelineView(.animation(minimumInterval: 0.45, paused: false)) { context in
+                        Circle()
+                            .fill(Color.red)
+                            .frame(width: 7, height: 7)
+                            .opacity(
+                                Int(context.date.timeIntervalSinceReferenceDate * 2) % 2 == 0
+                                    ? 1.0 : 0.25
+                            )
+                    }
+                    Text(speech.statusMessage.isEmpty ? "Listening…" : speech.statusMessage)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } else if !speech.statusMessage.isEmpty {
+                Text(speech.statusMessage)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
             }
 
             ScrollView {
@@ -231,6 +251,11 @@ struct OverlayView: View {
         .onChange(of: autoHideSeconds) { _ in
             onInteract()
         }
+        .onChange(of: model.isDictating) { dictating in
+            if !dictating && speech.isListening {
+                speech.cancel()
+            }
+        }
     }
 
     private var borderColor: Color {
@@ -278,18 +303,61 @@ struct OverlayView: View {
 
     private var inputBar: some View {
         HStack(spacing: 8) {
-            TextField("Ask or tell MacAgent…", text: $draft)
+            Button {
+                onInteract()
+                Task { await toggleMic() }
+            } label: {
+                Image(systemName: speech.isListening ? "mic.fill" : "mic")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(speech.isListening ? Color.red : Color.secondary)
+                    .frame(width: 28, height: 28)
+                    .background(
+                        Circle()
+                            .fill(speech.isListening ? Color.red.opacity(0.18) : Color.white.opacity(0.06))
+                    )
+            }
+            .buttonStyle(.plain)
+            .help(speech.isListening ? "Stop listening" : "Dictate with Mac speech recognition")
+            .disabled(model.busy && !speech.isListening)
+            .accessibilityLabel(speech.isListening ? "Stop dictation" : "Start dictation")
+
+            TextField(
+                speech.isListening ? "Listening… tap mic to send" : "Ask or tell MacAgent…",
+                text: $draft
+            )
                 .textFieldStyle(.plain)
                 .font(.system(size: 18, weight: .medium))
                 .focused($focused)
                 .onSubmit { send() }
                 .onChange(of: draft) { _ in onInteract() }
-            Button("Send") { send() }
+                .onChange(of: speech.partialText) { partial in
+                    if speech.isListening, !partial.isEmpty {
+                        draft = partial
+                        onInteract()
+                    }
+                }
+
+            Button(speech.isListening ? "Stop" : "Send") {
+                if speech.isListening {
+                    Task { await toggleMic() }
+                } else {
+                    send()
+                }
+            }
                 .buttonStyle(.borderedProminent)
-                .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.busy)
+                .tint(speech.isListening ? .red : nil)
+                .disabled(
+                    speech.isListening
+                        ? false
+                        : (draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.busy)
+                )
         }
         .padding(12)
         .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(speech.isListening ? Color.red.opacity(0.45) : Color.clear, lineWidth: 1.5)
+        )
         .contentShape(Rectangle())
         .onTapGesture {
             focused = true
@@ -342,7 +410,7 @@ struct OverlayView: View {
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
-            Text("Voice: FreeFlow → :8081")
+            Text(speech.isListening ? "Mic listening" : "Voice: Mic or FreeFlow → :8081")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
         }
@@ -366,5 +434,24 @@ struct OverlayView: View {
         logsExpanded = true
         onInteract()
         Task { await model.ask(q) }
+    }
+
+    private func toggleMic() async {
+        onInteract()
+        if speech.isListening {
+            model.isDictating = false
+            let text = speech.stop()
+            if !text.isEmpty {
+                draft = text
+                send()
+            }
+        } else {
+            model.isDictating = true
+            await speech.start()
+            if !speech.isListening {
+                model.isDictating = false
+            }
+            onInteract()
+        }
     }
 }

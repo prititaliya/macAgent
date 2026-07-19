@@ -26,5 +26,9 @@
 	<true/>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>MacAgent uses the microphone so you can dictate questions and commands in the overlay.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>MacAgent turns your speech into text with on-device macOS recognition, then runs the same local agent as typed input.</string>
 </dict>
 </plist>

@@ -10,14 +10,93 @@ from typing import Any, Optional
 
 from events.bus import event_bus
 from events.debug_trace import trace_step
-from tools.pending_actions import create_pending
+from tools.pending_actions import create_pending, clear_all as clear_pending_actions
 from tools.registry import TOOL_CATALOG, ToolRegistry
-from tools.run_bash import empty_trash_command
+from tools.run_bash import (
+    empty_trash_command,
+    restart_command,
+    shutdown_command,
+    sleep_command,
+)
 
 logger = logging.getLogger(__name__)
 
-_MAX_ITERS = 4
+_MAX_ITERS = 10
+_MAX_WEB_SEARCHES = 3
 _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+_ACTION_RE = re.compile(
+    r"(?i)\b("
+    r"shut\s*down|turn\s+off|power\s+off|restart|reboot|sleep|log\s*out|"
+    r"empty\s+(the\s+)?(bin|trash)|delete|remove|install|quit|close|"
+    r"click|press|type|open|launch|start|enable|disable|toggle|"
+    r"set|change|move|copy|create|make|do\s+it|perform|run\s+this"
+    r")\b"
+)
+
+_CHAT_RE = re.compile(
+    r"(?i)^\s*("
+    r"yo+|hey+|hi+|hello+|sup+|howdy|thanks|thank\s+you|thx|"
+    r"ok|okay|cool|nice|great|awesome|lol|haha|"
+    r"good\s+(morning|afternoon|evening|night)|"
+    r"how\s+are\s+you|what'?s\s+up|wassup"
+    r")[\s!.?]*$"
+)
+
+_META_RE = re.compile(
+    r"(?i)\b("
+    r"what\s+can\s+(you|u|ya)\s+do|"
+    r"what\s+are\s+(you|u)\s+(able|capable)|"
+    r"your\s+capabilities|what\s+capabilities|"
+    r"help\s+me\s+understand|"
+    r"what\s+things\s+can\s+(you|u)|"
+    r"by\s+yourself|who\s+are\s+(you|u)|"
+    r"what\s+are\s+(you|u)|introduce\s+yourself"
+    r")\b"
+)
+
+_ABOUT_ME_RE = re.compile(
+    r"(?i)\b("
+    r"what\s+do\s+(you|u)\s+know\s+about\s+me|"
+    r"what\s+do\s+(you|u)\s+remember\s+about\s+me|"
+    r"tell\s+me\s+about\s+(myself|me)\b|"
+    r"who\s+am\s+i\b|"
+    r"what('?s|\s+is)\s+my\s+(profile|bio|background)\b|"
+    r"do\s+(you|u)\s+know\s+(who\s+i\s+am|me)\b"
+    r")"
+)
+
+_DESTRUCTIVE_UTTERANCE_RE = re.compile(
+    r"(?i)\b("
+    r"shut\s*down|turn\s+off|power\s+off|restart|reboot|"
+    r"empty\s+(the\s+)?(bin|trash)|clear\s+(the\s+)?(bin|trash)|"
+    r"\brm\b|\bdelete\b|\bremove\b|delete\s+all|wipe|"
+    r"put\s+.+\s+to\s+sleep|sleep\s+(my\s+)?(mac|pc|computer)|go\s+to\s+sleep|"
+    r"log\s*out"
+    r")\b"
+)
+
+_DISCOVERY_BASH_RE = re.compile(
+    r"(?i)(^|[;&|]\s*|\n\s*)(ls|find|mdfind|locate|stat|du|head|tail|file|wc|dirname|basename)\b"
+)
+
+_DELETE_RE = re.compile(r"(?i)\b(delete|remove|rm|trash)\b")
+_OPEN_RE = re.compile(r"(?i)\b(open|launch|start|reveal)\b")
+_EMPTY_TRASH_RE = re.compile(
+    r"(?i)\b(empty\s+(the\s+)?(bin|trash)|clear\s+(the\s+)?(bin|trash))\b"
+)
+
+_CAPABILITIES_TEXT = """Here's what I can do on your Mac:
+
+• Answer questions (local model + web search when needed)
+• Open apps and Chrome URLs
+• Find files/folders (Downloads, Spotlight, shell)
+• Empty Trash, shut down / restart / sleep — with your Approve first
+• Control the UI (click, type, menus) when Accessibility is enabled
+• Run short bash/Python for local tasks
+• Remember notes you save in Preferences
+
+Ask me like: “open Slack”, “what's my latest download?”, or “empty the bin”."""
 
 
 def _parse_tool_call(text: str) -> Optional[dict[str, Any]]:
@@ -60,6 +139,8 @@ class AgentLoop:
         history: list[dict[str, Any]] = []
         sources: list[Any] = []
         last_text = ""
+        # Drop stale Approve cards from a previous (possibly hallucinated) action.
+        clear_pending_actions()
 
         event_bus.publish(
             utterance=utterance,
@@ -85,6 +166,21 @@ class AgentLoop:
             tool = call["tool"]
             args = call.get("args") or {}
 
+            # Hard stop: model invented a destructive command the user did not ask for.
+            if tool == "run_bash":
+                cmd = str(args.get("command") or "")
+                if _command_is_destructive(cmd) and not _DESTRUCTIVE_UTTERANCE_RE.search(
+                    utterance or ""
+                ):
+                    return self._finish(
+                        utterance,
+                        "I won't run a destructive action unless you ask for it "
+                        "(e.g. “shut down my Mac” or “empty the bin”). "
+                        "What did you want instead?",
+                        sources,
+                        history,
+                    )
+
             # Special: generate Python then run it (1.5B-friendly path).
             if tool == "__write_and_run_python__":
                 event_bus.publish(
@@ -108,6 +204,34 @@ class AgentLoop:
                     tool="run_python",
                     tool_input={"code": code},
                 )
+
+            # Special: answer “what do you know about me?” from Preferences notes.
+            if tool == "__answer_about_user__":
+                event_bus.publish(
+                    utterance=utterance,
+                    kind="action",
+                    text="Reading your notes…",
+                    detail="pending",
+                    step="about_user",
+                )
+                reply = self.parser.answer_about_user(utterance)
+                history.append(
+                    {
+                        "call": {"tool": "respond", "args": {"text": reply}},
+                        "result": {"ok": True, "text": reply, "final": True},
+                    }
+                )
+                event_bus.publish(
+                    utterance=utterance,
+                    kind="trace",
+                    text="Answered from user notes",
+                    detail="about_user",
+                    step="about_user",
+                    tool="respond",
+                    tool_input={"utterance": utterance},
+                    tool_output={"text": reply[:500]},
+                )
+                return self._finish(utterance, reply, sources, history)
 
             # Special: generate bash then run it.
             if tool == "__write_and_run_bash__":
@@ -167,7 +291,12 @@ class AgentLoop:
                     tool_input={"text": last_text},
                     tool_output={"text": last_text},
                 )
-                return self._finish(utterance, last_text, sources, history)
+                finished = self._attempt_finish(
+                    utterance, last_text, sources, history
+                )
+                if finished is not None:
+                    return finished
+                continue
 
             result = self.registry.run(tool, args)
             history.append({"call": call, "result": result})
@@ -184,36 +313,99 @@ class AgentLoop:
             )
 
             if tool == "web_search" and isinstance(result.get("sources"), list):
-                sources = result["sources"]
+                for s in result["sources"]:
+                    if s not in sources:
+                        sources.append(s)
 
-            # Failed / empty web search → answer locally, never dump JSON.
+            # Failed / empty web search
             if tool == "web_search" and not result.get("ok"):
+                if _is_action_request(utterance):
+                    # Keep going — try local tools without web context.
+                    continue
                 reply = self._local_answer(utterance)
-                return self._finish(utterance, reply, sources, history)
+                finished = self._attempt_finish(utterance, reply, sources, history)
+                if finished is not None:
+                    return finished
+                continue
 
             if tool == "web_search" and result.get("ok") and result.get("context"):
-                reply = self.parser.answer_from_search(
-                    utterance, str(result["context"])
-                )
-                return self._finish(utterance, reply, sources, history)
+                if _is_action_request(utterance):
+                    # Research informs the next tool call — do NOT answer-only.
+                    event_bus.publish(
+                        utterance=utterance,
+                        kind="action",
+                        text="Research done — acting…",
+                        detail="pending",
+                    )
+                    continue
+                # Merge contexts from earlier searches so retries compound evidence.
+                combined = _combined_search_context(history)
+                reply = self.parser.answer_from_search(utterance, combined)
+                searches_done = _web_search_count(history)
+                if _answer_needs_more_search(reply) and searches_done < _MAX_WEB_SEARCHES:
+                    history.append(
+                        {
+                            "call": {"tool": "_search_retry", "args": {}},
+                            "result": {
+                                "ok": False,
+                                "incomplete": True,
+                                "needs_more_search": True,
+                                "reason": "web answer lacked enough evidence",
+                                "candidate": (reply or "")[:400],
+                            },
+                        }
+                    )
+                    event_bus.publish(
+                        utterance=utterance,
+                        kind="action",
+                        text=f"Need better sources — searching again ({searches_done}/{_MAX_WEB_SEARCHES})…",
+                        detail="pending",
+                    )
+                    event_bus.publish(
+                        utterance=utterance,
+                        kind="trace",
+                        text="Search answer insufficient — retrying",
+                        detail="search_retry",
+                        step="search_retry",
+                        tool_output={"reason": "insufficient", "attempt": searches_done},
+                    )
+                    continue
+                finished = self._attempt_finish(utterance, reply, sources, history)
+                if finished is not None:
+                    return finished
+                continue
 
             if tool == "run_python":
                 if result.get("ok") and (result.get("stdout") or "").strip():
                     out = str(result["stdout"]).strip()
                     # Math / one-liners stay as-is; otherwise format for the question.
                     if len(out) < 80 and "\n" not in out:
-                        return self._finish(utterance, out, sources, history)
-                    text = self._format_command_answer(
-                        utterance,
-                        result.get("code") or "python",
-                        out,
-                    )
-                    return self._finish(utterance, text, sources, history)
+                        finished = self._attempt_finish(
+                            utterance, out, sources, history
+                        )
+                    else:
+                        text = self._format_command_answer(
+                            utterance,
+                            result.get("code") or "python",
+                            out,
+                        )
+                        finished = self._attempt_finish(
+                            utterance, text, sources, history
+                        )
+                    if finished is not None:
+                        return finished
+                    continue
                 err = result.get("error") or result.get("stderr") or "code failed"
                 reply = self._local_answer(utterance)
-                if reply:
-                    return self._finish(utterance, reply, sources, history)
-                return self._finish(utterance, f"Code failed: {err}", sources, history)
+                finished = self._attempt_finish(
+                    utterance,
+                    reply or f"Code failed: {err}",
+                    sources,
+                    history,
+                )
+                if finished is not None:
+                    return finished
+                continue
 
             if tool == "run_bash":
                 if result.get("needs_confirm"):
@@ -229,29 +421,91 @@ class AgentLoop:
                 cmd = (result.get("command") or args.get("command") or "").strip()
                 if result.get("ok") and out:
                     text = self._format_command_answer(utterance, cmd, out)
-                    return self._finish(utterance, text, sources, history)
-                if result.get("ok") and not out:
-                    return self._finish(
-                        utterance,
-                        "Done." if not cmd else f"Done (`{cmd}`).",
-                        sources,
-                        history,
+                    # Discovery-only bash on an action ask → keep looping.
+                    if _is_discovery_bash(cmd) and _goal_status(
+                        utterance, history, text
+                    ) == "incomplete":
+                        event_bus.publish(
+                            utterance=utterance,
+                            kind="action",
+                            text="Acting on results…",
+                            detail="pending",
+                        )
+                        continue
+                    finished = self._attempt_finish(
+                        utterance, text, sources, history
                     )
-                return self._finish(
+                    if finished is not None:
+                        return finished
+                    continue
+                if result.get("ok") and not out:
+                    text = "Done." if not cmd else f"Done (`{cmd}`)."
+                    finished = self._attempt_finish(
+                        utterance, text, sources, history
+                    )
+                    if finished is not None:
+                        return finished
+                    continue
+                finished = self._attempt_finish(
                     utterance,
                     f"Shell error: {err or 'command failed'}",
                     sources,
                     history,
+                    force=True,
                 )
+                if finished is not None:
+                    return finished
+                continue
 
             if result.get("final") and result.get("text"):
                 last_text = str(result["text"])
-                return self._finish(utterance, last_text, sources, history)
+                finished = self._attempt_finish(
+                    utterance, last_text, sources, history
+                )
+                if finished is not None:
+                    return finished
+                continue
 
             # Action tools that already did the work — wrap up without another LLM hop.
+            if tool == "open_app":
+                if result.get("not_found"):
+                    msg = result.get("message") or (
+                        f"I couldn't find that app. Which app did you mean?"
+                    )
+                    return self._finish(utterance, str(msg), sources, history)
+                if result.get("ok"):
+                    msg = result.get("message") or "Launched app."
+                    finished = self._attempt_finish(
+                        utterance, str(msg), sources, history
+                    )
+                    if finished is not None:
+                        return finished
+                    continue
+                return self._finish(
+                    utterance,
+                    result.get("error") or result.get("message") or "Could not open app.",
+                    sources,
+                    history,
+                )
+
+            if tool == "open_url":
+                if result.get("ok"):
+                    msg = result.get("message") or f"Opened {result.get('url')}"
+                    finished = self._attempt_finish(
+                        utterance, str(msg), sources, history
+                    )
+                    if finished is not None:
+                        return finished
+                    continue
+                return self._finish(
+                    utterance,
+                    result.get("error")
+                    or "Couldn't open that URL in Chrome. Is Google Chrome installed?",
+                    sources,
+                    history,
+                )
+
             if tool in {
-                "open_app",
-                "open_url",
                 "open_folder",
                 "open_system_settings",
                 "update_user_context",
@@ -267,7 +521,20 @@ class AgentLoop:
                     msg = f"Opened System Settings ({result.get('pane') or 'general'})."
                 elif tool == "open_folder":
                     msg = result.get("message") or f"Opened folder {result.get('path')}"
-                return self._finish(utterance, str(msg), sources, history)
+                finished = self._attempt_finish(
+                    utterance, str(msg), sources, history
+                )
+                if finished is not None:
+                    return finished
+                continue
+
+            # UI tools: keep looping so the agent can multi-step; only stop on hard fail.
+            if tool in {"ui_snapshot", "ui_click", "ui_type", "ui_key", "ui_menu"}:
+                if not result.get("ok"):
+                    err = _friendly_ui_error(result.get("error") or "UI action failed")
+                    return self._finish(utterance, err, sources, history)
+                # Successful UI step — continue toward respond / more clicks.
+                continue
 
             if tool == "find_files" and result.get("ok") and step >= 0:
                 paths = result.get("paths") or []
@@ -289,23 +556,44 @@ class AgentLoop:
                         for i, p in enumerate(paths[:12], 1):
                             lines.append(f"{i}. {p}")
                         header = f"Found {len(paths)} file(s):"
-                    return self._finish(
-                        utterance,
-                        header + "\n" + "\n".join(lines),
-                        sources,
-                        history,
+                    listing = header + "\n" + "\n".join(lines)
+                    if _goal_status(utterance, history, listing) == "incomplete":
+                        event_bus.publish(
+                            utterance=utterance,
+                            kind="action",
+                            text="Acting on results…",
+                            detail="pending",
+                        )
+                        continue
+                    finished = self._attempt_finish(
+                        utterance, listing, sources, history
                     )
-                return self._finish(
+                    if finished is not None:
+                        return finished
+                    continue
+                finished = self._attempt_finish(
                     utterance,
                     "No matching files found.",
                     sources,
                     history,
+                    force=True,
                 )
+                if finished is not None:
+                    return finished
+                continue
 
         # Force a respond if the model never did.
         last_text = self._synthesize_from_history(utterance, history) or last_text
         if not last_text:
             last_text = "I could not complete that request."
+        if _is_action_request(utterance) and _goal_status(
+            utterance, history, last_text
+        ) == "incomplete":
+            last_text = (
+                f"{last_text}\n\n"
+                "I found information but could not finish the full action "
+                "(permission may be required, or the next step failed)."
+            )
         return self._finish(utterance, last_text, sources, history)
 
     def _next_call(
@@ -317,15 +605,27 @@ class AgentLoop:
             if quick:
                 return quick
 
+        # After discovery, force the mutating follow-up when the goal is clear.
+        follow = _forced_followup(utterance, history)
+        if follow:
+            return follow
+
         raw = self.parser.plan_tool_call(utterance, history, TOOL_CATALOG)
         parsed = _parse_tool_call(raw)
         if parsed:
-            return parsed
-        # Fallback: if we have web context already, respond; else web_search or respond.
+            return _sanitize_planned_call(utterance, parsed)
+        # Fallback: if we have web context already, respond; else chat/local — not web for "yo".
         if history:
             return {
                 "tool": "respond",
                 "args": {"text": self._synthesize_from_history(utterance, history)},
+            }
+        if _CHAT_RE.match((utterance or "").strip()) or len((utterance or "").split()) <= 2:
+            return {
+                "tool": "respond",
+                "args": {
+                    "text": "Hey — I'm here. What do you want to do?"
+                },
             }
         return {"tool": "web_search", "args": {"query": utterance}}
 
@@ -439,6 +739,84 @@ class AgentLoop:
             "steps": len(history),
         }
 
+    def _attempt_finish(
+        self,
+        utterance: str,
+        text: str,
+        sources: list[Any],
+        history: list[dict[str, Any]],
+        *,
+        force: bool = False,
+    ) -> Optional[dict[str, Any]]:
+        """Finish if the goal is done; otherwise return None so the loop continues."""
+        if force or not _is_action_request(utterance):
+            return self._finish(utterance, text, sources, history)
+
+        status = _goal_status(utterance, history, text)
+        reason: Optional[str] = None
+        next_hint = ""
+        if status == "incomplete":
+            reason = _goal_incomplete_reason(utterance, history, text)
+        elif status == "unknown":
+            # Secondary LLM critic when rules are inconclusive.
+            try:
+                check = self.parser.check_goal_done(
+                    utterance,
+                    _history_summary_for_critic(history),
+                    text,
+                )
+            except Exception:  # noqa: BLE001
+                check = None
+            if isinstance(check, dict) and check.get("done") is False:
+                reason = str(check.get("reason") or "goal not completed")
+                next_hint = str(check.get("next_hint") or "")
+
+        if reason:
+            # Avoid infinite incomplete loops on the same candidate.
+            recent_incomplete = sum(
+                1
+                for h in history
+                if (h.get("result") or {}).get("incomplete")
+            )
+            if recent_incomplete >= 2:
+                return self._finish(
+                    utterance,
+                    (
+                        f"{text}\n\n"
+                        f"I couldn't complete the full request ({reason})."
+                    ),
+                    sources,
+                    history,
+                )
+            history.append(
+                {
+                    "call": {"tool": "_goal_check", "args": {}},
+                    "result": {
+                        "ok": False,
+                        "incomplete": True,
+                        "reason": reason,
+                        "next_hint": next_hint,
+                        "candidate": (text or "")[:500],
+                    },
+                }
+            )
+            event_bus.publish(
+                utterance=utterance,
+                kind="trace",
+                text=f"Goal incomplete — {reason}",
+                detail="goal_check",
+                step="goal_check",
+                tool_output={"reason": reason, "next_hint": next_hint},
+            )
+            event_bus.publish(
+                utterance=utterance,
+                kind="action",
+                text="Acting on results…",
+                detail="pending",
+            )
+            return None
+        return self._finish(utterance, text, sources, history)
+
     def _finish(
         self,
         utterance: str,
@@ -511,6 +889,23 @@ def _heuristic_tool(utterance: str) -> Optional[dict[str, Any]]:
     if not text:
         return None
 
+    # Capability / help questions — never run UI automation for these.
+    if _META_RE.search(text):
+        return {"tool": "respond", "args": {"text": _CAPABILITIES_TEXT}}
+
+    # “What do you know about me?” — use Preferences notes, not a flaky web refuse.
+    if _ABOUT_ME_RE.search(text):
+        return {"tool": "__answer_about_user__", "args": {}}
+
+    # Greetings / small talk — never invent tools.
+    if _CHAT_RE.match(text):
+        return {
+            "tool": "respond",
+            "args": {
+                "text": "Hey — I'm MacAgent. Ask me anything, or say “what can you do?” for a quick list."
+            },
+        }
+
     # Simple arithmetic — answer locally, skip web search.
     math = _try_simple_math(text)
     if math is not None and re.search(r"(?i)[\+\-\*\/x×÷]", text):
@@ -540,15 +935,44 @@ def _heuristic_tool(utterance: str) -> Optional[dict[str, Any]]:
             "args": {"command": empty_trash_command()},
         }
 
+    # Power actions — only when clearly requested (never invent from "yo").
+    if re.search(
+        r"(?i)("
+        r"\b(shut\s*down|turn\s+off|power\s+off)\b.+\b(mac|pc|computer|machine|system)\b|"
+        r"\b(shut\s*down|turn\s+off|power\s+off)\s+(my\s+)?(mac|pc|computer|machine|system)\b|"
+        r"^(please\s+)?(can\s+you\s+)?(shut\s*down|turn\s+off|power\s+off)(\s+now)?\s*[.!]?\s*$"
+        r")",
+        text,
+    ):
+        return {"tool": "run_bash", "args": {"command": shutdown_command()}}
+    if re.search(
+        r"(?i)("
+        r"\b(restart|reboot)\b.+\b(mac|pc|computer|machine|system)\b|"
+        r"\b(restart|reboot)\s+(my\s+)?(mac|pc|computer|machine|system)\b"
+        r")",
+        text,
+    ):
+        return {"tool": "run_bash", "args": {"command": restart_command()}}
+    if re.search(
+        r"(?i)\b("
+        r"put\s+(the\s+|my\s+)?(mac|pc|computer|machine)\s+to\s+sleep|"
+        r"sleep\s+(my\s+)?(mac|pc|computer|machine)|"
+        r"go\s+to\s+sleep"
+        r")\b",
+        text,
+    ):
+        return {"tool": "run_bash", "args": {"command": sleep_command()}}
+
     # Recently downloaded / Downloads — bash, not a special-case tool.
     if re.search(
         r"(?i)\b("
         r"recent(ly)?\s+download|download(ed)?\s+(item|file|folder|stuff)?|"
-        r"last\s+download|newest\s+in\s+downloads|"
-        r"what('?s|\s+is|\s+are)?\s+(the\s+)?most\s+recent(ly)?|"
+        r"last\s+download|latest\s+download|newest\s+in\s+downloads|"
+        r"what('?s|\s+is|\s+are)?\s+(the\s+)?(most\s+recent(ly)?|latest)\b|"
         r"what('?s| did i)\s+download|"
         r"find( me)?\s+(my\s+)?recent(ly)?\s+download|"
-        r"show( me)?\s+(my\s+)?downloads"
+        r"show( me)?\s+(my\s+)?downloads|"
+        r"file\s+that\s+i\s+download"
         r")\b",
         text,
     ) and re.search(r"(?i)download", text):
@@ -556,6 +980,11 @@ def _heuristic_tool(utterance: str) -> Optional[dict[str, Any]]:
             re.search(r"(?i)\b(most\s+recent(ly)?|last|newest|latest)\b", text)
             and not re.search(r"(?i)\b(list|show\s+all|all\s+my)\b", text)
         )
+        if _DELETE_RE.search(text):
+            return {
+                "tool": "run_bash",
+                "args": {"command": _delete_latest_download_command()},
+            }
         if re.search(r"(?i)\b(open|reveal)\b", text):
             return {
                 "tool": "run_bash",
@@ -631,10 +1060,13 @@ def _heuristic_tool(utterance: str) -> Optional[dict[str, Any]]:
             pane = "wifi"
         return {"tool": "open_system_settings", "args": {"pane": pane}}
 
-    m = re.match(r"(?i)^\s*(open|launch|start)\s+(.+)$", text)
+    # "can you open …" / "please open …" / "open …"
+    m = re.search(
+        r"(?i)(?:^|\b)(?:can\s+you\s+|could\s+you\s+|please\s+)?(open|launch|start)\s+(.+)$",
+        text,
+    )
     if m:
-        target = m.group(2).strip().rstrip(".")
-        # Strip leading "the folder/directory"
+        target = m.group(2).strip().rstrip(".?!")
         target = re.sub(r"(?i)^(the\s+)?(folder|directory|dir)\s+", "", target).strip()
         if re.search(r"(?i)\b(folder|directory|dir)\b", target):
             target = re.sub(r"(?i)\b(folder|directory|dir)\b", "", target).strip()
@@ -642,13 +1074,17 @@ def _heuristic_tool(utterance: str) -> Optional[dict[str, Any]]:
         if target.startswith("http") or (
             "." in target.split()[0] and not target.lower().endswith(".app")
         ):
-            # hostname-looking → url; course codes like comp3370 stay folders/apps
-            if "/" in target or target.startswith("www.") or re.search(r"\.[a-z]{2,}$", target.lower()):
+            if (
+                "/" in target
+                or target.startswith("www.")
+                or re.search(r"\.[a-z]{2,}(/|$)", target.lower())
+            ):
                 return {"tool": "open_url", "args": {"url": target}}
         if "setting" in target.lower() or "preference" in target.lower():
             return {"tool": "open_system_settings", "args": {"pane": "general"}}
-        # Course / project style names → try folder first (comp3370, my-notes, etc.)
-        if re.match(r"(?i)^[a-z]{2,}\d{3,}[a-z0-9_\-]*$", target.replace(" ", "")) or (
+        # Course codes like comp3370 → folder; otherwise app.
+        compact = target.replace(" ", "")
+        if re.match(r"(?i)^[a-z]{2,6}\d{3,4}[a-z]?$", compact) or (
             "folder" in lower or "directory" in lower
         ):
             return {"tool": "run_bash", "args": {"command": _bash_open_folder(target)}}
@@ -677,6 +1113,515 @@ def load_notes_safe() -> str:
         return load_user_notes()
     except Exception:  # noqa: BLE001
         return ""
+
+
+def _command_is_destructive(command: str) -> bool:
+    from tools.run_bash import classify_command
+
+    return classify_command(command) in {"needs_confirm", "hard_block"}
+
+
+def _sanitize_planned_call(
+    utterance: str, call: dict[str, Any]
+) -> dict[str, Any]:
+    """Block hallucinated destructive / UI tools on casual chat."""
+    tool = (call.get("tool") or "").strip()
+    args = call.get("args") if isinstance(call.get("args"), dict) else {}
+    text = (utterance or "").strip()
+
+    if _CHAT_RE.match(text) or _META_RE.search(text):
+        if tool != "respond":
+            if _META_RE.search(text):
+                return {"tool": "respond", "args": {"text": _CAPABILITIES_TEXT}}
+            return {
+                "tool": "respond",
+                "args": {
+                    "text": "Hey — I'm MacAgent. Ask me anything, or say “what can you do?”"
+                },
+            }
+
+    if _ABOUT_ME_RE.search(text) and tool in {
+        "web_search",
+        "ui_snapshot",
+        "ui_click",
+        "run_bash",
+        "open_url",
+    }:
+        return {"tool": "__answer_about_user__", "args": {}}
+
+    if tool == "run_bash":
+        cmd = str(args.get("command") or "")
+        if _command_is_destructive(cmd) and not _DESTRUCTIVE_UTTERANCE_RE.search(text):
+            return {
+                "tool": "respond",
+                "args": {
+                    "text": (
+                        "I almost ran a system action you didn't ask for — skipped it. "
+                        "What would you like me to do?"
+                    )
+                },
+            }
+
+    if tool in {"ui_snapshot", "ui_click", "ui_type", "ui_key", "ui_menu"}:
+        if not _is_action_request(text) or _CHAT_RE.match(text):
+            return {
+                "tool": "respond",
+                "args": {
+                    "text": (
+                        "I don't need screen control for that. "
+                        "Ask a question or tell me what to open/do."
+                    )
+                },
+            }
+
+    return call
+
+
+def _friendly_ui_error(raw: str) -> str:
+    lower = (raw or "").lower()
+    if (
+        "assistive" in lower
+        or "not allowed" in lower
+        or "accessibility" in lower
+        or "osascript is not allowed" in lower
+    ):
+        return (
+            "I need Accessibility permission to control the screen "
+            "(click/type). Open Preferences → Permissions → "
+            "Open Accessibility Settings, enable MacAgent once, then try again.\n\n"
+            "For a list of what I can do without that, ask: “what can you do?”"
+        )
+    return (raw or "UI action failed").strip()
+
+
+def _is_discovery_bash(command: str) -> bool:
+    cmd = (command or "").strip()
+    if not cmd:
+        return False
+    # Mutating commands are never "discovery-only".
+    if re.search(r"(?i)\b(rm|rmdir|mv|cp|mkdir|touch|kill|killall|osascript)\b", cmd):
+        return False
+    return bool(_DISCOVERY_BASH_RE.search(cmd))
+
+
+def _history_has_successful_mutation(history: list[dict[str, Any]]) -> bool:
+    for item in history:
+        call = item.get("call") or {}
+        result = item.get("result") or {}
+        tool = call.get("tool")
+        if tool in {"open_app", "open_url", "open_folder", "open_system_settings"}:
+            if result.get("ok"):
+                return True
+        if tool == "run_bash":
+            cmd = str((call.get("args") or {}).get("command") or result.get("command") or "")
+            if result.get("needs_confirm"):
+                return True  # confirm gate is the correct terminal for delete
+            if result.get("ok") and not _is_discovery_bash(cmd):
+                if re.search(
+                    r"(?i)\b(rm|rmdir|mv|empty|trash|shut\s*down|restart|sleep)\b",
+                    cmd,
+                ):
+                    return True
+            out = str(result.get("stdout") or "")
+            if result.get("ok") and re.search(
+                r"(?i)^(deleted|removed|emptied|moved|opened):", out
+            ):
+                return True
+    return False
+
+
+def _history_has_command_containing(history: list[dict[str, Any]], needle: str) -> bool:
+    n = needle.lower()
+    for item in history:
+        call = item.get("call") or {}
+        if call.get("tool") != "run_bash":
+            continue
+        cmd = str((call.get("args") or {}).get("command") or "")
+        if n in cmd.lower():
+            return True
+    return False
+
+
+def _goal_status(
+    utterance: str, history: list[dict[str, Any]], candidate: str
+) -> str:
+    """Return 'done' | 'incomplete' | 'unknown'."""
+    text = (utterance or "").strip()
+    if not text or not _is_action_request(text):
+        return "done"
+
+    cand = (candidate or "").strip()
+
+    if _EMPTY_TRASH_RE.search(text):
+        if _history_has_command_containing(history, "empty the trash") or any(
+            (h.get("result") or {}).get("needs_confirm") for h in history
+        ):
+            return "done"
+        return "incomplete"
+
+    if _DELETE_RE.search(text):
+        if _history_has_successful_mutation(history):
+            return "done"
+        if re.search(
+            r"(?i)your most recent download is|most recent (file|folder) is|"
+            r"^found \d+|most recent in downloads",
+            cand,
+        ):
+            return "incomplete"
+        # Only discovery so far.
+        only_discovery = True
+        saw_tool = False
+        for item in history:
+            call = item.get("call") or {}
+            tool = call.get("tool")
+            if tool in {"_goal_check"}:
+                continue
+            if tool == "respond":
+                continue
+            saw_tool = True
+            if tool == "find_files":
+                continue
+            if tool == "run_bash":
+                cmd = str((call.get("args") or {}).get("command") or "")
+                if _is_discovery_bash(cmd):
+                    continue
+                only_discovery = False
+                break
+            only_discovery = False
+            break
+        if saw_tool and only_discovery:
+            return "incomplete"
+        if not saw_tool and cand:
+            return "incomplete"
+        return "unknown"
+
+    if _OPEN_RE.search(text) and not _DELETE_RE.search(text):
+        # "open my latest download" etc.
+        if any(
+            (h.get("call") or {}).get("tool")
+            in {"open_app", "open_url", "open_folder", "open_system_settings"}
+            and (h.get("result") or {}).get("ok")
+            for h in history
+        ):
+            return "done"
+        if any(
+            (h.get("call") or {}).get("tool") == "run_bash"
+            and (h.get("result") or {}).get("ok")
+            and re.search(
+                r"(?i)\bopen\b",
+                str(((h.get("call") or {}).get("args") or {}).get("command") or ""),
+            )
+            for h in history
+        ):
+            return "done"
+        # Listing-only answers are incomplete for open asks.
+        if re.search(
+            r"(?i)your most recent download is|most recent in downloads|^found \d+",
+            cand,
+        ):
+            return "incomplete"
+        return "unknown"
+
+    return "unknown"
+
+
+def _goal_incomplete_reason(
+    utterance: str, history: list[dict[str, Any]], candidate: str
+) -> str:
+    if _DELETE_RE.search(utterance or ""):
+        return "listed or found the target but did not delete it yet"
+    if _EMPTY_TRASH_RE.search(utterance or ""):
+        return "trash was not emptied yet"
+    if _OPEN_RE.search(utterance or ""):
+        return "found the target but did not open it yet"
+    return "action not completed yet"
+
+
+def _delete_latest_download_command() -> str:
+    return (
+        'f=$(ls -t ~/Downloads/* 2>/dev/null | head -1); '
+        'if [ -n "$f" ]; then rm -- "$f"; echo "Deleted: $f"; '
+        'else echo "Downloads is empty"; fi'
+    )
+
+
+def _path_from_ls_stdout(stdout: str) -> Optional[str]:
+    """Best-effort newest file name from `ls -lt` stdout under Downloads."""
+    for line in (stdout or "").splitlines():
+        line = line.rstrip()
+        if not line or line.lower().startswith("total "):
+            continue
+        if line[0] not in "-dlbcps":
+            continue
+        parts = line.split(None, 8)
+        if len(parts) < 9:
+            continue
+        name = parts[8]
+        if name in {".", ".."}:
+            continue
+        # ls -lt ~/Downloads prints basenames; resolve under Downloads.
+        from pathlib import Path as _P
+
+        home = _P.home() / "Downloads" / name
+        return str(home)
+    return None
+
+
+def _first_path_from_history(history: list[dict[str, Any]]) -> Optional[str]:
+    import shlex
+
+    for item in reversed(history):
+        call = item.get("call") or {}
+        result = item.get("result") or {}
+        tool = call.get("tool")
+        if tool == "find_files":
+            items = result.get("items") or []
+            if items:
+                p = items[0].get("path")
+                if p:
+                    return str(p)
+            paths = result.get("paths") or []
+            if paths:
+                return str(paths[0])
+        if tool == "run_bash" and result.get("ok"):
+            cmd = str((call.get("args") or {}).get("command") or "")
+            out = str(result.get("stdout") or "")
+            if _is_discovery_bash(cmd) and "download" in cmd.lower():
+                p = _path_from_ls_stdout(out)
+                if p:
+                    return p
+            # echo Opened: /path
+            m = re.search(r"(?i)(?:opened|deleted):\s*(.+)$", out, re.M)
+            if m:
+                return m.group(1).strip()
+    _ = shlex  # silence if unused in some paths
+    return None
+
+
+def _forced_followup(
+    utterance: str, history: list[dict[str, Any]]
+) -> Optional[dict[str, Any]]:
+    """Deterministic next tool after discovery when the user goal is clear."""
+    if not history:
+        return None
+
+    # Q&A: prior search answer was too thin — search again with a sharper query.
+    if _history_needs_more_search(history) and _web_search_count(history) < _MAX_WEB_SEARCHES:
+        query = _next_search_query(utterance, history)
+        if query:
+            return {"tool": "web_search", "args": {"query": query}}
+
+    if _history_has_successful_mutation(history):
+        return None
+    text = utterance or ""
+
+    import shlex
+
+    if _DELETE_RE.search(text):
+        # Already queued/tried an rm — don't loop forever.
+        if _history_has_command_containing(history, "rm "):
+            return None
+        path = _first_path_from_history(history)
+        if path:
+            q = shlex.quote(path)
+            return {
+                "tool": "run_bash",
+                "args": {
+                    "command": f"rm -- {q} && echo Deleted: {q}",
+                },
+            }
+        if re.search(r"(?i)download", text):
+            return {
+                "tool": "run_bash",
+                "args": {"command": _delete_latest_download_command()},
+            }
+
+    if _OPEN_RE.search(text) and re.search(r"(?i)download", text):
+        if _history_has_command_containing(history, "open "):
+            return None
+        path = _first_path_from_history(history)
+        if path:
+            q = shlex.quote(path)
+            return {
+                "tool": "run_bash",
+                "args": {
+                    "command": f"open {q} && echo Opened: {q}",
+                },
+            }
+        return {
+            "tool": "run_bash",
+            "args": {
+                "command": (
+                    'f=$(ls -t ~/Downloads/* 2>/dev/null | head -1); '
+                    'if [ -n "$f" ]; then open "$f"; echo "Opened: $f"; '
+                    'else echo "Downloads is empty"; fi'
+                )
+            },
+        }
+    return None
+
+
+def _web_search_count(history: list[dict[str, Any]]) -> int:
+    return sum(
+        1
+        for h in history
+        if (h.get("call") or {}).get("tool") == "web_search"
+    )
+
+
+def _history_needs_more_search(history: list[dict[str, Any]]) -> bool:
+    for item in reversed(history):
+        result = item.get("result") or {}
+        if result.get("needs_more_search"):
+            return True
+        tool = (item.get("call") or {}).get("tool")
+        if tool == "web_search":
+            break
+    return False
+
+
+def _prior_search_queries(history: list[dict[str, Any]]) -> list[str]:
+    out: list[str] = []
+    for item in history:
+        call = item.get("call") or {}
+        if call.get("tool") != "web_search":
+            continue
+        q = str((call.get("args") or {}).get("query") or "").strip()
+        if q:
+            out.append(q)
+    return out
+
+
+def _combined_search_context(history: list[dict[str, Any]], limit: int = 9000) -> str:
+    blocks: list[str] = []
+    for i, item in enumerate(history, 1):
+        call = item.get("call") or {}
+        result = item.get("result") or {}
+        if call.get("tool") != "web_search":
+            continue
+        ctx = str(result.get("context") or "").strip()
+        if not ctx:
+            continue
+        q = str((call.get("args") or {}).get("query") or "")
+        blocks.append(f"=== Search {i}: {q} ===\n{ctx}")
+    merged = "\n\n".join(blocks)
+    return merged[:limit] if merged else ""
+
+
+def _answer_needs_more_search(text: str) -> bool:
+    """True when the grounded answer admits the sources weren't enough."""
+    t = (text or "").strip()
+    if not t:
+        return True
+    from llm.inference import _is_empty_refusal
+
+    if _is_empty_refusal(t):
+        return True
+    # Extra patterns common on long "sorry, context lacks…" replies.
+    return bool(
+        re.search(
+            r"(?i)("
+            r"does not (?:contain|address|include)|"
+            r"do not (?:contain|address|include)|"
+            r"not address the specific|"
+            r"would need (?:to search|more)|"
+            r"need to search for|"
+            r"lacks? (?:specific |enough )?(?:pricing|price|model)|"
+            r"no (?:specific )?(?:pricing|price|models?)"
+            r")",
+            t,
+        )
+    )
+
+
+def _next_search_query(utterance: str, history: list[dict[str, Any]]) -> Optional[str]:
+    """Build a sharper DuckDuckGo query for the next search attempt."""
+    prior = [p.lower() for p in _prior_search_queries(history)]
+    text = (utterance or "").strip()
+    lower = text.lower()
+    candidates: list[str] = []
+
+    wants_price = bool(re.search(r"(?i)\b(price|pricing|cost|subscription|\$)\b", text))
+    wants_compare = bool(re.search(r"(?i)\b(compare|comparison|vs|versus|frontier)\b", text))
+    mentions_ai = bool(
+        re.search(
+            r"(?i)\b(gpt|chatgpt|claude|gemini|llm|openai|anthropic|model)\b",
+            text,
+        )
+    )
+
+    if wants_price or wants_compare or mentions_ai:
+        candidates.extend(
+            [
+                "GPT-4o Claude Sonnet Gemini API pricing comparison 2026",
+                "OpenAI Anthropic Google frontier LLM pricing per million tokens",
+                "ChatGPT Plus Claude Pro Gemini Advanced subscription price comparison",
+            ]
+        )
+    if wants_price and not mentions_ai:
+        candidates.append(f"{text} official pricing")
+    # Tightened original ask is a fallback, not the first retry.
+    tightened = re.sub(r"(?i)\b(please|can you|could you|compare all|out there)\b", " ", text)
+    tightened = re.sub(r"\s+", " ", tightened).strip()
+    if tightened and tightened.lower() != lower:
+        candidates.append(tightened)
+    candidates.append(f"{text} pricing specs 2026")
+
+    for q in candidates:
+        q = (q or "").strip()
+        if not q:
+            continue
+        if q.lower() in prior:
+            continue
+        # Also skip near-duplicates of prior queries.
+        if any(q.lower() in p or p in q.lower() for p in prior if len(p) > 12):
+            continue
+        return q
+    # Last resort: append attempt number so DDG gets a fresh query string.
+    n = _web_search_count(history) + 1
+    fallback = f"{text} detailed facts attempt {n}"
+    if fallback.lower() not in prior:
+        return fallback
+    return None
+
+
+def _history_summary_for_critic(history: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for i, item in enumerate(history[-6:], 1):
+        call = item.get("call") or {}
+        result = item.get("result") or {}
+        tool = call.get("tool")
+        if result.get("incomplete"):
+            lines.append(f"{i}. goal_check incomplete: {result.get('reason')}")
+            continue
+        cmd = ""
+        if tool == "run_bash":
+            cmd = str((call.get("args") or {}).get("command") or "")[:120]
+        ok = result.get("ok")
+        confirm = result.get("needs_confirm")
+        lines.append(
+            f"{i}. {tool} cmd={cmd!r} ok={ok} confirm={confirm}"
+        )
+    return "\n".join(lines) if lines else "(none)"
+
+
+def _is_action_request(utterance: str) -> bool:
+    """True when the user wants something done on the Mac, not just answered."""
+    text = (utterance or "").strip()
+    if not text:
+        return False
+    if _META_RE.search(text):
+        return False
+    # Pure questions with no action verbs stay Q&A.
+    if re.match(
+        r"(?i)^\s*(what|why|how\s+do\s+i\s+know|who|when|where|which|whose|"
+        r"define|explain|tell\s+me\s+about)\b",
+        text,
+    ) and not _ACTION_RE.search(text):
+        return False
+    if _ACTION_RE.search(text):
+        return True
+    return False
 
 
 def _bash_open_folder(name: str) -> str:
