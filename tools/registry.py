@@ -61,6 +61,7 @@ Available tools (reply with ONE JSON object: {"tool":"...","args":{...}}):
 - web_search: {"query":"…"} — factual / live questions; if prior search lacked prices/facts, search again with a sharper query
 - open_app: {"name":"Safari"} — only if user asked to open an app
 - open_url: {"url":"https://…"} — only if user asked to open a site (Chrome)
+- open_folder: {"query":"comp3370"} — find and open a folder in Finder (prefer over bash find)
 - open_system_settings: {"pane":"wifi|bluetooth|…"} — only if user asked to OPEN Settings GUI
 - manage_system_resources: {"action":"kill","target_process":"Google Chrome"} — CLOSE/QUIT/KILL an app or process; {"action":"list"} for top CPU/memory
 - modify_system_setting: {"domain":"NSGlobalDomain","key":"AppleInterfaceStyle","value":"Dark","value_type":"string"} — ONLY for prefs/defaults (dark mode, Dock); NOT for closing apps
@@ -71,7 +72,10 @@ Available tools (reply with ONE JSON object: {"tool":"...","args":{...}}):
 - run_python: {"code":"print(2+4)"} — math / short scripts
 - ui_snapshot / ui_click / ui_type / ui_key / ui_menu — only for explicit on-screen control
 - get_user_context / update_user_context — notes
+- search_past_interactions: {"query":"…","limit":5} — search prior asks/answers
 To close/quit an app or browser → manage_system_resources kill (NOT control_power_management, NOT modify_system_setting).
+If the user asks for TWO things (open X and Y), use one tool per step — never combine into one open_app name.
+After ls/find_files, if they asked to move/delete/open the result, call run_bash — do NOT respond with only the listing.
 If a tool failed (ok:false), do NOT repeat the same call — try a different tool or respond with the error.
 Prefer spotlight_file_search over slow find/os.walk bash for locating files.
 NEVER invent shut down / restart / empty trash / rm unless the user clearly asked for that (delete/remove/rm).
@@ -87,6 +91,7 @@ class ToolRegistry:
             "open_folder": self._open_folder,
             "get_user_context": self._get_user_context,
             "update_user_context": self._update_user_context,
+            "search_past_interactions": self._search_past_interactions,
             "list_apps": self._list_apps,
             "open_app": self._open_app,
             "list_sites": self._list_sites,
@@ -255,34 +260,47 @@ class ToolRegistry:
         safe = "".join(c for c in query if c.isalnum() or c in " ._-+")[:80].strip()
         if not safe:
             return []
-        cmd = [
-            "find",
-            str(_HOME),
-            "-maxdepth",
-            "6",
-            "-iname",
-            f"*{safe}*",
-            "-type",
-            "d",
+        # Search common locations only — full $HOME find can exceed shell timeout.
+        roots = [
+            _HOME / "Desktop",
+            _HOME / "Documents",
+            _HOME / "Downloads",
+            _HOME / "Projects",
+            _HOME,
         ]
-        try:
-            proc = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=12, check=False
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return []
-        paths: list[str] = []
-        for ln in (proc.stdout or "").splitlines():
-            p = ln.strip()
-            if not p:
+        seen: set[str] = set()
+        out: list[str] = []
+        for root in roots:
+            if not root.is_dir():
                 continue
-            lower = p.lower()
-            if "/library/" in lower or "/.git/" in lower or "/node_modules/" in lower:
+            cmd = [
+                "find",
+                str(root),
+                "-maxdepth",
+                "8",
+                "-iname",
+                f"*{safe}*",
+                "-type",
+                "d",
+            ]
+            try:
+                proc = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=8, check=False
+                )
+            except (OSError, subprocess.TimeoutExpired):
                 continue
-            paths.append(p)
-            if len(paths) >= limit:
-                break
-        return paths
+            for ln in (proc.stdout or "").splitlines():
+                p = ln.strip()
+                if not p or p in seen or not Path(p).is_dir():
+                    continue
+                lower = p.lower()
+                if "/library/caches/" in lower or "/.trash/" in lower:
+                    continue
+                seen.add(p)
+                out.append(p)
+                if len(out) >= limit:
+                    return out
+        return out
 
     def _mdfind(self, query: str, limit: int) -> list[str]:
         # Prefer Spotlight scoped to home.
@@ -362,6 +380,15 @@ class ToolRegistry:
             return {"ok": False, "error": "notes required"}
         saved = save_user_notes(str(notes))
         return {"ok": True, "notes": saved, "chars": len(saved)}
+
+    def _search_past_interactions(self, args: dict[str, Any]) -> dict[str, Any]:
+        query = str(args.get("query") or args.get("q") or "").strip()
+        limit = int(args.get("limit") or 5)
+        if query:
+            items = self.memory.search_interactions(query, limit=limit)
+        else:
+            items = self.memory.recent_interactions(limit=limit)
+        return {"ok": True, "items": items, "count": len(items)}
 
     def _list_apps(self, _args: dict[str, Any]) -> dict[str, Any]:
         apps = self.memory.list_app_aliases()

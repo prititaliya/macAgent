@@ -582,6 +582,8 @@ class LocalIntentParser:
             "Never use control_power_management or modify_system_setting for closing apps. "
             "control_power_management is ONLY for sleep/display timeout/battery when the user asked for that. "
             "Multi-step is expected: one tool per step, keep going until the GOAL is done. "
+            "Compound requests (open X and Y, find file and move it) need SEPARATE steps — "
+            "never pass 'YouTube and folder' as one open_app name. "
             "After listing/search, if the user explicitly asked to delete/move/open that result on the Mac, "
             "call the next tool — do NOT respond with only the listing. "
             "If they only asked a question, respond once you have a solid answer — do not invent Mac actions. "
@@ -681,6 +683,8 @@ class LocalIntentParser:
             "Prefer: ls, find, mdfind, open, head, sort, stat, du, pwd, echo. "
             "If the user asked to DELETE/REMOVE the latest download, emit a command that "
             "resolves the newest file in ~/Downloads and rm's it (print Deleted: path). "
+            "If they asked to MOVE/COPY the latest download (e.g. to Desktop), emit a command "
+            "that resolves the newest file in ~/Downloads and mv/cp's it (print Moved: path). "
             "Home is ~. Print useful stdout. Do not use sudo, rm -rf /, curl|sh, or disk erase. "
             "To empty the macOS Trash/Bin use: "
             "osascript -e 'tell application \"Finder\" to empty the trash' "
@@ -718,10 +722,19 @@ class LocalIntentParser:
             return fallback
 
     def check_goal_done(
-        self, utterance: str, history_summary: str, candidate: str
+        self,
+        utterance: str,
+        history_summary: str,
+        candidate: str,
+        *,
+        is_action_request: bool = False,
     ) -> dict[str, Any]:
         """Critic: did the candidate answer / tool history finish the user's goal?"""
-        fallback = {"done": True, "reason": "assumed done", "next_hint": ""}
+        fallback = (
+            {"done": False, "reason": "action may be incomplete", "next_hint": "run_bash or next tool"}
+            if is_action_request
+            else {"done": True, "reason": "assumed done", "next_hint": ""}
+        )
         try:
             self._ensure_loaded()
         except (FileNotFoundError, RuntimeError) as exc:

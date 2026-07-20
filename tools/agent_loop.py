@@ -131,6 +131,31 @@ _DISCOVERY_BASH_RE = re.compile(
 )
 
 _DELETE_RE = re.compile(r"(?i)\b(delete|remove|rm|trash)\b")
+_MOVE_RE = re.compile(r"(?i)\b(move|relocate|transfer)\b")
+_COPY_RE = re.compile(r"(?i)\b(copy|duplicate)\b")
+_PAST_QUERY_RE = re.compile(
+    r"(?i)\b("
+    r"what\s+did\s+i\s+(ask|say|tell\s+you)|"
+    r"what\s+was\s+my\s+(last|previous)\s+(ask|question|request)|"
+    r"last\s+time|"
+    r"like\s+before|"
+    r"continue\s+(from|where)|"
+    r"earlier\s+(today|when)|"
+    r"remember\s+what\s+i"
+    r")\b"
+)
+_KNOWN_SITES: dict[str, str] = {
+    "youtube": "https://www.youtube.com",
+    "yt": "https://www.youtube.com",
+    "google": "https://www.google.com",
+    "gmail": "https://mail.google.com",
+    "github": "https://github.com",
+    "reddit": "https://www.reddit.com",
+    "twitter": "https://x.com",
+    "x": "https://x.com",
+    "linkedin": "https://www.linkedin.com",
+    "netflix": "https://www.netflix.com",
+}
 # Imperative open/launch — do NOT use bare \bopen\b (matches "open-source").
 _OPEN_RE = re.compile(
     r"(?i)(?:^|\b)(?:can\s+you\s+|could\s+you\s+|please\s+|would\s+you\s+)?"
@@ -205,6 +230,14 @@ class AgentLoop:
         history: list[dict[str, Any]] = []
         sources: list[Any] = []
         last_text = ""
+        subtasks = _decompose_compound_request(utterance)
+        compound_state = {
+            "subtasks": subtasks,
+            "idx": 0,
+            "results": [],
+            "full_utterance": utterance,
+        }
+        self._compound_state = compound_state
         # Drop stale Approve cards from a previous (possibly hallucinated) action.
         clear_pending_actions()
 
@@ -225,7 +258,8 @@ class AgentLoop:
         narrate("planning")
 
         for step in range(_MAX_ITERS):
-            call = self._next_call(utterance, history)
+            active = _active_subtask_utterance(compound_state)
+            call = self._next_call(active, history, compound_state)
             if call is None:
                 trace_step("agent_parse_fail", step=step, history_len=len(history))
                 break
@@ -505,7 +539,7 @@ class AgentLoop:
                     text = self._format_command_answer(utterance, cmd, out)
                     # Discovery-only bash on an action ask → keep looping.
                     if _is_discovery_bash(cmd) and _goal_status(
-                        utterance, history, text
+                        active, history, text
                     ) == "incomplete":
                         event_bus.publish(
                             utterance=utterance,
@@ -515,7 +549,7 @@ class AgentLoop:
                         )
                         continue
                     finished = self._attempt_finish(
-                        utterance, text, sources, history
+                        active, text, sources, history
                     )
                     if finished is not None:
                         return finished
@@ -523,13 +557,13 @@ class AgentLoop:
                 if result.get("ok") and not out:
                     text = "Done." if not cmd else f"Done (`{cmd}`)."
                     finished = self._attempt_finish(
-                        utterance, text, sources, history
+                        active, text, sources, history
                     )
                     if finished is not None:
                         return finished
                     continue
                 finished = self._attempt_finish(
-                    utterance,
+                    active,
                     f"Shell error: {err or 'command failed'}",
                     sources,
                     history,
@@ -558,7 +592,7 @@ class AgentLoop:
                 if result.get("ok"):
                     msg = result.get("message") or "Launched app."
                     finished = self._attempt_finish(
-                        utterance, str(msg), sources, history
+                        active, str(msg), sources, history
                     )
                     if finished is not None:
                         return finished
@@ -574,7 +608,7 @@ class AgentLoop:
                 if result.get("ok"):
                     msg = result.get("message") or f"Opened {result.get('url')}"
                     finished = self._attempt_finish(
-                        utterance, str(msg), sources, history
+                        active, str(msg), sources, history
                     )
                     if finished is not None:
                         return finished
@@ -586,6 +620,20 @@ class AgentLoop:
                     sources,
                     history,
                 )
+
+            if tool == "search_past_interactions":
+                items = result.get("items") or []
+                if not items:
+                    msg = "I don't have any matching past interactions stored yet."
+                else:
+                    lines = []
+                    for it in items[:8]:
+                        u = str(it.get("utterance") or "")[:160]
+                        a = str(it.get("answer") or it.get("result") or "")[:160]
+                        when = str(it.get("created_at") or "")[:16]
+                        lines.append(f"• [{when}] You asked: {u}\n  I answered: {a}")
+                    msg = "Here's what I remember from earlier:\n\n" + "\n\n".join(lines)
+                return self._finish(utterance, msg, sources, history)
 
             if tool in {
                 "open_folder",
@@ -765,16 +813,20 @@ class AgentLoop:
         return self._finish(utterance, last_text, sources, history)
 
     def _next_call(
-        self, utterance: str, history: list[dict[str, Any]]
+        self,
+        utterance: str,
+        history: list[dict[str, Any]],
+        compound_state: Optional[dict[str, Any]] = None,
     ) -> Optional[dict[str, Any]]:
         # Heuristic shortcuts for clear patterns (saves latency on 1.5B).
-        if not history:
+        scoped = _history_since_last_subtask_boundary(history)
+        if not scoped:
             quick = _heuristic_tool(utterance)
             if quick:
                 return quick
 
         # After discovery, force the mutating follow-up when the goal is clear.
-        follow = _forced_followup(utterance, history)
+        follow = _forced_followup(utterance, scoped or history)
         if follow:
             return follow
 
@@ -850,6 +902,17 @@ class AgentLoop:
             if tool == "get_user_context" and result.get("notes") is not None:
                 notes = (result.get("notes") or "").strip() or "(empty)"
                 return f"Current notes:\n{notes}"
+            if tool == "search_past_interactions" and result.get("ok"):
+                items = result.get("items") or []
+                if not items:
+                    return "No matching past interactions found."
+                lines = []
+                for it in items[:8]:
+                    u = str(it.get("utterance") or "")[:120]
+                    r = str(it.get("result") or it.get("answer") or "")[:120]
+                    when = str(it.get("created_at") or "")[:16]
+                    lines.append(f"- [{when}] You: {u}\n  Agent: {r}")
+                return "Past interactions:\n" + "\n".join(lines)
             if tool == "run_python" and result.get("stdout"):
                 return str(result["stdout"]).strip()
             if tool == "run_bash" and result.get("stdout"):
@@ -943,21 +1006,32 @@ class AgentLoop:
         force: bool = False,
     ) -> Optional[dict[str, Any]]:
         """Finish if the goal is done; otherwise return None so the loop continues."""
-        if force or not _is_action_request(utterance):
-            return self._finish(utterance, text, sources, history)
+        compound = getattr(self, "_compound_state", None)
+        full_utterance = (
+            str(compound.get("full_utterance") or utterance) if compound else utterance
+        )
+        goal_utterance = utterance
+        if compound and len(compound.get("subtasks") or []) > 1:
+            goal_utterance = _active_subtask_utterance(compound)
 
-        status = _goal_status(utterance, history, text)
+        if force or not _is_action_request(goal_utterance):
+            return self._maybe_finish_compound(
+                full_utterance, text, sources, history, compound, force=True
+            )
+
+        status = _goal_status(goal_utterance, history, text)
         reason: Optional[str] = None
         next_hint = ""
         if status == "incomplete":
-            reason = _goal_incomplete_reason(utterance, history, text)
+            reason = _goal_incomplete_reason(goal_utterance, history, text)
         elif status == "unknown":
             # Secondary LLM critic when rules are inconclusive.
             try:
                 check = self.parser.check_goal_done(
-                    utterance,
+                    goal_utterance,
                     _history_summary_for_critic(history),
                     text,
+                    is_action_request=_is_action_request(goal_utterance),
                 )
             except Exception:  # noqa: BLE001
                 check = None
@@ -973,14 +1047,16 @@ class AgentLoop:
                 if (h.get("result") or {}).get("incomplete")
             )
             if recent_incomplete >= 2:
-                return self._finish(
-                    utterance,
+                return self._maybe_finish_compound(
+                    full_utterance,
                     (
                         f"{text}\n\n"
                         f"I couldn't complete the full request ({reason})."
                     ),
                     sources,
                     history,
+                    compound,
+                    force=True,
                 )
             history.append(
                 {
@@ -995,7 +1071,7 @@ class AgentLoop:
                 }
             )
             event_bus.publish(
-                utterance=utterance,
+                utterance=full_utterance,
                 kind="trace",
                 text=f"Goal incomplete — {reason}",
                 detail="goal_check",
@@ -1003,14 +1079,64 @@ class AgentLoop:
                 tool_output={"reason": reason, "next_hint": next_hint},
             )
             event_bus.publish(
-                utterance=utterance,
+                utterance=full_utterance,
                 kind="action",
                 text="Acting on results…",
                 detail="pending",
             )
             narrate("acting")
             return None
-        return self._finish(utterance, text, sources, history)
+        return self._maybe_finish_compound(
+            full_utterance, text, sources, history, compound
+        )
+
+    def _maybe_finish_compound(
+        self,
+        full_utterance: str,
+        text: str,
+        sources: list[Any],
+        history: list[dict[str, Any]],
+        compound: Optional[dict[str, Any]],
+        *,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        """Finish, or advance to the next compound subtask."""
+        if not compound or len(compound.get("subtasks") or []) <= 1:
+            return self._finish(full_utterance, text, sources, history)
+
+        idx = int(compound.get("idx") or 0)
+        subtasks: list[str] = compound["subtasks"]
+        active = subtasks[idx] if idx < len(subtasks) else full_utterance
+
+        if force:
+            return self._finish(full_utterance, text, sources, history)
+
+        if not force and _is_action_request(active):
+            scoped = _history_since_last_subtask_boundary(history)
+            if _goal_status(active, scoped or history, text) == "incomplete":
+                return None  # type: ignore[return-value]
+
+        results: list[str] = compound.setdefault("results", [])
+        results.append(text)
+        history.append(
+            {
+                "call": {"tool": "_subtask_done", "args": {"index": idx}},
+                "result": {"ok": True, "text": text[:500]},
+            }
+        )
+        compound["idx"] = idx + 1
+        if compound["idx"] >= len(subtasks):
+            combined = "\n".join(r for r in results if r)
+            return self._finish(full_utterance, combined, sources, history)
+
+        event_bus.publish(
+            utterance=full_utterance,
+            kind="action",
+            text=f"Next step ({compound['idx'] + 1}/{len(subtasks)})…",
+            detail="pending",
+        )
+        narrate("acting")
+        return None  # type: ignore[return-value]
 
     def _finish(
         self,
@@ -1392,6 +1518,13 @@ def _heuristic_tool(utterance: str) -> Optional[dict[str, Any]]:
                 "tool": "run_bash",
                 "args": {"command": _delete_latest_download_command()},
             }
+        if _MOVE_RE.search(text) or _COPY_RE.search(text):
+            verb = "cp" if _COPY_RE.search(text) else "mv"
+            dest = _resolve_move_destination(text)
+            return {
+                "tool": "run_bash",
+                "args": {"command": _move_latest_download_command(dest, verb=verb)},
+            }
         if _is_open_action(text):
             return {
                 "tool": "run_bash",
@@ -1427,7 +1560,7 @@ def _heuristic_tool(utterance: str) -> Optional[dict[str, Any]]:
     ):
         name = folder_m.group(4).strip().rstrip(".")
         name = re.sub(r"(?i)^(named|called)\s+", "", name).strip()
-        return {"tool": "run_bash", "args": {"command": _bash_open_folder(name)}}
+        return {"tool": "open_folder", "args": {"query": name}}
     folder_m2 = re.search(
         r"(?i)^\s*(open|show|reveal)\s+(.+?)\s+(folder|directory|dir)\s*$",
         text,
@@ -1437,7 +1570,7 @@ def _heuristic_tool(utterance: str) -> Optional[dict[str, Any]]:
     ):
         name = folder_m2.group(2).strip()
         name = re.sub(r"(?i)^(the|a|my)\s+", "", name).strip()
-        return {"tool": "run_bash", "args": {"command": _bash_open_folder(name)}}
+        return {"tool": "open_folder", "args": {"query": name}}
 
     # File / folder search — let the model invent a bash command.
     if re.search(
@@ -1473,6 +1606,17 @@ def _heuristic_tool(utterance: str) -> Optional[dict[str, Any]]:
             pane = "wifi"
         return {"tool": "open_system_settings", "args": {"pane": pane}}
 
+    # Past interaction lookup — "what did I ask last time?"
+    if _PAST_QUERY_RE.search(text):
+        q = text
+        q = re.sub(r"(?i)^(what\s+did\s+i\s+(ask|say|tell\s+you)\??\s*)", "", q).strip()
+        return {"tool": "search_past_interactions", "args": {"query": q or text, "limit": 8}}
+
+    # Compound open: "open YouTube and comp3370 folder" — before single-target open.
+    compound_open = _heuristic_compound_open(text)
+    if compound_open:
+        return compound_open
+
     # "can you open …" / "please open …" / "open …" — not "open-source" questions
     if _is_open_action(text):
         m = re.search(
@@ -1481,38 +1625,15 @@ def _heuristic_tool(utterance: str) -> Optional[dict[str, Any]]:
         )
         if m:
             target = m.group(2).strip().rstrip(".?!")
-            target = re.sub(r"(?i)^(the\s+)?(folder|directory|dir)\s+", "", target).strip()
             if target and not re.match(r"(?i)^source(d)?\b", target):
-                if re.search(r"(?i)\b(folder|directory|dir)\b", target):
-                    target = re.sub(r"(?i)\b(folder|directory|dir)\b", "", target).strip()
-                    return {
-                        "tool": "run_bash",
-                        "args": {"command": _bash_open_folder(target)},
-                    }
-                if target.startswith("http") or (
-                    "." in target.split()[0] and not target.lower().endswith(".app")
-                ):
-                    if (
-                        "/" in target
-                        or target.startswith("www.")
-                        or re.search(r"\.[a-z]{2,}(/|$)", target.lower())
-                    ):
-                        return {"tool": "open_url", "args": {"url": target}}
                 if "setting" in target.lower() or "preference" in target.lower():
                     return {
                         "tool": "open_system_settings",
                         "args": {"pane": "general"},
                     }
-                # Course codes like comp3370 → folder; otherwise app.
-                compact = target.replace(" ", "")
-                if re.match(r"(?i)^[a-z]{2,6}\d{3,4}[a-z]?$", compact) or (
-                    "folder" in lower or "directory" in lower
-                ):
-                    return {
-                        "tool": "run_bash",
-                        "args": {"command": _bash_open_folder(target)},
-                    }
-                return {"tool": "open_app", "args": {"name": target}}
+                opened = _heuristic_open_target(target)
+                if opened:
+                    return opened
 
     if re.search(r"(?i)\b(what('?s| is) in my (notes|context)|show (my )?notes)\b", text):
         return {"tool": "get_user_context", "args": {}}
@@ -1789,6 +1910,43 @@ def _goal_status(
             return "incomplete"
         return "unknown"
 
+    if _MOVE_RE.search(text) or _COPY_RE.search(text):
+        if _history_has_successful_mutation(history):
+            return "done"
+        if re.search(
+            r"(?i)your most recent download is|most recent (file|folder) is|"
+            r"^found \d+|most recent in downloads",
+            cand,
+        ):
+            return "incomplete"
+        only_discovery = True
+        saw_tool = False
+        for item in history:
+            call = item.get("call") or {}
+            tool = call.get("tool")
+            if tool in {"_goal_check", "_subtask_done"}:
+                continue
+            if tool == "respond":
+                continue
+            saw_tool = True
+            if tool in {"find_files", "spotlight_file_search"}:
+                continue
+            if tool == "run_bash":
+                cmd = str((call.get("args") or {}).get("command") or "")
+                if _is_discovery_bash(cmd):
+                    continue
+                if re.search(r"(?i)\b(mv|cp)\b", cmd):
+                    return "done"
+                only_discovery = False
+                break
+            only_discovery = False
+            break
+        if saw_tool and only_discovery:
+            return "incomplete"
+        if not saw_tool and cand:
+            return "incomplete"
+        return "unknown"
+
     if _is_open_action(text) and not _DELETE_RE.search(text):
         # "open my latest download" etc.
         if any(
@@ -1824,6 +1982,10 @@ def _goal_incomplete_reason(
 ) -> str:
     if _DELETE_RE.search(utterance or ""):
         return "listed or found the target but did not delete it yet"
+    if _MOVE_RE.search(utterance or ""):
+        return "found the target but did not move it yet"
+    if _COPY_RE.search(utterance or ""):
+        return "found the target but did not copy it yet"
     if _EMPTY_TRASH_RE.search(utterance or ""):
         return "trash was not emptied yet"
     if _is_open_action(utterance or ""):
@@ -1837,6 +1999,31 @@ def _delete_latest_download_command() -> str:
         'if [ -n "$f" ]; then rm -- "$f"; echo "Deleted: $f"; '
         'else echo "Downloads is empty"; fi'
     )
+
+
+def _move_latest_download_command(dest: str = "~/Desktop", *, verb: str = "mv") -> str:
+    import shlex
+
+    d = shlex.quote(dest)
+    v = "cp" if verb.lower() == "cp" else "mv"
+    return (
+        'f=$(ls -t ~/Downloads/* 2>/dev/null | head -1); '
+        f'if [ -n "$f" ]; then {v} -- "$f" {d} && echo "Moved: $f -> {dest}"; '
+        f'else echo "Downloads is empty"; fi'
+    )
+
+
+def _resolve_move_destination(text: str) -> str:
+    t = (text or "").lower()
+    if re.search(r"(?i)\bdesktop\b", t):
+        return "~/Desktop"
+    m = re.search(r"(?i)\bto\s+(~/[\w./-]+|/[\w./-]+|[\w][\w./-]*)", text or "")
+    if m:
+        dest = m.group(1).strip().rstrip(".")
+        if not dest.startswith("~") and not dest.startswith("/"):
+            dest = f"~/{dest}"
+        return dest
+    return "~/Desktop"
 
 
 def _path_from_ls_stdout(stdout: str) -> Optional[str]:
@@ -1889,7 +2076,7 @@ def _first_path_from_history(history: list[dict[str, Any]]) -> Optional[str]:
                 if p:
                     return p
             # echo Opened: /path
-            m = re.search(r"(?i)(?:opened|deleted):\s*(.+)$", out, re.M)
+            m = re.search(r"(?i)(?:opened|deleted|moved|copied):\s*(.+)$", out, re.M)
             if m:
                 return m.group(1).strip()
     _ = shlex  # silence if unused in some paths
@@ -1968,6 +2155,30 @@ def _forced_followup(
                 )
             },
         }
+
+    if _MOVE_RE.search(text) or _COPY_RE.search(text):
+        verb = "cp" if _COPY_RE.search(text) else "mv"
+        cmd_needle = f"{verb} "
+        if _history_has_command_containing(history, cmd_needle):
+            return None
+        path = _first_path_from_history(history)
+        dest = _resolve_move_destination(text)
+        if path:
+            q = shlex.quote(path)
+            d = shlex.quote(dest)
+            label = "Copied" if verb == "cp" else "Moved"
+            return {
+                "tool": "run_bash",
+                "args": {
+                    "command": f"{verb} -- {q} {d} && echo {label}: {q} -> {dest}",
+                },
+            }
+        if re.search(r"(?i)download", text):
+            return {
+                "tool": "run_bash",
+                "args": {"command": _move_latest_download_command(dest, verb=verb)},
+            }
+
     return None
 
 
@@ -2120,6 +2331,109 @@ def _scrub_open_compounds(text: str) -> str:
     return _OPEN_COMPOUND_RE.sub(" ", text or "")
 
 
+def _active_subtask_utterance(compound: Optional[dict[str, Any]]) -> str:
+    if not compound:
+        return ""
+    subtasks: list[str] = compound.get("subtasks") or []
+    if len(subtasks) <= 1:
+        return str(compound.get("full_utterance") or subtasks[0] if subtasks else "")
+    idx = int(compound.get("idx") or 0)
+    if idx < len(subtasks):
+        return subtasks[idx]
+    return str(compound.get("full_utterance") or "")
+
+
+def _history_since_last_subtask_boundary(
+    history: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    for i in range(len(history) - 1, -1, -1):
+        call = (history[i].get("call") or {}).get("tool")
+        if call == "_subtask_done":
+            return history[i + 1 :]
+    return history
+
+
+def _decompose_compound_request(text: str) -> list[str]:
+    text = (text or "").strip()
+    if not text:
+        return [text]
+    open_parts = _extract_compound_open_parts(text)
+    if open_parts and len(open_parts) >= 2:
+        return open_parts
+    if not re.search(r"(?i)\b(?:and|then|also)\b", text):
+        return [text]
+    parts = re.split(r"(?i)\s+(?:and|then|also)\s+", text)
+    parts = [p.strip() for p in parts if p.strip()]
+    if len(parts) < 2:
+        return [text]
+    action_parts = [p for p in parts if _is_action_request(p) or _is_open_action(p)]
+    if len(action_parts) >= 2:
+        return action_parts
+    return [text]
+
+
+def _extract_compound_open_parts(text: str) -> Optional[list[str]]:
+    if not _is_open_action(text):
+        return None
+    cleaned = _scrub_open_compounds(text).strip()
+    m = re.search(
+        r"(?i)^(?:please\s+|can\s+you\s+|could\s+you\s+)?open\s+(.+?)\s+and\s+(.+)$",
+        cleaned,
+    )
+    if not m:
+        return None
+    left, right = m.group(1).strip().rstrip(".?!"), m.group(2).strip().rstrip(".?!")
+    if not left or not right:
+        return None
+    return [f"open {left}", f"open {right}"]
+
+
+def _normalize_folder_name(raw: str) -> str:
+    name = (raw or "").strip().rstrip(".?!")
+    name = re.sub(r"(?i)^(the|a|my)\s+", "", name).strip()
+    name = re.sub(r"(?i)\b(folder|directory|dir)\b", "", name).strip()
+    name = re.sub(r"(?i)^(named|called)\s+", "", name).strip()
+    course = re.search(r"(?i)\b([a-z]{2,6}\d{3,4}[a-z]?)\b", name)
+    if course:
+        return course.group(1)
+    digits = re.search(r"\b(\d{3,5})\b", name)
+    if digits:
+        return digits.group(1)
+    return name
+
+
+def _heuristic_open_target(target: str) -> Optional[dict[str, Any]]:
+    t = (target or "").strip().rstrip(".?!")
+    if not t:
+        return None
+    lower = t.lower()
+    if lower in _KNOWN_SITES:
+        return {"tool": "open_url", "args": {"url": _KNOWN_SITES[lower]}}
+    for key, url in _KNOWN_SITES.items():
+        if lower == key or lower.startswith(key + " "):
+            return {"tool": "open_url", "args": {"url": url}}
+    if re.search(r"(?i)\b(folder|directory|dir)\b", t) or re.search(
+        r"(?i)\b(\d{3,5}|[a-z]{2,6}\d{3,4})\b", t
+    ):
+        folder = _normalize_folder_name(t)
+        if folder:
+            return {"tool": "open_folder", "args": {"query": folder}}
+    if t.startswith("http") or re.search(r"(?i)\b(www\.|\.com|\.org|\.net)\b", t):
+        return {"tool": "open_url", "args": {"url": t if t.startswith("http") else f"https://{t}"}}
+    compact = t.replace(" ", "")
+    if re.match(r"(?i)^[a-z]{2,6}\d{3,4}[a-z]?$", compact):
+        return {"tool": "open_folder", "args": {"query": compact}}
+    return {"tool": "open_app", "args": {"name": t}}
+
+
+def _heuristic_compound_open(text: str) -> Optional[dict[str, Any]]:
+    """First step of a compound open when subtask queue hasn't started yet."""
+    parts = _extract_compound_open_parts(text)
+    if not parts:
+        return None
+    return _heuristic_open_target(re.sub(r"(?i)^open\s+", "", parts[0]).strip())
+
+
 def _is_open_action(utterance: str) -> bool:
     """True only when the user asks to open/launch/reveal something on the Mac."""
     text = (utterance or "").strip()
@@ -2152,14 +2466,19 @@ def _is_action_request(utterance: str) -> bool:
 
 
 def _bash_open_folder(name: str) -> str:
-    """Safe-ish bash to find a folder under ~ and open it in Finder."""
+    """Fast folder lookup via Spotlight; limited find fallback (no full-home scan)."""
     import shlex
 
     q = shlex.quote((name or "").strip())
     return (
         f"name={q}; "
         'p=$(mdfind -onlyin "$HOME" "kind:folder $name" 2>/dev/null | head -1); '
-        'if [ -z "$p" ]; then p=$(find "$HOME" -type d -iname "*$name*" 2>/dev/null | head -1); fi; '
+        'if [ -z "$p" ]; then '
+        'for d in "$HOME/Desktop" "$HOME/Documents" "$HOME/Downloads" "$HOME/Projects"; do '
+        '  [ -d "$d" ] || continue; '
+        '  p=$(find "$d" -maxdepth 8 -type d -iname "*$name*" 2>/dev/null | head -1); '
+        '  [ -n "$p" ] && break; '
+        "done; fi; "
         'if [ -n "$p" ]; then open "$p"; echo "Opened: $p"; else echo "No folder found for: $name"; fi'
     )
 

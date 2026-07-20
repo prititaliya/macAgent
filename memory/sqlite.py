@@ -423,6 +423,65 @@ class ContextMemory:
             for r in rows
         ]
 
+    def recent_interactions(self, limit: int = 8) -> List[dict[str, Any]]:
+        """Recent agent Q&A turns for prompt context."""
+        rows = self.list_activity(limit=max(int(limit), 1) * 3)
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            if row.get("action") != "agent":
+                continue
+            out.append(
+                {
+                    "created_at": row.get("created_at"),
+                    "utterance": row.get("utterance") or "",
+                    "answer": row.get("result") or "",
+                    "detail": row.get("detail") or "",
+                }
+            )
+            if len(out) >= int(limit):
+                break
+        return out
+
+    def search_interactions(self, query: str, limit: int = 5) -> List[dict[str, Any]]:
+        """Keyword search over past utterances and answers."""
+        q = (query or "").strip()
+        if not q:
+            return self.recent_interactions(limit=limit)
+        tokens = [
+            t
+            for t in re.split(r"[^\w]+", q.lower())
+            if len(t) >= 3 and t not in _STOPWORDS
+        ]
+        rows = self.list_activity(limit=500)
+        scored: list[tuple[int, dict[str, Any]]] = []
+        for row in rows:
+            if row.get("action") != "agent":
+                continue
+            utter = (row.get("utterance") or "").lower()
+            ans = (row.get("result") or "").lower()
+            blob = f"{utter} {ans}"
+            if not tokens:
+                score = 1 if q.lower() in blob else 0
+            else:
+                score = sum(1 for t in tokens if t in blob)
+            if score <= 0 and q:
+                continue
+            scored.append(
+                (
+                    score,
+                    {
+                        "created_at": row.get("created_at"),
+                        "utterance": row.get("utterance") or "",
+                        "answer": row.get("result") or "",
+                        "detail": row.get("detail") or "",
+                    },
+                )
+            )
+        scored.sort(key=lambda x: (-x[0], str(x[1].get("created_at") or "")))
+        if not tokens and not q:
+            return [item for _, item in scored[: int(limit)]]
+        return [item for _, item in scored[: int(limit)]]
+
     def upsert_history(self, url: str, title: str, visit_count: int) -> None:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()

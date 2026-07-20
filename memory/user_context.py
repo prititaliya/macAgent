@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _CONTEXT_PATH = _PROJECT_ROOT / "config" / "user_context.txt"
@@ -44,8 +44,8 @@ def save_user_notes(text: str) -> str:
     return cleaned
 
 
-def build_runtime_context() -> str:
-    """Clock + optional user notes for the small local model."""
+def build_runtime_context(memory: Optional[Any] = None) -> str:
+    """Clock + optional user notes + recent interactions for the small local model."""
     now = datetime.now().astimezone()
     parts = [
         f"Current local datetime: {now.strftime('%A, %B %d, %Y %-I:%M %p %Z')}",
@@ -55,6 +55,21 @@ def build_runtime_context() -> str:
     if notes:
         parts.append("User profile / preferences (from Settings):")
         parts.append(notes[:_MAX_NOTES])
+    try:
+        if memory is None:
+            from memory.sqlite import ContextMemory
+
+            memory = ContextMemory()
+        recent = memory.recent_interactions(limit=5)
+        if recent:
+            parts.append("Recent interactions (may inform follow-up tasks):")
+            for row in recent:
+                u = str(row.get("utterance") or "")[:120]
+                a = str(row.get("answer") or "")[:120]
+                when = str(row.get("created_at") or "")[:16]
+                parts.append(f"- [{when}] User: {u} → Agent: {a}")
+    except Exception:
+        pass
     return "\n".join(parts)
 
 

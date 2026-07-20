@@ -74,6 +74,7 @@ def tts_config() -> dict[str, Any]:
         "volume": vol,
         "speak_status": bool(s.get("tts_speak_status", True)),
         "speak_answer": bool(s.get("tts_speak_answer", True)),
+        "muted": bool(s.get("tts_muted", False)),
     }
 
 
@@ -238,8 +239,8 @@ def _speak_sync(text: str, cfg: dict[str, Any]) -> None:
 def speak(text: str, *, interrupt_current: bool = True) -> None:
     """Synthesize and play `text` on a background thread."""
     cfg = tts_config()
-    if not cfg["enabled"]:
-        logger.debug("TTS skipped — disabled in settings")
+    if not cfg["enabled"] or cfg.get("muted"):
+        logger.debug("TTS skipped — disabled or muted")
         return
     if _dictating:
         logger.info("TTS skipped — mic dictation active")

@@ -11,8 +11,27 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# Unbounded find under ~ is a common cause of shell timeouts.
+_SLOW_FIND_RE = re.compile(
+    r"(?i)\bfind\s+(~|\$HOME|/Users/)[^\n|;]*(-type\s+d|-iname\b)"
+)
+
+
+def _command_timeout(command: str) -> float:
+    """Shorter timeout for simple commands; longer for multi-step shell."""
+    cmd = (command or "").strip()
+    if not cmd:
+        return _QUICK_TIMEOUT_SEC
+    if _SLOW_FIND_RE.search(cmd) and "-maxdepth" not in cmd.lower():
+        return _QUICK_TIMEOUT_SEC
+    if re.match(r"(?i)^(ls|open|mv|cp|echo|pwd|head|tail|stat|du)\b", cmd):
+        return _QUICK_TIMEOUT_SEC
+    return _TIMEOUT_SEC
+
+
 _MAX_CMD_CHARS = 2000
-_TIMEOUT_SEC = 20
+_TIMEOUT_SEC = 45
+_QUICK_TIMEOUT_SEC = 15
 _MAX_OUTPUT = 6000
 _HOME = Path.home()
 
@@ -119,7 +138,7 @@ def classify_command(command: str) -> str:
 
 def run_bash(
     command: str,
-    timeout: float = _TIMEOUT_SEC,
+    timeout: float | None = None,
     *,
     confirmed: bool = False,
 ) -> dict[str, Any]:
@@ -152,12 +171,22 @@ def run_bash(
 
     env = os.environ.copy()
     env["HOME"] = str(_HOME)
+    effective_timeout = timeout if timeout is not None else _command_timeout(cmd)
+    if _SLOW_FIND_RE.search(cmd) and "-maxdepth" not in cmd.lower():
+        return {
+            "ok": False,
+            "error": (
+                "command blocked: unbounded find under ~ is too slow — "
+                "use open_folder or spotlight_file_search instead"
+            ),
+            "command": cmd[:800],
+        }
     try:
         proc = subprocess.run(
             ["/bin/bash", "-lc", cmd],
             capture_output=True,
             text=True,
-            timeout=timeout,
+            timeout=effective_timeout,
             cwd=str(_HOME),
             env=env,
             check=False,
@@ -177,6 +206,10 @@ def run_bash(
             out["error"] = stderr.strip()[:500]
         return out
     except subprocess.TimeoutExpired:
-        return {"ok": False, "error": f"timed out after {timeout}s", "command": cmd[:800]}
+        return {
+            "ok": False,
+            "error": f"timed out after {effective_timeout}s",
+            "command": cmd[:800],
+        }
     except OSError as exc:
         return {"ok": False, "error": str(exc), "command": cmd[:800]}

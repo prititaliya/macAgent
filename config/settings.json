@@ -13,5 +13,5 @@
   "tts_volume": 0.95,
   "tts_speak_status": true,
   "tts_speak_answer": true,
-  "tts_muted": false
+  "tts_muted": true
 }
