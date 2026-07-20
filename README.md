@@ -13,7 +13,7 @@ Runs entirely on your machine (local LLM + Python tools). Not a cloud chatbot pa
 
 | | |
 |---|---|
-| **macOS app** | [**MacAgent-1.0.0.dmg**](https://github.com/prititaliya/macAgent/releases/latest/download/MacAgent-1.0.0.dmg) |
+| **macOS app** | [**Download MacAgent.dmg**](https://github.com/prititaliya/macAgent/releases/latest/download/MacAgent.dmg) |
 | **Requirements** | macOS 13+, Apple Silicon (M1/M2/M3/M4) |
 | **Latest releases** | [github.com/prititaliya/macAgent/releases](https://github.com/prititaliya/macAgent/releases) |
 
@@ -25,7 +25,7 @@ The DMG contains the menu-bar overlay app. You also need the Python backend (one
 
 ### 1. Install the overlay app
 
-1. Download [**MacAgent-1.0.0.dmg**](https://github.com/prititaliya/macAgent/releases/latest/download/MacAgent-1.0.0.dmg).
+1. Download [**MacAgent.dmg**](https://github.com/prititaliya/macAgent/releases/latest/download/MacAgent.dmg).
 2. Open the DMG and drag **MacAgent.app** into **Applications**.
 3. Launch MacAgent (sparkles icon in the menu bar).
 
@@ -43,7 +43,7 @@ This script will:
 
 - Install Homebrew deps (`espeak-ng`, `portaudio`, `libsndfile`) for voice
 - Create a Python virtualenv and install packages (with Metal-accelerated `llama-cpp-python`)
-- Download the default Qwen2.5-1.5B GGUF model (~1 GB) to `~/Models/`
+- Download the default **Qwen2.5-3B** GGUF model (~2 GB) to `~/Models/`
 - Update `config/settings.json` with your model path
 
 **Manual setup** (if you prefer):
@@ -58,7 +58,7 @@ CMAKE_ARGS="-DGGML_METAL=on -DCMAKE_OSX_ARCHITECTURES=arm64" ARCHFLAGS="-arch ar
 
 Download a GGUF model and set `model_path` in `config/settings.json`. Default recommendation:
 
-`~/Models/qwen2.5-1.5b-instruct-q4_k_m.gguf` — [Qwen2.5-1.5B-Instruct Q4_K_M](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF)
+`~/Models/qwen2.5-3b-instruct-q4_k_m.gguf` — [Qwen2.5-3B-Instruct Q4_K_M](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF)
 
 ### 3. Grant permissions
 
@@ -177,7 +177,7 @@ git clone https://github.com/prititaliya/macAgent.git
 cd MacAgent
 ./automation/setup_backend.sh
 ./automation/open_macagent.sh    # Debug build + launch
-./automation/make_dmg.sh         # Release DMG → dist/MacAgent-1.0.0.dmg
+./automation/make_dmg.sh         # Release DMG → dist/MacAgent-1.0.1.dmg
 ```
 
 ### Release (maintainers)
@@ -186,8 +186,8 @@ Version is defined in [`VERSION`](VERSION). Pushing a tag triggers CI to build t
 
 ```bash
 ./automation/sync_version.sh   # sync VERSION → Info.plist, main.py
-git add VERSION && git commit -m "Bump version to 1.0.0"
-git tag v1.0.0
+git add VERSION && git commit -m "Bump version to 1.0.1"
+git tag v1.0.1
 git push origin main --tags
 ```
 

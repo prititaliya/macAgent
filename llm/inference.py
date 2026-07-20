@@ -126,7 +126,7 @@ class LocalIntentParser:
     def __init__(self, model_path: Optional[str] = None, grammar_path: Optional[str] = None):
         settings = _load_settings()
         raw_model = model_path or settings.get(
-            "model_path", "~/Models/qwen2.5-1.5b-instruct-q4_k_m.gguf"
+            "model_path", "~/Models/qwen2.5-3b-instruct-q4_k_m.gguf"
         )
         self.model_path = str(Path(raw_model).expanduser())
         self.grammar_path = grammar_path or str(
@@ -158,7 +158,7 @@ class LocalIntentParser:
         if not Path(self.model_path).exists():
             raise FileNotFoundError(
                 f"Model missing at {self.model_path}. "
-                "Download the Qwen2.5-1.5B-Instruct Q4_K_M GGUF first."
+                "Download the Qwen2.5-3B-Instruct Q4_K_M GGUF first."
             )
         logger.info("Loading GGUF from %s (Metal n_gpu_layers=-1)", self.model_path)
         self._llm = Llama(

@@ -27,11 +27,16 @@ jobs:
       - name: Build DMG
         run: ./automation/make_dmg.sh
 
+      - name: Add stable download alias
+        run: cp "$(ls dist/MacAgent-*.dmg | head -1)" dist/MacAgent.dmg
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           name: MacAgent ${{ github.ref_name }}
-          files: dist/*.dmg
+          files: |
+            dist/MacAgent-*.dmg
+            dist/MacAgent.dmg
           generate_release_notes: true
           draft: false
           prerelease: false

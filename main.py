@@ -69,7 +69,7 @@ def _model_dir() -> Path:
     raw = settings.get("model_dir") or ""
     if not raw:
         # Default: parent of configured model_path, else ~/Models
-        mp = settings.get("model_path") or "~/Models/qwen2.5-1.5b-instruct-q4_k_m.gguf"
+        mp = settings.get("model_path") or "~/Models/qwen2.5-3b-instruct-q4_k_m.gguf"
         parent = Path(mp).expanduser().parent
         if parent.is_dir():
             return parent
@@ -99,7 +99,7 @@ def _list_gguf_models(directory: Path) -> list[dict[str, Any]]:
 
 def _models_payload() -> dict[str, Any]:
     model_path = Path(
-        settings.get("model_path", "~/Models/qwen2.5-1.5b-instruct-q4_k_m.gguf")
+        settings.get("model_path", "~/Models/qwen2.5-3b-instruct-q4_k_m.gguf")
     ).expanduser()
     directory = _model_dir()
     models = _list_gguf_models(directory)
@@ -131,7 +131,7 @@ def _models_payload() -> dict[str, Any]:
 
 
 settings = _load_settings()
-app = FastAPI(title="MacAgent", version="1.0.0")
+app = FastAPI(title="MacAgent", version="1.0.1")
 
 _parser: Optional[LocalIntentParser] = None
 _router: Optional[CoreRouter] = None
@@ -195,7 +195,7 @@ class ModelSelectBody(BaseModel):
 @app.get("/health")
 async def health() -> dict[str, Any]:
     model_path = Path(
-        settings.get("model_path", "~/Models/qwen2.5-1.5b-instruct-q4_k_m.gguf")
+        settings.get("model_path", "~/Models/qwen2.5-3b-instruct-q4_k_m.gguf")
     ).expanduser()
     return {
         "status": "ok",
