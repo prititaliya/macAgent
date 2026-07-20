@@ -50,7 +50,9 @@ final class OverlayController {
 
     func hide() {
         if model.isDictating {
-            model.isDictating = false
+            Task { @MainActor in
+                await model.setDictating(false)
+            }
         }
         stopIdleTimer()
         clearCountdownUI()

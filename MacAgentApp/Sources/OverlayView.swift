@@ -368,9 +368,13 @@ struct OverlayView: View {
     private var footer: some View {
         HStack(spacing: 8) {
             Circle()
-                .fill(model.daemonOnline ? Color.green : Color.orange)
+                .fill(model.daemonOnline ? Color.green : (model.lastError != nil ? Color.red : Color.orange))
                 .frame(width: 7, height: 7)
-            Text(model.daemonOnline ? "Daemon ready" : "Starting daemon…")
+            Text(
+                model.daemonOnline
+                    ? "Daemon ready"
+                    : (model.lastError != nil ? "Daemon failed — see Logs/MacAgent" : "Starting daemon…")
+            )
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
             Spacer()
@@ -439,17 +443,17 @@ struct OverlayView: View {
     private func toggleMic() async {
         onInteract()
         if speech.isListening {
-            model.isDictating = false
+            await model.setDictating(false)
             let text = speech.stop()
             if !text.isEmpty {
                 draft = text
                 send()
             }
         } else {
-            model.isDictating = true
+            await model.setDictating(true)
             await speech.start()
             if !speech.isListening {
-                model.isDictating = false
+                await model.setDictating(false)
             }
             onInteract()
         }

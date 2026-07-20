@@ -72,12 +72,17 @@ Everything stays on-device except outbound web search when needed.
 
 ```bash
 cd /path/to/MacAgent
+# TTS (Kokoro) system deps
+brew install espeak-ng portaudio libsndfile
+
 python3 -m venv venv && source venv/bin/activate
 CMAKE_ARGS="-DGGML_METAL=on -DCMAKE_OSX_ARCHITECTURES=arm64" ARCHFLAGS="-arch arm64" \
   pip install -r requirements.txt
 
 ./automation/open_macagent.sh   # build + launch overlay
 ```
+
+Spoken status + final answers use [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) (downloaded on first use into the Hugging Face cache). Toggle volume / TTS in Preferences → Settings.
 
 - **⌃⌥Space** — show/hide overlay (grant **Accessibility** when prompted; enable **MacAgent.app**, not AEServer)
 - First mic use: allow **Microphone** + **Speech Recognition**

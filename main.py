@@ -23,6 +23,8 @@ from tools.duckduckgo import build_grounded_context
 from tools.pending_actions import take_pending
 from tools.registry import ToolRegistry
 from tools.run_bash import run_bash
+from tools.tts_kokoro import set_dictating, tts_config
+from tools.tts_narrator import narrate, narrate_answer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,6 +56,78 @@ def _load_settings() -> dict:
         with open(_SETTINGS_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
     return {}
+
+
+def _save_settings(data: dict[str, Any]) -> None:
+    _SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(_SETTINGS_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+
+
+def _model_dir() -> Path:
+    raw = settings.get("model_dir") or ""
+    if not raw:
+        # Default: parent of configured model_path, else ~/Models
+        mp = settings.get("model_path") or "~/Models/qwen2.5-1.5b-instruct-q4_k_m.gguf"
+        parent = Path(mp).expanduser().parent
+        if parent.is_dir():
+            return parent
+        return Path("~/Models").expanduser()
+    return Path(raw).expanduser()
+
+
+def _list_gguf_models(directory: Path) -> list[dict[str, Any]]:
+    if not directory.is_dir():
+        return []
+    items: list[dict[str, Any]] = []
+    for path in sorted(directory.glob("*.gguf")):
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+        items.append(
+            {
+                "name": path.name,
+                "path": str(path),
+                "size_bytes": size,
+                "size_gb": round(size / (1024**3), 2),
+            }
+        )
+    return items
+
+
+def _models_payload() -> dict[str, Any]:
+    model_path = Path(
+        settings.get("model_path", "~/Models/qwen2.5-1.5b-instruct-q4_k_m.gguf")
+    ).expanduser()
+    directory = _model_dir()
+    models = _list_gguf_models(directory)
+    # Include current path even if it lives outside model_dir.
+    if model_path.exists() and model_path.suffix.lower() == ".gguf":
+        if not any(m["path"] == str(model_path) for m in models):
+            try:
+                size = model_path.stat().st_size
+            except OSError:
+                size = 0
+            models.insert(
+                0,
+                {
+                    "name": model_path.name,
+                    "path": str(model_path),
+                    "size_bytes": size,
+                    "size_gb": round(size / (1024**3), 2),
+                },
+            )
+    return {
+        "ok": True,
+        "model_dir": str(directory),
+        "model_path": str(model_path),
+        "model_present": model_path.exists(),
+        "model_loaded": _parser is not None
+        and getattr(_parser, "_llm", None) is not None,
+        "models": models,
+    }
 
 
 settings = _load_settings()
@@ -108,6 +182,16 @@ class SiteUpdate(BaseModel):
     purpose: str = Field(..., min_length=1)
 
 
+class ModelSelectBody(BaseModel):
+    model_config = {"protected_namespaces": ()}
+
+    model_path: str = Field(..., min_length=1)
+    reload: bool = Field(
+        True,
+        description="If true, unload the current GGUF and load the new one immediately",
+    )
+
+
 @app.get("/health")
 async def health() -> dict[str, Any]:
     model_path = Path(
@@ -117,13 +201,111 @@ async def health() -> dict[str, Any]:
         "status": "ok",
         "model_present": model_path.exists(),
         "model_path": str(model_path),
+        "model_dir": str(_model_dir()),
         "model_loaded": _parser is not None
         and getattr(_parser, "_llm", None) is not None,
         "purpose_sites": len(get_memory().list_purpose_sites()),
     }
 
 
+@app.get("/v1/models")
+async def list_models() -> dict[str, Any]:
+    """List GGUF files in model_dir (default ~/Models) and the active model_path."""
+    return _models_payload()
 
+
+class SettingsBody(BaseModel):
+    tts_enabled: Optional[bool] = None
+    tts_voice: Optional[str] = None
+    tts_lang: Optional[str] = None
+    tts_speed: Optional[float] = None
+    tts_volume: Optional[float] = None
+    tts_speak_status: Optional[bool] = None
+    tts_speak_answer: Optional[bool] = None
+
+
+class DictationBody(BaseModel):
+    active: bool = False
+
+
+def _settings_payload() -> dict[str, Any]:
+    global settings
+    settings = _load_settings()
+    cfg = tts_config()
+    return {
+        "ok": True,
+        "tts_enabled": cfg["enabled"],
+        "tts_voice": cfg["voice"],
+        "tts_lang": cfg["lang"],
+        "tts_speed": cfg["speed"],
+        "tts_volume": cfg["volume"],
+        "tts_speak_status": cfg["speak_status"],
+        "tts_speak_answer": cfg["speak_answer"],
+    }
+
+
+@app.get("/v1/settings")
+async def get_settings() -> dict[str, Any]:
+    return _settings_payload()
+
+
+@app.put("/v1/settings")
+async def put_settings(body: SettingsBody) -> dict[str, Any]:
+    """Persist TTS / agent settings to settings.json."""
+    global settings
+    settings = _load_settings()
+    data = body.model_dump(exclude_none=True)
+    if "tts_volume" in data:
+        data["tts_volume"] = max(0.0, min(1.5, float(data["tts_volume"])))
+    if "tts_speed" in data:
+        data["tts_speed"] = max(0.5, min(2.0, float(data["tts_speed"])))
+    if "tts_voice" in data and data["tts_voice"]:
+        data["tts_voice"] = str(data["tts_voice"]).strip()
+    if "tts_lang" in data and data["tts_lang"]:
+        data["tts_lang"] = str(data["tts_lang"]).strip()[:8]
+    settings.update(data)
+    _save_settings(settings)
+    return _settings_payload()
+
+
+@app.post("/v1/tts/dictation")
+async def tts_dictation(body: DictationBody) -> dict[str, Any]:
+    """Pause TTS while the overlay mic is recording."""
+    set_dictating(body.active)
+    return {"ok": True, "dictating": body.active}
+
+
+@app.put("/v1/models")
+async def select_model(body: ModelSelectBody) -> dict[str, Any]:
+    """Persist model_path to settings.json and optionally reload the GGUF in-process."""
+    global settings
+    path = Path(body.model_path).expanduser()
+    if not path.exists() or path.suffix.lower() != ".gguf":
+        raise HTTPException(
+            status_code=400,
+            detail=f"GGUF not found: {path}",
+        )
+
+    settings = _load_settings()
+    settings["model_path"] = str(path)
+    # Keep model_dir pointing at the folder that contains this file when sensible.
+    if not settings.get("model_dir"):
+        settings["model_dir"] = str(path.parent)
+    _save_settings(settings)
+
+    reload_info: dict[str, Any] = {"reloaded": False}
+    if body.reload:
+        try:
+            parser = get_parser()
+            reload_info = parser.reload(str(path))
+            reload_info["reloaded"] = True
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Model reload failed")
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    out = _models_payload()
+    out.update(reload_info)
+    return out
 
 
 @app.get("/v1/sites")
@@ -309,6 +491,10 @@ async def confirm_action(body: ConfirmBody) -> dict[str, Any]:
             step="confirm",
             tool_input={"id": body.id, "approve": False},
         )
+        try:
+            narrate_answer("Cancelled — nothing was deleted.")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("tts answer skipped: %s", exc)
         get_memory().log_activity(utterance, "confirm", "denied", summary[:300])
         return {"ok": True, "approved": False, "id": body.id}
 
@@ -341,18 +527,27 @@ async def confirm_action(body: ConfirmBody) -> dict[str, Any]:
             tool_input={"id": body.id, "command": command},
             tool_output=result,
         )
+        try:
+            narrate_answer(msg)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("tts answer skipped: %s", exc)
         get_memory().log_activity(utterance, "confirm", "approved", msg[:300])
         return {"ok": True, "approved": True, "id": body.id, "result": result}
 
     err = result.get("error") or result.get("stderr") or "command failed"
+    fail_msg = f"Could not complete that: {err}"
     event_bus.publish(
         utterance=utterance,
         kind="answer",
-        text=f"Could not complete that: {err}",
+        text=fail_msg,
         detail="confirm_failed",
         step="confirm",
         tool_output=result,
     )
+    try:
+        narrate_answer(fail_msg)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("tts answer skipped: %s", exc)
     return {"ok": False, "approved": True, "id": body.id, "error": err}
 
 
@@ -598,6 +793,10 @@ def _handle_spoken_inner(spoken: str) -> None:
                 event_bus.publish(
                     utterance=text, kind="answer", text=reply, detail="local_math"
                 )
+                try:
+                    narrate_answer(reply)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("tts answer skipped: %s", exc)
                 trace_step("final", kind="answer", detail="local_math", text=reply)
                 return
 
@@ -611,6 +810,10 @@ def _handle_spoken_inner(spoken: str) -> None:
             text=reply,
             detail="local_llm",
         )
+        try:
+            narrate_answer(reply)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("tts answer skipped: %s", exc)
         trace_step("final", kind="answer", detail="local_llm", text=reply)
         return
 
@@ -667,6 +870,10 @@ def _answer_with_web_context(spoken: str) -> bool:
         text=reply,
         detail="duckduckgo_grounded",
     )
+    try:
+        narrate_answer(reply)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("tts answer skipped: %s", exc)
     trace_step("final", kind="answer", detail="duckduckgo_grounded", text=reply)
     logger.info(
         "Grounded answer (%d chars, %d sources)", len(reply), len(sources)
@@ -757,6 +964,10 @@ async def _dispatch_spoken(spoken: str) -> bool:
         text="Thinking…",
         detail="pending",
     )
+    try:
+        narrate("thinking", force=True)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("tts narrate thinking skipped: %s", exc)
     try:
         await asyncio.to_thread(_handle_spoken, spoken, tid)
         debug_traces.finish(tid, status="ok")

@@ -79,7 +79,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard app.processIdentifier != myPID else { continue }
             let matchBundle = app.bundleIdentifier == mine
             let matchName = (app.localizedName ?? "") == "MacAgent"
-                || (app.bundleURL?.lastPathCompo₹nent == "MacAgent.app")
+                || (app.bundleURL?.lastPathComponent == "MacAgent.app")
             guard matchBundle || matchName else { continue }
             app.forceTerminate()
         }

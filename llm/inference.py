@@ -134,6 +134,24 @@ class LocalIntentParser:
         )
         self._llm: Optional[Llama] = None
 
+    def reload(self, model_path: Optional[str] = None) -> dict[str, Any]:
+        """Unload the current GGUF (if any) and optionally switch path, then load."""
+        if model_path:
+            self.model_path = str(Path(model_path).expanduser())
+        old = self._llm
+        self._llm = None
+        if old is not None:
+            try:
+                del old
+            except Exception:  # noqa: BLE001
+                pass
+        self._ensure_loaded()
+        return {
+            "ok": True,
+            "model_path": self.model_path,
+            "model_loaded": self._llm is not None,
+        }
+
     def _ensure_loaded(self) -> None:
         if self._llm is not None:
             return
@@ -548,13 +566,25 @@ class LocalIntentParser:
         history_block = "\n".join(hist_lines) if hist_lines else "(none yet)"
 
         system_prompt = (
-            "You are MacAgent's planner on macOS. "
+            "You are MacAgent's planner AND supervisor on macOS. "
             "Choose exactly ONE next tool call as JSON: {\"tool\":\"name\",\"args\":{...}}. "
             "No markdown. No explanation. "
-            "CRITICAL: Match the user's words. "
+            "CRITICAL: Match the user's intent — never copy unrelated catalog examples. "
+            "Understand natural language: factual or advice questions (including phrases like "
+            "open-source, open source, open to, any open model) are NOT Mac open/launch actions — "
+            "use web_search then respond. "
+            "Only use open_app, open_url, open_folder, open_system_settings, or bash `open` when the "
+            "user explicitly asks to open/launch/reveal an app, URL, folder, or Settings pane. "
+            "Supervise prior steps: if the last tool failed (ok:false) or its result does not "
+            "address the request, do NOT repeat the same tool+args — pick a corrective tool or "
+            "respond honestly with what you know. "
+            "To close/quit/kill an app or browser, use manage_system_resources with action=kill. "
+            "Never use control_power_management or modify_system_setting for closing apps. "
+            "control_power_management is ONLY for sleep/display timeout/battery when the user asked for that. "
             "Multi-step is expected: one tool per step, keep going until the GOAL is done. "
-            "After listing/search, if the user asked to delete/move/open/act on that result, "
+            "After listing/search, if the user explicitly asked to delete/move/open that result on the Mac, "
             "call the next tool — do NOT respond with only the listing. "
+            "If they only asked a question, respond once you have a solid answer — do not invent Mac actions. "
             "If a prior web_search answer said context was insufficient / missing prices, "
             "call web_search again with a sharper query (include model names + pricing + year). "
             "Use tool=respond only when the goal is finished or you must ask a clarifying question. "
@@ -562,8 +592,6 @@ class LocalIntentParser:
             "NEVER call shut down, restart, empty trash, rm, or ui_* unless the user explicitly asked. "
             "Do not invent destructive actions from the catalog examples. "
             "For factual questions use web_search then respond. "
-            "For explicit open/launch use open_app or open_url. "
-            "For explicit file tasks use run_bash. "
             "Only when the user wants something done on the Mac should you use action tools."
         )
         user_prompt = (
@@ -704,9 +732,13 @@ class LocalIntentParser:
             "You verify whether a Mac assistant finished the user's request. "
             "Reply with ONLY JSON: "
             '{"done":true|false,"reason":"…","next_hint":"tool or action to try next"}. '
-            "done=false if they only listed/found something but the user asked to "
-            "delete/remove/open/move/empty/change it. "
-            "done=true if the action is complete or the user only asked a question."
+            "done=true if the user asked an informational question and the candidate answers it "
+            "(even when words like open-source appear — that is NOT an open-file request). "
+            "done=false only when the user clearly asked for a Mac side-effect "
+            "(delete/remove/open-app/launch/move/empty trash/change setting) that has not happened. "
+            "done=false if tools ran but the candidate answer does not address the question "
+            "(quality fail — suggest a corrective next_hint). "
+            "done=true if the Mac action is complete or a clarifying question is appropriate."
         )
         user_prompt = (
             f"User request: {utterance}\n\n"

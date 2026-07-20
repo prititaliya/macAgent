@@ -54,7 +54,7 @@ final class HotkeyManager {
             &handlerRef
         )
 
-        var keyID = EventHotKeyID(signature: OSType(0x4D414754), id: 1)
+        let keyID = EventHotKeyID(signature: OSType(0x4D414754), id: 1)
         let status = RegisterEventHotKey(
             UInt32(kVK_Space),
             UInt32(controlKey | optionKey),

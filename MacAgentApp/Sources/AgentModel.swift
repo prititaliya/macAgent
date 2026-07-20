@@ -45,6 +45,18 @@ final class AgentModel: ObservableObject {
     @Published var contextNotes = ""
     @Published var debugJSON = "[]"
     @Published var lastError: String?
+    /// Available GGUF models from ~/Models (via daemon).
+    @Published var availableModels: [[String: Any]] = []
+    @Published var modelDir = ""
+    @Published var modelPath = ""
+    @Published var modelLoaded = false
+    @Published var modelSwitching = false
+    /// TTS (Kokoro) prefs from daemon settings.json
+    @Published var ttsEnabled = true
+    @Published var ttsSpeakStatus = true
+    @Published var ttsSpeakAnswer = true
+    @Published var ttsVolume: Double = 0.95
+    @Published var ttsVoice = "af_heart"
 
     var onEvent: (() -> Void)?
     /// Fired when the user interacts or a new answer arrives — resets auto-hide.
@@ -58,7 +70,15 @@ final class AgentModel: ObservableObject {
     private init() {}
 
     func bootstrap() async {
+        statusLine = "Checking local daemon…"
         daemonOnline = await daemon.ensureRunning()
+        if daemonOnline {
+            statusLine = ""
+            lastError = nil
+        } else {
+            statusLine = "Daemon failed to start"
+            lastError = "Check ~/Library/Logs/MacAgent/daemon.err"
+        }
         startSSE()
         startPoll()
         await refreshPrefs()
@@ -168,11 +188,89 @@ final class AgentModel: ObservableObject {
            let str = String(data: data, encoding: .utf8) {
             debugJSON = str
         }
+        if let obj = await getJSON("v1/settings") {
+            if let v = obj["tts_enabled"] as? Bool { ttsEnabled = v }
+            if let v = obj["tts_speak_status"] as? Bool { ttsSpeakStatus = v }
+            if let v = obj["tts_speak_answer"] as? Bool { ttsSpeakAnswer = v }
+            if let v = obj["tts_volume"] as? Double { ttsVolume = v }
+            else if let v = obj["tts_volume"] as? NSNumber { ttsVolume = v.doubleValue }
+            if let v = obj["tts_voice"] as? String, !v.isEmpty { ttsVoice = v }
+        }
+        await refreshModels()
+    }
+
+    func refreshModels() async {
+        guard let obj = await getJSON("v1/models") else { return }
+        if let dir = obj["model_dir"] as? String { modelDir = dir }
+        if let path = obj["model_path"] as? String { modelPath = path }
+        if let loaded = obj["model_loaded"] as? Bool { modelLoaded = loaded }
+        if let items = obj["models"] as? [[String: Any]] {
+            availableModels = items
+        }
+    }
+
+    /// Switch active GGUF (writes settings.json and reloads in the daemon).
+    func selectModel(path: String) async {
+        guard !path.isEmpty, path != modelPath else { return }
+        modelSwitching = true
+        defer { modelSwitching = false }
+        statusLine = "Loading model…"
+        if let obj = await putJSON(
+            "v1/models",
+            body: ["model_path": path, "reload": true],
+            timeout: 300
+        ) {
+            if let err = obj["detail"] as? String {
+                lastError = err
+                statusLine = "Model switch failed"
+            } else if let err = obj["error"] as? String {
+                lastError = err
+                statusLine = "Model switch failed"
+            } else {
+                lastError = nil
+                if let p = obj["model_path"] as? String { modelPath = p }
+                if let loaded = obj["model_loaded"] as? Bool { modelLoaded = loaded }
+                if let items = obj["models"] as? [[String: Any]] {
+                    availableModels = items
+                }
+                statusLine = modelLoaded ? "Model ready" : "Model selected"
+            }
+        } else {
+            lastError = "Could not switch model — is the daemon running?"
+            statusLine = "Model switch failed"
+        }
+        await refreshModels()
     }
 
     func saveNotes(_ notes: String) async {
         _ = await putJSON("v1/context", body: ["notes": notes])
         await refreshPrefs()
+    }
+
+    func saveTTSSettings(
+        enabled: Bool? = nil,
+        speakStatus: Bool? = nil,
+        speakAnswer: Bool? = nil,
+        volume: Double? = nil
+    ) async {
+        var body: [String: Any] = [:]
+        if let enabled { body["tts_enabled"] = enabled }
+        if let speakStatus { body["tts_speak_status"] = speakStatus }
+        if let speakAnswer { body["tts_speak_answer"] = speakAnswer }
+        if let volume { body["tts_volume"] = volume }
+        guard !body.isEmpty else { return }
+        if let obj = await putJSON("v1/settings", body: body) {
+            if let v = obj["tts_enabled"] as? Bool { ttsEnabled = v }
+            if let v = obj["tts_speak_status"] as? Bool { ttsSpeakStatus = v }
+            if let v = obj["tts_speak_answer"] as? Bool { ttsSpeakAnswer = v }
+            if let v = obj["tts_volume"] as? Double { ttsVolume = v }
+            else if let v = obj["tts_volume"] as? NSNumber { ttsVolume = v.doubleValue }
+        }
+    }
+
+    func setDictating(_ active: Bool) async {
+        isDictating = active
+        _ = await postJSON("v1/tts/dictation", body: ["active": active])
     }
 
     func addSite(url: String, purpose: String) async {
@@ -460,11 +558,16 @@ final class AgentModel: ObservableObject {
         }
     }
 
-    private func putJSON(_ path: String, body: [String: Any]) async -> [String: Any]? {
+    private func putJSON(
+        _ path: String,
+        body: [String: Any],
+        timeout: TimeInterval = 60
+    ) async -> [String: Any]? {
         guard let url = URL(string: path, relativeTo: base)?.absoluteURL else { return nil }
         var req = URLRequest(url: url)
         req.httpMethod = "PUT"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.timeoutInterval = timeout
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
         do {
             let (data, _) = try await URLSession.shared.data(for: req)

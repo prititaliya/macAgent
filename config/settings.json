@@ -1,8 +1,16 @@
 {
   "host": "127.0.0.1",
   "port": 8081,
-  "model_path": "~/Models/qwen2.5-1.5b-instruct-q4_k_m.gguf",
+  "model_path": "/Users/jatin/Models/qwen2.5-3b-instruct-q4_k_m.gguf",
+  "model_dir": "~/Models",
   "db_path": "",
   "default_browser": "chrome",
-  "lazy_load_model": true
+  "lazy_load_model": true,
+  "tts_enabled": true,
+  "tts_voice": "af_heart",
+  "tts_lang": "a",
+  "tts_speed": 1.0,
+  "tts_volume": 0.95,
+  "tts_speak_status": true,
+  "tts_speak_answer": true
 }

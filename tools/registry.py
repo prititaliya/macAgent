@@ -15,6 +15,13 @@ from memory.user_context import (
     save_user_notes,
 )
 from tools.duckduckgo import build_grounded_context
+from tools.mac_alerts import trigger_native_notification_from_args
+from tools.mac_diagnostics import manage_system_resources_from_args
+from tools.mac_search import spotlight_file_search_from_args
+from tools.mac_system import (
+    control_power_management_from_args,
+    modify_system_setting_from_args,
+)
 from tools.run_bash import run_bash
 from tools.run_code import run_python
 from automation import ui_control
@@ -54,13 +61,19 @@ Available tools (reply with ONE JSON object: {"tool":"...","args":{...}}):
 - web_search: {"query":"…"} — factual / live questions; if prior search lacked prices/facts, search again with a sharper query
 - open_app: {"name":"Safari"} — only if user asked to open an app
 - open_url: {"url":"https://…"} — only if user asked to open a site (Chrome)
-- open_system_settings: {"pane":"wifi|bluetooth|…"} — only if user asked for Settings
+- open_system_settings: {"pane":"wifi|bluetooth|…"} — only if user asked to OPEN Settings GUI
+- manage_system_resources: {"action":"kill","target_process":"Google Chrome"} — CLOSE/QUIT/KILL an app or process; {"action":"list"} for top CPU/memory
+- modify_system_setting: {"domain":"NSGlobalDomain","key":"AppleInterfaceStyle","value":"Dark","value_type":"string"} — ONLY for prefs/defaults (dark mode, Dock); NOT for closing apps
+- control_power_management: {"setting":"sleep","value":10} — ONLY for pmset power/sleep timeouts when user asked about sleep/display timeout/battery; NEVER for closing apps
+- spotlight_file_search: {"query":"invoice.pdf"} — fast system-wide Spotlight (mdfind); returns top 15 absolute paths
+- trigger_native_notification: {"title":"Done","subtitle":"MacAgent","message":"Task finished","play_sound":true} — Notification Center alert
 - run_bash: {"command":"…"} — file/shell tasks; multi-step OK (list then delete/open)
 - run_python: {"code":"print(2+4)"} — math / short scripts
 - ui_snapshot / ui_click / ui_type / ui_key / ui_menu — only for explicit on-screen control
 - get_user_context / update_user_context — notes
-Multi-step: after listing/search, if the user asked to delete/move/open that item, call the next tool — do not respond with only the listing.
-If a web_search answer said the context was insufficient, call web_search again with a more specific query (pricing, model names, year).
+To close/quit an app or browser → manage_system_resources kill (NOT control_power_management, NOT modify_system_setting).
+If a tool failed (ok:false), do NOT repeat the same call — try a different tool or respond with the error.
+Prefer spotlight_file_search over slow find/os.walk bash for locating files.
 NEVER invent shut down / restart / empty trash / rm unless the user clearly asked for that (delete/remove/rm).
 """.strip()
 
@@ -80,6 +93,11 @@ class ToolRegistry:
             "open_url": self._open_url,
             "web_search": self._web_search,
             "open_system_settings": self._open_system_settings,
+            "modify_system_setting": self._modify_system_setting,
+            "control_power_management": self._control_power_management,
+            "spotlight_file_search": self._spotlight_file_search,
+            "manage_system_resources": self._manage_system_resources,
+            "trigger_native_notification": self._trigger_native_notification,
             "run_python": self._run_python,
             "run_bash": self._run_bash,
             "ui_snapshot": self._ui_snapshot,
@@ -468,6 +486,21 @@ class ToolRegistry:
             }
         subprocess.run(["open", url], check=False)
         return {"ok": True, "pane": key, "opened": url}
+
+    def _modify_system_setting(self, args: dict[str, Any]) -> dict[str, Any]:
+        return modify_system_setting_from_args(args)
+
+    def _control_power_management(self, args: dict[str, Any]) -> dict[str, Any]:
+        return control_power_management_from_args(args)
+
+    def _spotlight_file_search(self, args: dict[str, Any]) -> dict[str, Any]:
+        return spotlight_file_search_from_args(args)
+
+    def _manage_system_resources(self, args: dict[str, Any]) -> dict[str, Any]:
+        return manage_system_resources_from_args(args)
+
+    def _trigger_native_notification(self, args: dict[str, Any]) -> dict[str, Any]:
+        return trigger_native_notification_from_args(args)
 
     def _run_python(self, args: dict[str, Any]) -> dict[str, Any]:
         code = str(args.get("code") or args.get("source") or args.get("script") or "")

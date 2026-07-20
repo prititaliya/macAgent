@@ -18,21 +18,71 @@ from tools.run_bash import (
     shutdown_command,
     sleep_command,
 )
+from tools.tts_narrator import narrate, narrate_answer
 
 logger = logging.getLogger(__name__)
 
 _MAX_ITERS = 10
 _MAX_WEB_SEARCHES = 3
+_MAX_IDENTICAL_FAILURES = 2
 _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 _ACTION_RE = re.compile(
     r"(?i)\b("
     r"shut\s*down|turn\s+off|power\s+off|restart|reboot|sleep|log\s*out|"
     r"empty\s+(the\s+)?(bin|trash)|delete|remove|install|quit|close|"
-    r"click|press|type|open|launch|start|enable|disable|toggle|"
+    # bare "open" is handled via _is_open_action (avoids open-source / open to …)
+    r"click|press|type|launch|start|enable|disable|toggle|"
     r"set|change|move|copy|create|make|do\s+it|perform|run\s+this"
     r")\b"
 )
+
+_POWER_UTTERANCE_RE = re.compile(
+    r"(?i)\b("
+    r"pmset|displaysleep|display\s*sleep|disk\s*sleep|"
+    r"sleep\s+(timeout|timer|after|in)|"
+    r"hibernate|low\s*power|power\s*nap|energy\s*saver|"
+    r"battery\s+(settings?|timeout)|"
+    r"screen\s+(sleep|timeout)|"
+    r"put\s+.+\s+to\s+sleep"
+    r")\b"
+)
+
+_PREF_UTTERANCE_RE = re.compile(
+    r"(?i)\b("
+    r"dark\s*mode|light\s*mode|defaults\s+write|"
+    r"system\s+preference|change\s+(the\s+)?(dock|appearance)|"
+    r"set\s+(the\s+)?(dock|appearance|theme)"
+    r")\b"
+)
+
+# Common app aliases → process / app name for manage_system_resources kill.
+_APP_ALIASES: dict[str, str] = {
+    "chrome": "Google Chrome",
+    "google chrome": "Google Chrome",
+    "chromium": "Chromium",
+    "safari": "Safari",
+    "firefox": "Firefox",
+    "edge": "Microsoft Edge",
+    "microsoft edge": "Microsoft Edge",
+    "slack": "Slack",
+    "spotify": "Spotify",
+    "code": "Code",
+    "vscode": "Code",
+    "visual studio code": "Code",
+    "terminal": "Terminal",
+    "iterm": "iTerm2",
+    "iterm2": "iTerm2",
+    "finder": "Finder",
+    "mail": "Mail",
+    "messages": "Messages",
+    "notes": "Notes",
+    "music": "Music",
+    "zoom": "zoom.us",
+    "discord": "Discord",
+    "notion": "Notion",
+    "cursor": "Cursor",
+}
 
 _CHAT_RE = re.compile(
     r"(?i)^\s*("
@@ -81,7 +131,20 @@ _DISCOVERY_BASH_RE = re.compile(
 )
 
 _DELETE_RE = re.compile(r"(?i)\b(delete|remove|rm|trash)\b")
-_OPEN_RE = re.compile(r"(?i)\b(open|launch|start|reveal)\b")
+# Imperative open/launch — do NOT use bare \bopen\b (matches "open-source").
+_OPEN_RE = re.compile(
+    r"(?i)(?:^|\b)(?:can\s+you\s+|could\s+you\s+|please\s+|would\s+you\s+)?"
+    r"(open|launch|start|reveal)\s+(?!source\b|sourced\b|to\b|minded\b|question\b)"
+)
+_OPEN_COMPOUND_RE = re.compile(
+    r"(?i)\bopen[- ]source(d)?\b|"
+    r"\bopen[- ]minded\b|"
+    r"\bopenness\b|"
+    r"\bopen to\b|"
+    r"\bopen question\b|"
+    r"\bin the open\b|"
+    r"\b(any|some|an?)\s+open[- ]?(source(d)?|model|models|standard|protocol|api|license|software)\b"
+)
 _EMPTY_TRASH_RE = re.compile(
     r"(?i)\b(empty\s+(the\s+)?(bin|trash)|clear\s+(the\s+)?(bin|trash))\b"
 )
@@ -90,13 +153,16 @@ _CAPABILITIES_TEXT = """Here's what I can do on your Mac:
 
 • Answer questions (local model + web search when needed)
 • Open apps and Chrome URLs
-• Find files/folders (Downloads, Spotlight, shell)
+• Find files via Spotlight (fast) or shell
+• Change system prefs (defaults) and power settings (pmset) without opening GUI
+• List / kill top CPU & memory processes
+• Send Notification Center alerts (even when the overlay is hidden)
 • Empty Trash, shut down / restart / sleep — with your Approve first
 • Control the UI (click, type, menus) when Accessibility is enabled
 • Run short bash/Python for local tasks
 • Remember notes you save in Preferences
 
-Ask me like: “open Slack”, “what's my latest download?”, or “empty the bin”."""
+Ask me like: “open Slack”, “spotlight invoice.pdf”, “notify me when done”, or “top CPU processes”."""
 
 
 def _parse_tool_call(text: str) -> Optional[dict[str, Any]]:
@@ -156,6 +222,7 @@ class AgentLoop:
             text="Planning…",
             detail="pending",
         )
+        narrate("planning")
 
         for step in range(_MAX_ITERS):
             call = self._next_call(utterance, history)
@@ -273,6 +340,10 @@ class AgentLoop:
                 text=f"Tool: {tool}",
                 detail="pending",
             )
+            if tool == "web_search":
+                narrate("researching")
+            elif tool not in {"respond"}:
+                narrate("acting")
 
             if tool == "respond":
                 text = str(args.get("text") or args.get("message") or "").strip()
@@ -312,6 +383,15 @@ class AgentLoop:
                 tool_output=_trim(result),
             )
 
+            # Stop thrashing: same failed tool+args repeated → surface error.
+            if not result.get("ok") and _identical_failure_count(history) >= _MAX_IDENTICAL_FAILURES:
+                err = str(result.get("error") or "tool failed")
+                msg = (
+                    f"That action failed repeatedly ({tool}): {err}. "
+                    "Stopped retrying — try a different request."
+                )
+                return self._finish(utterance, msg, sources, history)
+
             if tool == "web_search" and isinstance(result.get("sources"), list):
                 for s in result["sources"]:
                     if s not in sources:
@@ -337,6 +417,7 @@ class AgentLoop:
                         text="Research done — acting…",
                         detail="pending",
                     )
+                    narrate("acting")
                     continue
                 # Merge contexts from earlier searches so retries compound evidence.
                 combined = _combined_search_context(history)
@@ -361,6 +442,7 @@ class AgentLoop:
                         text=f"Need better sources — searching again ({searches_done}/{_MAX_WEB_SEARCHES})…",
                         detail="pending",
                     )
+                    narrate("researching")
                     event_bus.publish(
                         utterance=utterance,
                         kind="trace",
@@ -509,6 +591,9 @@ class AgentLoop:
                 "open_folder",
                 "open_system_settings",
                 "update_user_context",
+                "modify_system_setting",
+                "control_power_management",
+                "trigger_native_notification",
             } and result.get("ok"):
                 msg = (
                     result.get("message")
@@ -521,6 +606,18 @@ class AgentLoop:
                     msg = f"Opened System Settings ({result.get('pane') or 'general'})."
                 elif tool == "open_folder":
                     msg = result.get("message") or f"Opened folder {result.get('path')}"
+                elif tool == "modify_system_setting":
+                    msg = (
+                        f"Updated {result.get('domain')}.{result.get('key')} "
+                        f"= {result.get('value')}"
+                    )
+                elif tool == "control_power_management":
+                    msg = (
+                        f"Set pmset {result.get('setting')} "
+                        f"to {result.get('value')}"
+                    )
+                elif tool == "trigger_native_notification":
+                    msg = f"Notification sent: {result.get('title') or 'MacAgent'}"
                 finished = self._attempt_finish(
                     utterance, str(msg), sources, history
                 )
@@ -577,10 +674,81 @@ class AgentLoop:
                     sources,
                     history,
                     force=True,
+
                 )
                 if finished is not None:
                     return finished
                 continue
+
+            if tool == "spotlight_file_search" and result.get("ok") and step >= 0:
+                paths = result.get("paths") or []
+                if paths:
+                    lines = [f"{i}. {p}" for i, p in enumerate(paths[:15], 1)]
+                    listing = (
+                        f"Spotlight found {len(paths)} file(s):\n"
+                        + "\n".join(lines)
+                    )
+                    if _goal_status(utterance, history, listing) == "incomplete":
+                        event_bus.publish(
+                            utterance=utterance,
+                            kind="action",
+                            text="Acting on results…",
+                            detail="pending",
+                        )
+                        continue
+                    finished = self._attempt_finish(
+                        utterance, listing, sources, history
+                    )
+                    if finished is not None:
+                        return finished
+                    continue
+                finished = self._attempt_finish(
+                    utterance,
+                    "No Spotlight matches found.",
+                    sources,
+                    history,
+                    force=True,
+                )
+                if finished is not None:
+                    return finished
+                continue
+
+            if tool == "manage_system_resources" and result.get("ok") and step >= 0:
+                action = str(result.get("action") or "")
+                if action == "list":
+                    procs = result.get("processes") or []
+                    if procs:
+                        lines = [
+                            f"{i}. {p.get('name')} (pid {p.get('pid')}) — "
+                            f"CPU {p.get('cpu_percent')}% / "
+                            f"{p.get('memory_mb')} MB"
+                            for i, p in enumerate(procs, 1)
+                        ]
+                        listing = "Top processes:\n" + "\n".join(lines)
+                    else:
+                        listing = "No processes available."
+                    finished = self._attempt_finish(
+                        utterance, listing, sources, history, force=True
+                    )
+                    if finished is not None:
+                        return finished
+                    continue
+                if action == "kill":
+                    terminated = result.get("terminated") or []
+                    names = ", ".join(
+                        f"{t.get('name')}({t.get('pid')})" for t in terminated[:8]
+                    )
+                    msg = (
+                        f"Terminated: {names}"
+                        if names
+                        else "Process termination requested."
+                    )
+                    finished = self._attempt_finish(
+                        utterance, msg, sources, history, force=True
+                    )
+                    if finished is not None:
+                        return finished
+                    continue
 
         # Force a respond if the model never did.
         last_text = self._synthesize_from_history(utterance, history) or last_text
@@ -649,6 +817,32 @@ class AgentLoop:
                 paths = result["paths"]
                 lines = "\n".join(f"- {p}" for p in paths[:12])
                 return f"Found {len(paths)} file(s):\n{lines}"
+            if tool == "spotlight_file_search" and result.get("paths"):
+                paths = result["paths"]
+                lines = "\n".join(f"- {p}" for p in paths[:15])
+                return f"Spotlight found {len(paths)} file(s):\n{lines}"
+            if tool == "manage_system_resources" and result.get("processes"):
+                lines = [
+                    f"- {p.get('name')} (pid {p.get('pid')}): "
+                    f"CPU {p.get('cpu_percent')}% / {p.get('memory_mb')} MB"
+                    for p in (result.get("processes") or [])[:5]
+                ]
+                return "Top processes:\n" + "\n".join(lines)
+            if tool == "manage_system_resources" and result.get("terminated"):
+                names = ", ".join(
+                    f"{t.get('name')}({t.get('pid')})"
+                    for t in (result.get("terminated") or [])[:8]
+                )
+                return f"Terminated: {names}" if names else "Termination done."
+            if tool == "trigger_native_notification" and result.get("ok"):
+                return f"Notification sent: {result.get('title') or 'MacAgent'}"
+            if tool == "modify_system_setting" and result.get("ok"):
+                return (
+                    f"Updated {result.get('domain')}.{result.get('key')} "
+                    f"= {result.get('value')}"
+                )
+            if tool == "control_power_management" and result.get("ok"):
+                return f"Set pmset {result.get('setting')} to {result.get('value')}"
             if result.get("message"):
                 return str(result["message"])
             if result.get("text") and result.get("ok", True):
@@ -814,6 +1008,7 @@ class AgentLoop:
                 text="Acting on results…",
                 detail="pending",
             )
+            narrate("acting")
             return None
         return self._finish(utterance, text, sources, history)
 
@@ -853,6 +1048,10 @@ class AgentLoop:
             detail="agent",
             sources=normalized or None,
         )
+        try:
+            narrate_answer(text or "")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("tts answer skipped: %s", exc)
         trace_step(
             "final",
             kind="answer",
@@ -883,6 +1082,101 @@ def _trim(obj: Any, limit: int = 1200) -> Any:
     return raw[:limit]
 
 
+def _resolve_app_name(raw: str) -> str:
+    """Map user phrasing (chrome, browser) to a process name."""
+    key = re.sub(r"\s+", " ", (raw or "").strip().lower())
+    key = re.sub(r"^(the|a|an|my)\s+", "", key).strip()
+    key = re.sub(r"\s+(app|application|browser|process)$", "", key).strip()
+    if key in {"browser", "web browser"}:
+        return "Google Chrome"
+    if key in _APP_ALIASES:
+        return _APP_ALIASES[key]
+    # Substring alias: "google chrome browser" → chrome
+    for alias, resolved in sorted(_APP_ALIASES.items(), key=lambda x: -len(x[0])):
+        if alias in key:
+            return resolved
+    return (raw or "").strip()
+
+
+def _close_app_heuristic(text: str) -> Optional[dict[str, Any]]:
+    """Deterministic close/quit/kill for apps — 1.5B often invents pmset instead."""
+    if not re.search(
+        r"(?i)\b(close|quit|kill|force[\s-]?quit|terminate|exit|shut)\b",
+        text,
+    ):
+        return None
+    if re.search(r"(?i)\b(window|tab|file|folder|document)\b", text) and not re.search(
+        r"(?i)\b(chrome|safari|firefox|browser|slack|spotify|app|application)\b",
+        text,
+    ):
+        return None
+
+    # Prefer known app names anywhere in the utterance.
+    known = re.search(
+        r"(?i)\b(?P<name>google\s*chrome|microsoft\s*edge|visual\s*studio\s*code|"
+        r"chrome|safari|firefox|edge|slack|spotify|discord|zoom|notion|"
+        r"cursor|vscode|iterm2?|finder|mail|messages|notes|music|browser)\b",
+        text,
+    )
+    if known:
+        return {
+            "tool": "manage_system_resources",
+            "args": {
+                "action": "kill",
+                "target_process": _resolve_app_name(known.group("name")),
+            },
+        }
+
+    # Generic “close X” / “quit the X app”
+    m = re.search(
+        r"(?i)\b(?:close|quit|kill|force[\s-]?quit|terminate|exit)\b"
+        r"(?:\s+(?:the|my|a))?"
+        r"(?:\s+(?:app|application|process|browser))?"
+        r"\s+(?P<name>[\w.\-]+(?:\s+[\w.\-]+){0,3})"
+        r"(?:\s+(?:app|application|browser|process|for\s+me))?$",
+        text.strip().rstrip(".?!"),
+    )
+    if not m:
+        return None
+    name = m.group("name").strip().rstrip(".?!")
+    name = re.sub(r"(?i)\s+(for\s+me|please)$", "", name).strip()
+    if not name or len(name) > 64:
+        return None
+    # Avoid treating “close enough” / “close the loop” as apps.
+    if name.lower() in {"enough", "the loop", "loop", "me", "it"}:
+        return None
+    return {
+        "tool": "manage_system_resources",
+        "args": {
+            "action": "kill",
+            "target_process": _resolve_app_name(name),
+        },
+    }
+
+
+def _identical_failure_count(history: list[dict[str, Any]]) -> int:
+    """How many times the latest failed tool+args appears consecutively at the end."""
+    if not history:
+        return 0
+    last = history[-1]
+    last_call = last.get("call") or {}
+    last_result = last.get("result") or {}
+    if last_result.get("ok", True):
+        return 0
+    tool = last_call.get("tool")
+    args = last_call.get("args") or {}
+    count = 0
+    for item in reversed(history):
+        call = item.get("call") or {}
+        result = item.get("result") or {}
+        if call.get("tool") != tool or (call.get("args") or {}) != args:
+            break
+        if result.get("ok", True):
+            break
+        count += 1
+    return count
+
+
 def _heuristic_tool(utterance: str) -> Optional[dict[str, Any]]:
     text = (utterance or "").strip()
     lower = text.lower()
@@ -910,6 +1204,119 @@ def _heuristic_tool(utterance: str) -> Optional[dict[str, Any]]:
     math = _try_simple_math(text)
     if math is not None and re.search(r"(?i)[\+\-\*\/x×÷]", text):
         return {"tool": "respond", "args": {"text": math}}
+
+    # Close / quit / kill an app or browser (before planner can invent pmset).
+    close_call = _close_app_heuristic(text)
+    if close_call:
+        return close_call
+
+    # Native Notification Center — “notify me …”, “send a notification …”
+    notify_m = re.search(
+        r"(?i)\b("
+        r"notify\s+me|"
+        r"send\s+(me\s+)?(a\s+)?notification|"
+        r"show\s+(me\s+)?(a\s+)?notification|"
+        r"alert\s+me|"
+        r"desktop\s+notification"
+        r")\b",
+        text,
+    )
+    if notify_m:
+        msg = text
+        for pat in (
+            r"(?i)^(please\s+)?(can\s+you\s+|could\s+you\s+)?",
+            r"(?i)\b(notify\s+me(\s+(that|about|when|with))?|"
+            r"send\s+(me\s+)?(a\s+)?notification(\s+(that|about|saying|with))?|"
+            r"show\s+(me\s+)?(a\s+)?notification(\s+(that|about|saying|with))?|"
+            r"alert\s+me(\s+(that|about|when|with))?|"
+            r"desktop\s+notification(\s+(that|about|saying|with))?)\s*",
+        ):
+            msg = re.sub(pat, "", msg).strip()
+        msg = msg.strip(" .,:;\"'") or "Done"
+        play = bool(re.search(r"(?i)\b(sound|beep|ping|chime)\b", text))
+        return {
+            "tool": "trigger_native_notification",
+            "args": {
+                "title": "MacAgent",
+                "subtitle": "",
+                "message": msg[:200],
+                "play_sound": play,
+            },
+        }
+
+    # Process monitor — top CPU / memory / kill process
+    if re.search(
+        r"(?i)\b("
+        r"top\s+(cpu|memory|ram|processes|apps)|"
+        r"(cpu|memory|ram)\s+(hogs?|usage|processes)|"
+        r"what('?s|\s+is)\s+using\s+(my\s+)?(cpu|memory|ram)|"
+        r"list\s+(running\s+)?processes|"
+        r"system\s+resources|"
+        r"resource\s+usage"
+        r")\b",
+        text,
+    ):
+        return {"tool": "manage_system_resources", "args": {"action": "list"}}
+
+    kill_m = re.search(
+        r"(?i)\b(kill|quit|force[\s-]?quit|terminate|close)\s+"
+        r"(the\s+)?(process\s+)?(?P<name>[\w.\- ]+?)(?:\s+process)?\s*$",
+        text,
+    )
+    if kill_m and not re.search(r"(?i)\b(kill\s+me|quit\s+asking|close\s+enough)\b", text):
+        name = kill_m.group("name").strip().rstrip(".?!")
+        name = re.sub(r"(?i)^(called|named|the)\s+", "", name).strip()
+        name = re.sub(r"(?i)\s+(browser|app|application)$", "", name).strip()
+        if name and len(name) < 64:
+            resolved = _resolve_app_name(name)
+            return {
+                "tool": "manage_system_resources",
+                "args": {"action": "kill", "target_process": resolved},
+            }
+
+    # Spotlight file search — prefer mdfind tool over bash find
+    spotlight_m = re.search(
+        r"(?i)\b("
+        r"spotlight(\s+search)?|"
+        r"mdfind|"
+        r"search\s+(my\s+)?(mac|computer|disk|system)\s+for|"
+        r"find\s+(the\s+)?file\b"
+        r")\b",
+        text,
+    )
+    if spotlight_m or (
+        re.search(r"(?i)\b(find|locate|search\s+for)\b", text)
+        and re.search(
+            r"(?i)\b(file|pdf|doc|docx|xlsx?|png|jpg|jpeg|csv|txt|folder)\b",
+            text,
+        )
+        and not re.search(r"(?i)\b(download|downloads)\b", text)
+    ):
+        q = text
+        q = re.sub(
+            r"(?i)^(please\s+)?(can\s+you\s+|could\s+you\s+)?",
+            "",
+            q,
+        ).strip()
+        q = re.sub(
+            r"(?i)\b("
+            r"spotlight(\s+search)?|"
+            r"mdfind|"
+            r"search\s+(my\s+)?(mac|computer|disk|system)\s+for|"
+            r"find\s+(the\s+)?(file|folder)|"
+            r"find|locate|search\s+for|show\s+me"
+            r")\b",
+            " ",
+            q,
+        )
+        q = re.sub(
+            r"(?i)\b(file|pdf|doc|folder|on\s+my\s+mac|please)\b",
+            " ",
+            q,
+        )
+        q = re.sub(r"\s+", " ", q).strip(" .,:;\"'")
+        if q:
+            return {"tool": "spotlight_file_search", "args": {"query": q}}
 
     # Explicit code / compute — model will write Python via generate path.
     if re.search(
@@ -985,7 +1392,7 @@ def _heuristic_tool(utterance: str) -> Optional[dict[str, Any]]:
                 "tool": "run_bash",
                 "args": {"command": _delete_latest_download_command()},
             }
-        if re.search(r"(?i)\b(open|reveal)\b", text):
+        if _is_open_action(text):
             return {
                 "tool": "run_bash",
                 "args": {
@@ -1015,7 +1422,9 @@ def _heuristic_tool(utterance: str) -> Optional[dict[str, Any]]:
         r"(?i)^\s*(open|show|reveal)\s+(the\s+)?(folder|directory|dir)\s+(.+)$",
         text,
     )
-    if folder_m:
+    if folder_m and (
+        folder_m.group(1).lower() in {"show", "reveal"} or _is_open_action(text)
+    ):
         name = folder_m.group(4).strip().rstrip(".")
         name = re.sub(r"(?i)^(named|called)\s+", "", name).strip()
         return {"tool": "run_bash", "args": {"command": _bash_open_folder(name)}}
@@ -1023,7 +1432,9 @@ def _heuristic_tool(utterance: str) -> Optional[dict[str, Any]]:
         r"(?i)^\s*(open|show|reveal)\s+(.+?)\s+(folder|directory|dir)\s*$",
         text,
     )
-    if folder_m2:
+    if folder_m2 and (
+        folder_m2.group(1).lower() in {"show", "reveal"} or _is_open_action(text)
+    ):
         name = folder_m2.group(2).strip()
         name = re.sub(r"(?i)^(the|a|my)\s+", "", name).strip()
         return {"tool": "run_bash", "args": {"command": _bash_open_folder(name)}}
@@ -1038,7 +1449,9 @@ def _heuristic_tool(utterance: str) -> Optional[dict[str, Any]]:
     ) or re.search(r"(?i)\b(run|execute)\b.+\b(bash|shell|command|terminal)\b", text):
         return {"tool": "__write_and_run_bash__", "args": {}}
 
-    if re.search(r"(?i)\b(open|launch|start)\s+(system\s+)?(settings|preferences)\b", lower):
+    if _is_open_action(text) and re.search(
+        r"(?i)\b(open|launch|start)\s+(system\s+)?(settings|preferences)\b", lower
+    ):
         pane = "general"
         for key in (
             "wifi",
@@ -1060,35 +1473,46 @@ def _heuristic_tool(utterance: str) -> Optional[dict[str, Any]]:
             pane = "wifi"
         return {"tool": "open_system_settings", "args": {"pane": pane}}
 
-    # "can you open …" / "please open …" / "open …"
-    m = re.search(
-        r"(?i)(?:^|\b)(?:can\s+you\s+|could\s+you\s+|please\s+)?(open|launch|start)\s+(.+)$",
-        text,
-    )
-    if m:
-        target = m.group(2).strip().rstrip(".?!")
-        target = re.sub(r"(?i)^(the\s+)?(folder|directory|dir)\s+", "", target).strip()
-        if re.search(r"(?i)\b(folder|directory|dir)\b", target):
-            target = re.sub(r"(?i)\b(folder|directory|dir)\b", "", target).strip()
-            return {"tool": "run_bash", "args": {"command": _bash_open_folder(target)}}
-        if target.startswith("http") or (
-            "." in target.split()[0] and not target.lower().endswith(".app")
-        ):
-            if (
-                "/" in target
-                or target.startswith("www.")
-                or re.search(r"\.[a-z]{2,}(/|$)", target.lower())
-            ):
-                return {"tool": "open_url", "args": {"url": target}}
-        if "setting" in target.lower() or "preference" in target.lower():
-            return {"tool": "open_system_settings", "args": {"pane": "general"}}
-        # Course codes like comp3370 → folder; otherwise app.
-        compact = target.replace(" ", "")
-        if re.match(r"(?i)^[a-z]{2,6}\d{3,4}[a-z]?$", compact) or (
-            "folder" in lower or "directory" in lower
-        ):
-            return {"tool": "run_bash", "args": {"command": _bash_open_folder(target)}}
-        return {"tool": "open_app", "args": {"name": target}}
+    # "can you open …" / "please open …" / "open …" — not "open-source" questions
+    if _is_open_action(text):
+        m = re.search(
+            r"(?i)(?:^|\b)(?:can\s+you\s+|could\s+you\s+|please\s+)?(open|launch|start)\s+(.+)$",
+            _scrub_open_compounds(text),
+        )
+        if m:
+            target = m.group(2).strip().rstrip(".?!")
+            target = re.sub(r"(?i)^(the\s+)?(folder|directory|dir)\s+", "", target).strip()
+            if target and not re.match(r"(?i)^source(d)?\b", target):
+                if re.search(r"(?i)\b(folder|directory|dir)\b", target):
+                    target = re.sub(r"(?i)\b(folder|directory|dir)\b", "", target).strip()
+                    return {
+                        "tool": "run_bash",
+                        "args": {"command": _bash_open_folder(target)},
+                    }
+                if target.startswith("http") or (
+                    "." in target.split()[0] and not target.lower().endswith(".app")
+                ):
+                    if (
+                        "/" in target
+                        or target.startswith("www.")
+                        or re.search(r"\.[a-z]{2,}(/|$)", target.lower())
+                    ):
+                        return {"tool": "open_url", "args": {"url": target}}
+                if "setting" in target.lower() or "preference" in target.lower():
+                    return {
+                        "tool": "open_system_settings",
+                        "args": {"pane": "general"},
+                    }
+                # Course codes like comp3370 → folder; otherwise app.
+                compact = target.replace(" ", "")
+                if re.match(r"(?i)^[a-z]{2,6}\d{3,4}[a-z]?$", compact) or (
+                    "folder" in lower or "directory" in lower
+                ):
+                    return {
+                        "tool": "run_bash",
+                        "args": {"command": _bash_open_folder(target)},
+                    }
+                return {"tool": "open_app", "args": {"name": target}}
 
     if re.search(r"(?i)\b(what('?s| is) in my (notes|context)|show (my )?notes)\b", text):
         return {"tool": "get_user_context", "args": {}}
@@ -1174,6 +1598,58 @@ def _sanitize_planned_call(
                 },
             }
 
+    # Don't invent system mutations / kills on casual chat.
+    if tool in {
+        "modify_system_setting",
+        "control_power_management",
+        "manage_system_resources",
+        "trigger_native_notification",
+    }:
+        if _CHAT_RE.match(text) or (
+            tool == "manage_system_resources"
+            and str(args.get("action") or "").lower() == "kill"
+            and not re.search(r"(?i)\b(kill|quit|force[\s-]?quit|terminate|close)\b", text)
+        ):
+            return {
+                "tool": "respond",
+                "args": {
+                    "text": (
+                        "I almost ran a system action you didn't ask for — skipped it. "
+                        "What would you like me to do?"
+                    )
+                },
+            }
+
+    # Catalog-example hijack: pmset / defaults only when the user asked for that.
+    if tool == "control_power_management" and not _POWER_UTTERANCE_RE.search(text):
+        close = _close_app_heuristic(text)
+        if close:
+            return close
+        return {
+            "tool": "respond",
+            "args": {
+                "text": (
+                    "I won't change power/sleep settings unless you ask for that. "
+                    "If you meant to close an app, say e.g. “close Chrome”."
+                )
+            },
+        }
+
+    if tool == "modify_system_setting" and not _PREF_UTTERANCE_RE.search(text):
+        close = _close_app_heuristic(text)
+        if close:
+            return close
+        if re.search(r"(?i)\b(close|quit|kill)\b", text):
+            return {
+                "tool": "respond",
+                "args": {
+                    "text": (
+                        "To close an app, ask me to quit it by name "
+                        "(e.g. “close Chrome”) — I won't change system prefs for that."
+                    )
+                },
+            }
+
     return call
 
 
@@ -1209,8 +1685,24 @@ def _history_has_successful_mutation(history: list[dict[str, Any]]) -> bool:
         call = item.get("call") or {}
         result = item.get("result") or {}
         tool = call.get("tool")
-        if tool in {"open_app", "open_url", "open_folder", "open_system_settings"}:
+        if tool in {
+            "open_app",
+            "open_url",
+            "open_folder",
+            "open_system_settings",
+            "modify_system_setting",
+            "control_power_management",
+            "trigger_native_notification",
+        }:
             if result.get("ok"):
+                return True
+        if tool == "manage_system_resources" and result.get("ok"):
+            action = str(
+                result.get("action")
+                or (call.get("args") or {}).get("action")
+                or ""
+            ).lower()
+            if action == "kill":
                 return True
         if tool == "run_bash":
             cmd = str((call.get("args") or {}).get("command") or result.get("command") or "")
@@ -1281,6 +1773,8 @@ def _goal_status(
             saw_tool = True
             if tool == "find_files":
                 continue
+            if tool == "spotlight_file_search":
+                continue
             if tool == "run_bash":
                 cmd = str((call.get("args") or {}).get("command") or "")
                 if _is_discovery_bash(cmd):
@@ -1295,7 +1789,7 @@ def _goal_status(
             return "incomplete"
         return "unknown"
 
-    if _OPEN_RE.search(text) and not _DELETE_RE.search(text):
+    if _is_open_action(text) and not _DELETE_RE.search(text):
         # "open my latest download" etc.
         if any(
             (h.get("call") or {}).get("tool")
@@ -1332,7 +1826,7 @@ def _goal_incomplete_reason(
         return "listed or found the target but did not delete it yet"
     if _EMPTY_TRASH_RE.search(utterance or ""):
         return "trash was not emptied yet"
-    if _OPEN_RE.search(utterance or ""):
+    if _is_open_action(utterance or ""):
         return "found the target but did not open it yet"
     return "action not completed yet"
 
@@ -1383,6 +1877,10 @@ def _first_path_from_history(history: list[dict[str, Any]]) -> Optional[str]:
             paths = result.get("paths") or []
             if paths:
                 return str(paths[0])
+        if tool == "spotlight_file_search":
+            paths = result.get("paths") or []
+            if paths:
+                return str(paths[0])
         if tool == "run_bash" and result.get("ok"):
             cmd = str((call.get("args") or {}).get("command") or "")
             out = str(result.get("stdout") or "")
@@ -1415,6 +1913,18 @@ def _forced_followup(
         return None
     text = utterance or ""
 
+    # Close/quit was mis-planned (e.g. pmset) — force the kill tool once.
+    close = _close_app_heuristic(text)
+    if close:
+        already_kill = any(
+            (h.get("call") or {}).get("tool") == "manage_system_resources"
+            and str(((h.get("call") or {}).get("args") or {}).get("action") or "").lower()
+            == "kill"
+            for h in history
+        )
+        if not already_kill:
+            return close
+
     import shlex
 
     if _DELETE_RE.search(text):
@@ -1436,7 +1946,7 @@ def _forced_followup(
                 "args": {"command": _delete_latest_download_command()},
             }
 
-    if _OPEN_RE.search(text) and re.search(r"(?i)download", text):
+    if _is_open_action(text) and re.search(r"(?i)download", text):
         if _history_has_command_containing(history, "open "):
             return None
         path = _first_path_from_history(history)
@@ -1605,6 +2115,20 @@ def _history_summary_for_critic(history: list[dict[str, Any]]) -> str:
     return "\n".join(lines) if lines else "(none)"
 
 
+def _scrub_open_compounds(text: str) -> str:
+    """Remove open-source / open-to phrases so bare 'open' heuristics stay quiet."""
+    return _OPEN_COMPOUND_RE.sub(" ", text or "")
+
+
+def _is_open_action(utterance: str) -> bool:
+    """True only when the user asks to open/launch/reveal something on the Mac."""
+    text = (utterance or "").strip()
+    if not text:
+        return False
+    cleaned = _scrub_open_compounds(text)
+    return bool(_OPEN_RE.search(cleaned))
+
+
 def _is_action_request(utterance: str) -> bool:
     """True when the user wants something done on the Mac, not just answered."""
     text = (utterance or "").strip()
@@ -1612,14 +2136,17 @@ def _is_action_request(utterance: str) -> bool:
         return False
     if _META_RE.search(text):
         return False
+    cleaned = _scrub_open_compounds(text)
     # Pure questions with no action verbs stay Q&A.
     if re.match(
         r"(?i)^\s*(what|why|how\s+do\s+i\s+know|who|when|where|which|whose|"
-        r"define|explain|tell\s+me\s+about)\b",
-        text,
-    ) and not _ACTION_RE.search(text):
+        r"define|explain|tell\s+me\s+about|is\s+there|are\s+there)\b",
+        cleaned,
+    ) and not _ACTION_RE.search(cleaned) and not _is_open_action(text):
         return False
-    if _ACTION_RE.search(text):
+    if _is_open_action(text):
+        return True
+    if _ACTION_RE.search(cleaned):
         return True
     return False
 
