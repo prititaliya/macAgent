@@ -57,8 +57,9 @@ final class AgentModel: ObservableObject {
     @Published var ttsSpeakAnswer = true
     @Published var ttsVolume: Double = 0.95
     @Published var ttsVoice = "af_heart"
+    @Published var ttsMuted = false
 
-    var onEvent: (() -> Void)?
+    var onNeedsAttention: (() -> Void)?
     /// Fired when the user interacts or a new answer arrives — resets auto-hide.
     var onUserActivity: (() -> Void)?
 
@@ -108,7 +109,6 @@ final class AgentModel: ObservableObject {
             TraceStep(title: "Input", body: text)
         ]
         lastError = nil
-        onEvent?()
         onUserActivity?()
         defer { busy = false }
         do {
@@ -195,6 +195,7 @@ final class AgentModel: ObservableObject {
             if let v = obj["tts_volume"] as? Double { ttsVolume = v }
             else if let v = obj["tts_volume"] as? NSNumber { ttsVolume = v.doubleValue }
             if let v = obj["tts_voice"] as? String, !v.isEmpty { ttsVoice = v }
+            if let v = obj["tts_muted"] as? Bool { ttsMuted = v }
         }
         await refreshModels()
     }
@@ -251,13 +252,15 @@ final class AgentModel: ObservableObject {
         enabled: Bool? = nil,
         speakStatus: Bool? = nil,
         speakAnswer: Bool? = nil,
-        volume: Double? = nil
+        volume: Double? = nil,
+        muted: Bool? = nil
     ) async {
         var body: [String: Any] = [:]
         if let enabled { body["tts_enabled"] = enabled }
         if let speakStatus { body["tts_speak_status"] = speakStatus }
         if let speakAnswer { body["tts_speak_answer"] = speakAnswer }
         if let volume { body["tts_volume"] = volume }
+        if let muted { body["tts_muted"] = muted }
         guard !body.isEmpty else { return }
         if let obj = await putJSON("v1/settings", body: body) {
             if let v = obj["tts_enabled"] as? Bool { ttsEnabled = v }
@@ -265,7 +268,12 @@ final class AgentModel: ObservableObject {
             if let v = obj["tts_speak_answer"] as? Bool { ttsSpeakAnswer = v }
             if let v = obj["tts_volume"] as? Double { ttsVolume = v }
             else if let v = obj["tts_volume"] as? NSNumber { ttsVolume = v.doubleValue }
+            if let v = obj["tts_muted"] as? Bool { ttsMuted = v }
         }
+    }
+
+    func toggleMute() async {
+        await saveTTSSettings(muted: !ttsMuted)
     }
 
     func setDictating(_ active: Bool) async {
@@ -339,7 +347,6 @@ final class AgentModel: ObservableObject {
             appendTrace(from: obj, fallbackTitle: text)
             busy = true
             if !text.isEmpty { statusLine = text }
-            onEvent?()
             onUserActivity?()
             return
         }
@@ -371,7 +378,7 @@ final class AgentModel: ObservableObject {
             statusLine = "Waiting for your approval…"
             busy = false
             appendTraceLine(title: "Needs permission", body: summary)
-            onEvent?()
+            onNeedsAttention?()
             onUserActivity?()
             return
         }
@@ -385,7 +392,6 @@ final class AgentModel: ObservableObject {
                 }
             }
             busy = true
-            onEvent?()
             onUserActivity?()
             return
         }
@@ -423,7 +429,6 @@ final class AgentModel: ObservableObject {
             }
         }
 
-        onEvent?()
         Task { await refreshPrefs() }
     }
 

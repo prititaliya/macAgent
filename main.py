@@ -131,7 +131,7 @@ def _models_payload() -> dict[str, Any]:
 
 
 settings = _load_settings()
-app = FastAPI(title="MacAgent", version="0.4.0")
+app = FastAPI(title="MacAgent", version="1.0.0")
 
 _parser: Optional[LocalIntentParser] = None
 _router: Optional[CoreRouter] = None
@@ -222,6 +222,7 @@ class SettingsBody(BaseModel):
     tts_volume: Optional[float] = None
     tts_speak_status: Optional[bool] = None
     tts_speak_answer: Optional[bool] = None
+    tts_muted: Optional[bool] = None
 
 
 class DictationBody(BaseModel):
@@ -241,6 +242,7 @@ def _settings_payload() -> dict[str, Any]:
         "tts_volume": cfg["volume"],
         "tts_speak_status": cfg["speak_status"],
         "tts_speak_answer": cfg["speak_answer"],
+        "tts_muted": cfg["muted"],
     }
 
 
@@ -265,6 +267,10 @@ async def put_settings(body: SettingsBody) -> dict[str, Any]:
         data["tts_lang"] = str(data["tts_lang"]).strip()[:8]
     settings.update(data)
     _save_settings(settings)
+    if data.get("tts_muted") is True:
+        from tools.tts_kokoro import interrupt
+
+        interrupt()
     return _settings_payload()
 
 

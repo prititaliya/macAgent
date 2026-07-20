@@ -279,6 +279,15 @@ struct OverlayView: View {
             Text("⌃⌥Space")
                 .font(.caption2.monospaced())
                 .foregroundStyle(.tertiary)
+            Button {
+                onInteract()
+                Task { await model.toggleMute() }
+            } label: {
+                Image(systemName: model.ttsMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                    .foregroundStyle(model.ttsMuted ? Color.orange : Color.secondary)
+            }
+            .buttonStyle(.plain)
+            .help(model.ttsMuted ? "Unmute voice (tap to hear answers again)" : "Mute voice")
             Button(action: onPrefs) {
                 Image(systemName: "gearshape")
             }

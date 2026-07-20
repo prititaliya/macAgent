@@ -19,7 +19,8 @@ final class OverlayController {
 
     init(model: AgentModel) {
         self.model = model
-        model.onEvent = { [weak self] in
+        // Only pop the overlay for explicit user action or approval — not every SSE trace.
+        model.onNeedsAttention = { [weak self] in
             self?.show()
         }
         model.onUserActivity = { [weak self] in
@@ -40,7 +41,9 @@ final class OverlayController {
             setupPanel()
         }
         guard let panel else { return }
-        position(panel)
+        // Always anchor to the top-right of the current screen.
+        let screen = panel.screen ?? NSScreen.main
+        OverlayFrame.apply(to: panel, preferredScreen: screen)
         NSApp.setActivationPolicy(.accessory)
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
@@ -57,6 +60,15 @@ final class OverlayController {
         stopIdleTimer()
         clearCountdownUI()
         panel?.orderOut(nil)
+    }
+
+    /// Reset overlay size and top-right placement.
+    func resetPosition() {
+        guard let panel else { return }
+        OverlayFrame.resetToDefault()
+        panel.setContentSize(OverlayFrame.defaultSize)
+        let screen = panel.screen ?? NSScreen.main ?? NSScreen.screens.first
+        OverlayFrame.apply(to: panel, preferredScreen: screen)
     }
 
     /// Full reset after real activity (type, send, answer, prefs change).
@@ -151,14 +163,9 @@ final class OverlayController {
     }
 
     private func setupPanel() {
-        let saved = UserDefaults.standard.string(forKey: "overlayFrame")
-        var rect = NSRect(x: 0, y: 0, width: 560, height: 480)
-        if let saved {
-            let r = NSRectFromString(saved)
-            if r.width > 100, r.height > 100 {
-                rect = r
-            }
-        }
+        let screen = NSScreen.main ?? NSScreen.screens[0]
+        let size = OverlayFrame.loadSavedSize() ?? OverlayFrame.defaultSize
+        let rect = OverlayFrame.defaultFrame(on: screen, size: size)
 
         let panel = KeyablePanel(
             contentRect: rect,
@@ -173,7 +180,7 @@ final class OverlayController {
         panel.backgroundColor = .clear
         panel.hasShadow = true
         panel.hidesOnDeactivate = false
-        panel.isMovableByWindowBackground = true
+        panel.isMovableByWindowBackground = false
         panel.becomesKeyOnlyIfNeeded = false
         panel.acceptsMouseMovedEvents = true
         panel.minSize = NSSize(width: 420, height: 300)
@@ -205,7 +212,7 @@ final class OverlayController {
             queue: .main
         ) { [weak panel] _ in
             guard let panel else { return }
-            UserDefaults.standard.set(NSStringFromRect(panel.frame), forKey: "overlayFrame")
+            OverlayFrame.apply(to: panel, preferredScreen: panel.screen)
         }
 
         // Clicking away (lose key) → resume idle countdown immediately.
@@ -227,28 +234,5 @@ final class OverlayController {
                 self?.tickIdle()
             }
         }
-    }
-
-    private func position(_ panel: NSPanel) {
-        if let saved = UserDefaults.standard.string(forKey: "overlayFrame") {
-            var frame = NSRectFromString(saved)
-            if frame.width >= 100, frame.height >= 100,
-               let screen = NSScreen.main {
-                let vis = screen.visibleFrame
-                frame.size.width = min(max(frame.width, 420), vis.width)
-                frame.size.height = min(max(frame.height, 300), vis.height)
-                frame.origin.x = min(max(frame.origin.x, vis.minX), vis.maxX - frame.width)
-                frame.origin.y = min(max(frame.origin.y, vis.minY), vis.maxY - frame.height)
-                panel.setFrame(frame, display: false)
-                UserDefaults.standard.set(NSStringFromRect(frame), forKey: "overlayFrame")
-            }
-            return
-        }
-        guard let screen = NSScreen.main else { return }
-        let frame = screen.visibleFrame
-        let size = panel.frame.size
-        let x = frame.midX - size.width / 2
-        let y = frame.midY - size.height / 2 + 40
-        panel.setFrameOrigin(NSPoint(x: x, y: y))
     }
 }

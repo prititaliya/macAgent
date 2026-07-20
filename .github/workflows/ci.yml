@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: brew install xcodegen
+
+      - name: Sync version
+        run: ./automation/sync_version.sh
+
+      - name: Build Release app
+        run: |
+          cd MacAgentApp
+          xcodegen generate >/dev/null
+          xcodebuild \
+            -project MacAgent.xcodeproj \
+            -scheme MacAgent \
+            -configuration Release \
+            -derivedDataPath DerivedDataRelease \
+            -quiet \
+            build
+
+      - name: Build DMG
+        run: ./automation/make_dmg.sh
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MacAgent-dmg
+          path: dist/*.dmg
+          if-no-files-found: error

@@ -16,8 +16,8 @@ final class DaemonManager {
         let candidates = [
             FileManager.default.currentDirectoryPath,
             (Bundle.main.bundleURL.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().path),
+            NSString("~/MacAgent").expandingTildeInPath,
             NSString("~/Projects/MacAgent").expandingTildeInPath,
-            "/Users/jatin/Projects/MacAgent",
         ]
         for c in candidates {
             if FileManager.default.fileExists(atPath: c + "/main.py") {

@@ -7,8 +7,11 @@ APP_DIR="$ROOT/MacAgentApp"
 DIST="$ROOT/dist"
 DERIVED="$APP_DIR/DerivedDataRelease"
 VOL="MacAgent"
-DMG_NAME="MacAgent-0.5.0.dmg"
 STAGE="$DIST/dmg-stage"
+
+"$ROOT/automation/sync_version.sh"
+VERSION="$(tr -d '[:space:]' < "$ROOT/VERSION")"
+DMG_NAME="MacAgent-${VERSION}.dmg"
 
 cd "$APP_DIR"
 if command -v xcodegen >/dev/null 2>&1; then
@@ -17,7 +20,7 @@ if command -v xcodegen >/dev/null 2>&1; then
   cp -f WorkspaceSettings.xcsettings MacAgent.xcodeproj/project.xcworkspace/xcshareddata/ 2>/dev/null || true
 fi
 
-echo "Building Release…"
+echo "Building Release ${VERSION}…"
 xcodebuild \
   -project MacAgent.xcodeproj \
   -scheme MacAgent \
@@ -38,18 +41,19 @@ mkdir -p "$STAGE" "$DIST"
 cp -R "$APP" "$STAGE/MacAgent.app"
 ln -s /Applications "$STAGE/Applications"
 
-# Brief install note
-cat > "$STAGE/README.txt" <<'EOF'
-MacAgent
-========
+cat > "$STAGE/README.txt" <<EOF
+MacAgent ${VERSION}
+===================
 
 1. Drag MacAgent.app into Applications.
-2. Open MacAgent (menu bar icon).
-3. Grant Accessibility when prompted (needed for ⌃⌥Space).
-4. Point FreeFlow LLM base URL at: http://127.0.0.1:8081/v1
-5. Keep the Python project + venv at the same machine path the app
-   was built against, or set MacAgentRoot / run from the repo so the
-   daemon can start (venv/bin/python main.py).
+2. Clone the backend (one-time):
+     git clone https://github.com/prititaliya/macAgent.git ~/MacAgent
+     cd ~/MacAgent && ./automation/setup_backend.sh
+3. Open MacAgent from Applications (menu bar sparkles icon).
+4. Grant Accessibility when prompted (needed for Control-Option-Space).
+5. Press Control-Option-Space to summon the overlay.
+
+Full setup guide: https://github.com/prititaliya/macAgent#setup
 
 Hotkey: Control-Option-Space
 EOF

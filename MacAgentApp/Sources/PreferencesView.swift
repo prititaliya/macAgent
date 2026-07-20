@@ -157,9 +157,16 @@ struct SettingsPrefsView: View {
 
             GroupBox("Overlay") {
                 VStack(alignment: .leading, spacing: 8) {
+                    Text("The panel always opens in the top-right corner.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button("Reset size to default") {
+                        AppDelegate.shared?.resetOverlayPosition()
+                    }
                     Text("Auto-hide floating panel after")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        .padding(.top, 4)
                     Picker("Auto-hide", selection: $autoHideSeconds) {
                         ForEach(OverlayAutoHide.choices, id: \.seconds) { choice in
                             Text(choice.label).tag(choice.seconds)
@@ -206,6 +213,9 @@ struct SettingsPrefsView: View {
                             .frame(width: 44, alignment: .trailing)
                     }
                     Text("Voice: \(model.ttsVoice.isEmpty ? "af_heart" : model.ttsVoice) · first use downloads ~327 MB weights")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                    Text("Quick mute: speaker icon in the overlay header (stays muted until you tap again).")
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                 }

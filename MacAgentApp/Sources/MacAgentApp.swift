@@ -98,6 +98,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         overlay?.show()
     }
 
+    func resetOverlayPosition() {
+        overlay?.resetPosition()
+    }
+
     func openPrefs() {
         PreferencesController.shared.show()
     }
