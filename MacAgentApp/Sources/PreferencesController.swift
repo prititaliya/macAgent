@@ -18,11 +18,12 @@ final class PreferencesController {
         if window == nil {
             let root = PreferencesView()
                 .environmentObject(AgentModel.shared)
-                .frame(minWidth: 780, minHeight: 520)
+                .tint(Theme.accent)
+                .frame(minWidth: 880, minHeight: 560)
 
             let hosting = NSHostingController(rootView: root)
             let win = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 820, height: 560),
+                contentRect: NSRect(x: 0, y: 0, width: 920, height: 600),
                 styleMask: [.titled, .closable, .miniaturizable, .resizable],
                 backing: .buffered,
                 defer: false

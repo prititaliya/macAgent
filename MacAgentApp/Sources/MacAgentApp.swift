@@ -26,7 +26,8 @@ struct MacAgentMain: App {
         Settings {
             PreferencesView()
                 .environmentObject(AgentModel.shared)
-                .frame(minWidth: 780, minHeight: 520)
+                .tint(Theme.accent)
+                .frame(minWidth: 880, minHeight: 560)
         }
     }
 }

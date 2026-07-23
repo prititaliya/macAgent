@@ -8,6 +8,7 @@ struct OverlayView: View {
     var onQuit: () -> Void = { AppDelegate.shared?.quitApp() }
     var onInteract: () -> Void = {}
     @AppStorage(OverlayAutoHide.defaultsKey) private var autoHideSeconds: Int = 15
+    @AppStorage("macagent.searchMode") private var searchMode: String = "auto"
     @State private var draft = ""
     @State private var logsExpanded = false
     @FocusState private var focused: Bool
@@ -35,6 +36,7 @@ struct OverlayView: View {
         VStack(alignment: .leading, spacing: 12) {
             header
             inputBar
+            optionChips
 
             if model.busy {
                 HStack(spacing: 8) {
@@ -47,7 +49,7 @@ struct OverlayView: View {
                 HStack(spacing: 8) {
                     TimelineView(.animation(minimumInterval: 0.45, paused: false)) { context in
                         Circle()
-                            .fill(Color.red)
+                            .fill(Theme.danger)
                             .frame(width: 7, height: 7)
                             .opacity(
                                 Int(context.date.timeIntervalSinceReferenceDate * 2) % 2 == 0
@@ -61,7 +63,7 @@ struct OverlayView: View {
             } else if !speech.statusMessage.isEmpty {
                 Text(speech.statusMessage)
                     .font(.caption)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(Theme.caution)
             }
 
             ScrollView {
@@ -74,137 +76,19 @@ struct OverlayView: View {
                     }
 
                     if let pending = model.pendingConfirm {
-                        VStack(alignment: .leading, spacing: 10) {
-                            Label("Permission needed", systemImage: "hand.raised.fill")
-                                .font(.system(size: 12, weight: .semibold))
-                                .foregroundStyle(.orange)
-                            Text(pending.summary)
-                                .font(.system(size: 15, weight: .semibold))
-                                .foregroundStyle(.primary)
-                                .textSelection(.enabled)
-                            if !pending.command.isEmpty {
-                                Text(pending.command)
-                                    .font(.system(size: 11, design: .monospaced))
-                                    .foregroundStyle(.secondary)
-                                    .textSelection(.enabled)
-                            }
-                            HStack(spacing: 10) {
-                                Button("Deny") {
-                                    onInteract()
-                                    Task { await model.respondToConfirm(approve: false) }
-                                }
-                                .buttonStyle(.bordered)
-                                Button("Approve") {
-                                    onInteract()
-                                    Task { await model.respondToConfirm(approve: true) }
-                                }
-                                .buttonStyle(.borderedProminent)
-                                .tint(.orange)
-                            }
-                        }
-                        .padding(14)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(
-                            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                .fill(Color.orange.opacity(0.14))
-                        )
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                .strokeBorder(Color.orange.opacity(0.5), lineWidth: 1.5)
-                        )
+                        permissionCard(pending)
                     }
 
-                    // Final answer — visually distinct
                     if hasAnswer {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Label("Answer", systemImage: "checkmark.seal.fill")
-                                .font(.system(size: 12, weight: .semibold))
-                                .foregroundStyle(Color.accentColor)
-                            Text(model.answer)
-                                .font(.system(size: 16, weight: .semibold))
-                                .foregroundStyle(.primary)
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                        .padding(14)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(
-                            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                .fill(Color.accentColor.opacity(0.14))
-                        )
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                .strokeBorder(Color.accentColor.opacity(0.45), lineWidth: 1.5)
-                        )
+                        answerCard
                     }
 
                     if !model.sources.isEmpty {
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("Sources")
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(.secondary)
-                            ForEach(model.sources) { src in
-                                Button {
-                                    onInteract()
-                                    model.openURL(src.url)
-                                } label: {
-                                    Text(src.title.isEmpty ? src.url : src.title)
-                                        .font(.caption)
-                                        .foregroundStyle(.blue)
-                                        .lineLimit(2)
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
+                        sourcesSection
                     }
 
-                    // Collapsible activity logs
                     if !logSteps.isEmpty || model.busy {
-                        DisclosureGroup(isExpanded: $logsExpanded) {
-                            VStack(alignment: .leading, spacing: 8) {
-                                ForEach(logSteps) { step in
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        Text(step.title)
-                                            .font(.caption2.weight(.semibold))
-                                            .foregroundStyle(.tertiary)
-                                        Text(step.body)
-                                            .font(.system(size: 11, design: .monospaced))
-                                            .foregroundStyle(.secondary)
-                                            .textSelection(.enabled)
-                                            .frame(maxWidth: .infinity, alignment: .leading)
-                                    }
-                                    .padding(8)
-                                    .background(.white.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
-                                }
-                            }
-                            .padding(.top, 6)
-                        } label: {
-                            HStack {
-                                Image(systemName: "chevron.right.circle")
-                                    .rotationEffect(.degrees(logsExpanded ? 90 : 0))
-                                Text(logsExpanded ? "Hide activity logs" : "Show activity logs")
-                                    .font(.caption.weight(.medium))
-                                Text("(\(logSteps.count))")
-                                    .font(.caption2)
-                                    .foregroundStyle(.tertiary)
-                                Spacer()
-                            }
-                            .foregroundStyle(.secondary)
-                            .contentShape(Rectangle())
-                        }
-                        .onChange(of: hasAnswer) { answered in
-                            if answered {
-                                withAnimation(.easeInOut(duration: 0.2)) {
-                                    logsExpanded = false
-                                }
-                            }
-                        }
-                        .onChange(of: model.busy) { busy in
-                            // While working, keep logs open so progress is visible.
-                            if busy {
-                                logsExpanded = true
-                            }
-                        }
+                        activityLogs
                     }
                 }
             }
@@ -218,25 +102,16 @@ struct OverlayView: View {
         .frame(minWidth: 420, minHeight: 280)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background {
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(.ultraThinMaterial)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .strokeBorder(borderColor, lineWidth: model.hideUrgency ? 2.5 : 1)
-                )
-                .shadow(
-                    color: model.hideUrgency
-                        ? Color.orange.opacity(model.hidePulse ? 0.55 : 0.18)
-                        : Color.black.opacity(0.35),
-                    radius: model.hideUrgency ? (model.hidePulse ? 26 : 14) : 24,
-                    y: 12
-                )
+            OverlaySurface(urgent: model.hideUrgency, urgentPulse: model.hidePulse)
         }
-        // Slight scale only while urgent + pulse beat — no forever animation.
         .scaleEffect(model.hideUrgency && model.hidePulse ? 1.015 : 1.0)
         .animation(.easeInOut(duration: 0.2), value: model.hidePulse)
+        .tint(Theme.accent)
         .onAppear {
-            Task { await model.refreshHealth() }
+            Task {
+                await model.refreshHealth()
+                await model.refreshModels()
+            }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
                 focused = true
             }
@@ -258,71 +133,211 @@ struct OverlayView: View {
         }
     }
 
-    private var borderColor: Color {
-        if model.hideUrgency {
-            return Color.orange.opacity(model.hidePulse ? 0.95 : 0.4)
+    // MARK: - Cards
+
+    private func permissionCard(_ pending: PendingConfirm) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("Permission needed", systemImage: "hand.raised.fill")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(Theme.cautionDeep)
+            Text(pending.summary)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(.primary)
+                .textSelection(.enabled)
+            if !pending.command.isEmpty {
+                Text(pending.command)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+            HStack(spacing: 10) {
+                Button("Deny") {
+                    onInteract()
+                    Task { await model.respondToConfirm(approve: false) }
+                }
+                .buttonStyle(GhostButtonStyle())
+                Button("Approve") {
+                    onInteract()
+                    Task { await model.respondToConfirm(approve: true) }
+                }
+                .buttonStyle(AccentButtonStyle(tint: Theme.cautionDeep))
+            }
         }
-        return Color.white.opacity(0.12)
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: Theme.radiusCard, style: .continuous)
+                .fill(Theme.caution.opacity(0.10))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: Theme.radiusCard, style: .continuous)
+                .strokeBorder(Theme.caution.opacity(0.45), lineWidth: 1.25)
+        )
     }
 
-    private var header: some View {
-        HStack(spacing: 8) {
-            logoImage
-                .resizable()
-                .aspectRatio(contentMode: .fit)
-                .frame(width: 28, height: 28)
-                .clipShape(Circle())
-            Text("MacAgent")
-                .font(.system(size: 13, weight: .semibold, design: .rounded))
+    private var answerCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Label("Answer", systemImage: "checkmark.seal.fill")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Theme.accentDeep)
+                Text("by \(model.modelDisplayName)")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+            }
+            Text(model.answer)
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(.primary)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: Theme.radiusCard, style: .continuous)
+                .fill(Theme.accent.opacity(0.10))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: Theme.radiusCard, style: .continuous)
+                .strokeBorder(Theme.accent.opacity(0.35), lineWidth: 1.25)
+        )
+    }
+
+    private var sourcesSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Sources")
+                .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
+            ForEach(model.sources) { src in
+                Button {
+                    onInteract()
+                    model.openURL(src.url)
+                } label: {
+                    Text(src.title.isEmpty ? src.url : src.title)
+                        .font(.caption)
+                        .foregroundStyle(Theme.accentDeep)
+                        .lineLimit(2)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
+    private var activityLogs: some View {
+        DisclosureGroup(isExpanded: $logsExpanded) {
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(logSteps) { step in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(step.title)
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.tertiary)
+                        Text(step.body)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .padding(8)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(Color.primary.opacity(0.04))
+                    )
+                }
+            }
+            .padding(.top, 6)
+        } label: {
+            HStack {
+                Image(systemName: "chevron.right.circle")
+                    .rotationEffect(.degrees(logsExpanded ? 90 : 0))
+                Text(logsExpanded ? "Hide activity logs" : "Show activity logs")
+                    .font(.caption.weight(.medium))
+                Text("(\(logSteps.count))")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                Spacer()
+            }
+            .foregroundStyle(.secondary)
+            .contentShape(Rectangle())
+        }
+        .onChange(of: hasAnswer) { answered in
+            if answered {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    logsExpanded = false
+                }
+            }
+        }
+        .onChange(of: model.busy) { busy in
+            if busy {
+                logsExpanded = true
+            }
+        }
+    }
+
+    // MARK: - Header / input
+
+    private var header: some View {
+        HStack(spacing: 10) {
+            BrandMark(size: 30)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("MacAgent")
+                    .font(.brand(14, .semibold))
+                    .foregroundStyle(.primary.opacity(0.9))
+                Text("⌃⌥Space")
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.tertiary)
+            }
             Spacer()
-            Text("⌃⌥Space")
-                .font(.caption2.monospaced())
-                .foregroundStyle(.tertiary)
             Button {
                 onInteract()
                 Task { await model.toggleMute() }
             } label: {
                 Image(systemName: model.ttsMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
-                    .foregroundStyle(model.ttsMuted ? Color.orange : Color.secondary)
             }
-            .buttonStyle(.plain)
+            .buttonStyle(IconControlButtonStyle(
+                active: model.ttsMuted,
+                activeColor: Theme.caution
+            ))
             .help(model.ttsMuted ? "Unmute voice (tap to hear answers again)" : "Mute voice")
+
             Button(action: onPrefs) {
                 Image(systemName: "gearshape")
             }
-            .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
+            .buttonStyle(IconControlButtonStyle())
             .help("Preferences")
+
             Button(action: onDismiss) {
                 Image(systemName: "xmark")
             }
-            .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
+            .buttonStyle(IconControlButtonStyle())
             .help("Hide overlay")
             .keyboardShortcut(.escape, modifiers: [])
+
             Button(action: onQuit) {
                 Image(systemName: "power")
             }
-            .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
+            .buttonStyle(IconControlButtonStyle())
             .help("Quit MacAgent")
         }
     }
 
     private var inputBar: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 10) {
             Button {
                 onInteract()
                 Task { await toggleMic() }
             } label: {
                 Image(systemName: speech.isListening ? "mic.fill" : "mic")
-                    .font(.system(size: 16, weight: .semibold))
-                    .foregroundStyle(speech.isListening ? Color.red : Color.secondary)
-                    .frame(width: 28, height: 28)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(speech.isListening ? Theme.danger : Color.secondary)
+                    .frame(width: 32, height: 32)
                     .background(
                         Circle()
-                            .fill(speech.isListening ? Color.red.opacity(0.18) : Color.white.opacity(0.06))
+                            .fill(
+                                speech.isListening
+                                    ? Theme.danger.opacity(0.16)
+                                    : Color.primary.opacity(0.06)
+                            )
                     )
             }
             .buttonStyle(.plain)
@@ -334,17 +349,17 @@ struct OverlayView: View {
                 speech.isListening ? "Listening… tap mic to send" : "Ask or tell MacAgent…",
                 text: $draft
             )
-                .textFieldStyle(.plain)
-                .font(.system(size: 18, weight: .medium))
-                .focused($focused)
-                .onSubmit { send() }
-                .onChange(of: draft) { _ in onInteract() }
-                .onChange(of: speech.partialText) { partial in
-                    if speech.isListening, !partial.isEmpty {
-                        draft = partial
-                        onInteract()
-                    }
+            .textFieldStyle(.plain)
+            .font(.system(size: 17, weight: .medium))
+            .focused($focused)
+            .onSubmit { send() }
+            .onChange(of: draft) { _ in onInteract() }
+            .onChange(of: speech.partialText) { partial in
+                if speech.isListening, !partial.isEmpty {
+                    draft = partial
+                    onInteract()
                 }
+            }
 
             Button(speech.isListening ? "Stop" : "Send") {
                 if speech.isListening {
@@ -353,19 +368,26 @@ struct OverlayView: View {
                     send()
                 }
             }
-                .buttonStyle(.borderedProminent)
-                .tint(speech.isListening ? .red : nil)
-                .disabled(
-                    speech.isListening
-                        ? false
-                        : (draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.busy)
-                )
+            .buttonStyle(
+                AccentButtonStyle(tint: speech.isListening ? Theme.danger : Theme.accent)
+            )
+            .disabled(
+                speech.isListening
+                    ? false
+                    : (draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.busy)
+            )
         }
         .padding(12)
-        .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+        .background(
+            RoundedRectangle(cornerRadius: Theme.radiusControl, style: .continuous)
+                .fill(Color.primary.opacity(0.06))
+        )
         .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .strokeBorder(speech.isListening ? Color.red.opacity(0.45) : Color.clear, lineWidth: 1.5)
+            RoundedRectangle(cornerRadius: Theme.radiusControl, style: .continuous)
+                .strokeBorder(
+                    speech.isListening ? Theme.danger.opacity(0.45) : Color.white.opacity(0.08),
+                    lineWidth: speech.isListening ? 1.5 : 1
+                )
         )
         .contentShape(Rectangle())
         .onTapGesture {
@@ -374,38 +396,132 @@ struct OverlayView: View {
         }
     }
 
+    private var optionChips: some View {
+        HStack(spacing: 8) {
+            Menu {
+                if model.modelPaths.isEmpty {
+                    Text("No models in ~/Models")
+                } else {
+                    ForEach(model.usableModelPaths, id: \.self) { path in
+                        Button {
+                            onInteract()
+                            Task { await model.selectModel(path: path) }
+                        } label: {
+                            HStack {
+                                Text(model.menuLabelForModelPath(path))
+                                if path == model.modelPath {
+                                    Image(systemName: "checkmark")
+                                }
+                            }
+                        }
+                        .disabled(model.modelSwitching || path == model.modelPath)
+                    }
+                    let heavy = model.heavyModelPaths
+                    if !heavy.isEmpty {
+                        Divider()
+                        Text("Too large for this Mac")
+                        ForEach(heavy, id: \.self) { path in
+                            Text(model.labelForModelPath(path))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            } label: {
+                OverlayChip(
+                    systemImage: "cpu",
+                    title: "Model",
+                    value: model.modelSwitching ? "Loading…" : model.modelDisplayName,
+                    active: model.modelSwitching
+                )
+            }
+            .disabled(model.modelSwitching || !model.daemonOnline)
+            .help("Switch local GGUF model")
+
+            Menu {
+                Button {
+                    onInteract()
+                    searchMode = "auto"
+                } label: {
+                    searchMenuRow("Auto", selected: searchMode == "auto")
+                }
+                Button {
+                    onInteract()
+                    searchMode = "on"
+                } label: {
+                    searchMenuRow("On", selected: searchMode == "on")
+                }
+                Button {
+                    onInteract()
+                    searchMode = "off"
+                } label: {
+                    searchMenuRow("Off", selected: searchMode == "off")
+                }
+            } label: {
+                OverlayChip(
+                    systemImage: "magnifyingglass",
+                    title: "Search",
+                    value: searchModeLabel,
+                    active: searchMode != "auto"
+                )
+            }
+            .help("Web search: Auto (when needed), On, or Off")
+
+            Spacer(minLength: 0)
+        }
+    }
+
+    private var searchModeLabel: String {
+        switch searchMode.lowercased() {
+        case "on": return "On"
+        case "off": return "Off"
+        default: return "Auto"
+        }
+    }
+
+    private func searchMenuRow(_ title: String, selected: Bool) -> some View {
+        HStack {
+            Text(title)
+            if selected {
+                Image(systemName: "checkmark")
+            }
+        }
+    }
+
     private var footer: some View {
         HStack(spacing: 8) {
             Circle()
-                .fill(model.daemonOnline ? Color.green : (model.lastError != nil ? Color.red : Color.orange))
+                .fill(
+                    model.daemonOnline
+                        ? Theme.positive
+                        : (model.lastError != nil ? Theme.danger : Theme.caution)
+                )
                 .frame(width: 7, height: 7)
             Text(
                 model.daemonOnline
                     ? "Daemon ready"
                     : (model.lastError != nil ? "Daemon failed — see Logs/MacAgent" : "Starting daemon…")
             )
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
+            .font(.caption2)
+            .foregroundStyle(.tertiary)
             Spacer()
             if autoHideSeconds > 0, let left = model.hideCountdown {
                 HStack(spacing: 6) {
                     if model.hideUrgency {
                         Image(systemName: "exclamationmark.triangle.fill")
                             .font(.caption2)
-                            .foregroundStyle(.orange)
+                            .foregroundStyle(Theme.caution)
                             .opacity(model.hidePulse ? 1 : 0.35)
                     }
                     Text(countdownLabel)
-                        .font(.system(size: 11, weight: model.hideUrgency ? .bold : .medium, design: .rounded))
+                        .font(.metric(11, model.hideUrgency ? .bold : .medium))
                         .monospacedDigit()
-                        .foregroundStyle(model.hideUrgency ? Color.orange : Color.secondary)
-                    // Tiny progress bar for remaining idle time.
+                        .foregroundStyle(model.hideUrgency ? Theme.caution : Color.secondary)
                     Capsule()
-                        .fill(Color.white.opacity(0.12))
+                        .fill(Color.primary.opacity(0.10))
                         .frame(width: 44, height: 4)
                         .overlay(alignment: .leading) {
                             Capsule()
-                                .fill(model.hideUrgency ? Color.orange : Color.accentColor.opacity(0.8))
+                                .fill(model.hideUrgency ? Theme.caution : Theme.accent.opacity(0.85))
                                 .frame(
                                     width: max(4, 44 * CGFloat(left) / CGFloat(max(autoHideSeconds, 1))),
                                     height: 4
@@ -416,28 +532,18 @@ struct OverlayView: View {
                 .padding(.vertical, 4)
                 .background(
                     Capsule()
-                        .fill(model.hideUrgency ? Color.orange.opacity(0.18) : Color.white.opacity(0.06))
+                        .fill(
+                            model.hideUrgency
+                                ? Theme.caution.opacity(0.16)
+                                : Color.primary.opacity(0.05)
+                        )
                 )
             } else if autoHideSeconds == 0 {
                 Text("Auto-hide off")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
-            Text(speech.isListening ? "Mic listening" : "Voice: Mic or FreeFlow → :8081")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
         }
-    }
-
-    private var logoImage: Image {
-        if let ns = NSImage(named: "Logo") {
-            return Image(nsImage: ns)
-        }
-        if let url = Bundle.main.url(forResource: "MacAgentLogo", withExtension: "png"),
-           let ns = NSImage(contentsOf: url) {
-            return Image(nsImage: ns)
-        }
-        return Image(systemName: "sparkles")
     }
 
     private func send() {
@@ -446,7 +552,7 @@ struct OverlayView: View {
         draft = ""
         logsExpanded = true
         onInteract()
-        Task { await model.ask(q) }
+        Task { await model.ask(q, useWeb: searchMode) }
     }
 
     private func toggleMic() async {

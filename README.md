@@ -43,7 +43,7 @@ This script will:
 
 - Install Homebrew deps (`espeak-ng`, `portaudio`, `libsndfile`) for voice
 - Create a Python virtualenv and install packages (with Metal-accelerated `llama-cpp-python`)
-- Download the default **Qwen2.5-3B** GGUF model (~2 GB) to `~/Models/`
+- Download the default **Qwen3-4B** GGUF model (~2.3 GB) to `~/Models/`
 - Update `config/settings.json` with your model path
 
 **Manual setup** (if you prefer):
@@ -58,7 +58,9 @@ CMAKE_ARGS="-DGGML_METAL=on -DCMAKE_OSX_ARCHITECTURES=arm64" ARCHFLAGS="-arch ar
 
 Download a GGUF model and set `model_path` in `config/settings.json`. Default recommendation:
 
-`~/Models/qwen2.5-3b-instruct-q4_k_m.gguf` — [Qwen2.5-3B-Instruct Q4_K_M](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF)
+`~/Models/Qwen3-4B-Q4_K_M.gguf` — [Qwen3-4B Q4_K_M](https://huggingface.co/Qwen/Qwen3-4B-GGUF)
+
+On 8GB Macs, prefer Qwen3-4B/8B. Qwen3-30B-A3B GGUFs need ~10GB+ free disk and typically 16GB+ unified memory.
 
 ### 3. Grant permissions
 

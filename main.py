@@ -4,7 +4,7 @@ import logging
 import re
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
@@ -69,7 +69,7 @@ def _model_dir() -> Path:
     raw = settings.get("model_dir") or ""
     if not raw:
         # Default: parent of configured model_path, else ~/Models
-        mp = settings.get("model_path") or "~/Models/qwen2.5-3b-instruct-q4_k_m.gguf"
+        mp = settings.get("model_path") or "~/Models/Qwen3-4B-Q4_K_M.gguf"
         parent = Path(mp).expanduser().parent
         if parent.is_dir():
             return parent
@@ -99,7 +99,7 @@ def _list_gguf_models(directory: Path) -> list[dict[str, Any]]:
 
 def _models_payload() -> dict[str, Any]:
     model_path = Path(
-        settings.get("model_path", "~/Models/qwen2.5-3b-instruct-q4_k_m.gguf")
+        settings.get("model_path", "~/Models/Qwen3-4B-Q4_K_M.gguf")
     ).expanduser()
     directory = _model_dir()
     models = _list_gguf_models(directory)
@@ -195,7 +195,7 @@ class ModelSelectBody(BaseModel):
 @app.get("/health")
 async def health() -> dict[str, Any]:
     model_path = Path(
-        settings.get("model_path", "~/Models/qwen2.5-3b-instruct-q4_k_m.gguf")
+        settings.get("model_path", "~/Models/Qwen3-4B-Q4_K_M.gguf")
     ).expanduser()
     return {
         "status": "ok",
@@ -290,6 +290,15 @@ async def select_model(body: ModelSelectBody) -> dict[str, Any]:
         raise HTTPException(
             status_code=400,
             detail=f"GGUF not found: {path}",
+        )
+    gb = path.stat().st_size / (1024**3)
+    if gb >= 5.5:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{path.name} is {gb:.1f} GB — too large for reliable local use on this Mac. "
+                "Use Qwen3-4B-Q4_K_M (or another ≤~4GB Instruct GGUF)."
+            ),
         )
 
     settings = _load_settings()
@@ -445,6 +454,7 @@ async def hud_show() -> dict[str, Any]:
 
 class AskBody(BaseModel):
     text: str = Field(..., min_length=1)
+    use_web: Literal["auto", "on", "off"] = "auto"
 
 
 class ConfirmBody(BaseModel):
@@ -473,8 +483,9 @@ async def ask_typed(body: AskBody) -> dict[str, Any]:
     spoken = (body.text or "").strip()
     if not spoken:
         raise HTTPException(status_code=400, detail="empty text")
-    accepted = await _dispatch_spoken(spoken)
-    return {"ok": accepted, "utterance": spoken}
+    use_web = body.use_web if body.use_web in ("auto", "on", "off") else "auto"
+    accepted = await _dispatch_spoken(spoken, use_web=use_web)
+    return {"ok": accepted, "utterance": spoken, "use_web": use_web}
 
 
 @app.post("/v1/confirm")
@@ -711,38 +722,16 @@ _REFUSAL_RE = re.compile(
     r"real[- ]?time|NEED_BROWSER|check your local)"
 )
 
-# Tiny local-only prompts — no need to hit the web.
+# Tiny local-only prompts — greetings / identity (math goes through the agent + run_python).
 _LOCAL_ONLY_RE = re.compile(
     r"(?i)^\s*("
-    r"hi|hello|hey|thanks|thank you|who are you|what can you do|"
-    # Math / arithmetic (spoken variants: "whats the 2+4", "what is 2 + 4")
-    r"(what('?s|s|\s+is)(\s+the)?\s+)?\d[\d\s\+\-\*\/x×÷]+\d\s*\??|"
-    r"\d+\s*[\+\-\*\/x×÷]\s*\d+\s*\??"
-    r")\s*$"
+    r"hi|hello|hey+|yo+|sup|howdy|thanks|thank you|thx|"
+    r"bro+|dude|ok|okay|"
+    r"how are you|how'?s it going|how'?s going|hows going|"
+    r"what'?s up|whats going on|what'?s going on|"
+    r"who are you|what can you do"
+    r")[\s!.?]*$"
 )
-
-_MATH_EXPR_RE = re.compile(
-    r"(?i)(\d+)\s*([\+\-\*\/x×÷])\s*(\d+)"
-)
-
-
-def _try_local_math(text: str) -> Optional[str]:
-    """Answer simple a±b / a×b / a÷b questions without tools."""
-    m = _MATH_EXPR_RE.search(text or "")
-    if not m:
-        return None
-    a, op, b = int(m.group(1)), m.group(2), int(m.group(3))
-    if op in {"x", "X", "×", "*"}:
-        return str(a * b)
-    if op in {"÷", "/"}:
-        if b == 0:
-            return "undefined (division by zero)"
-        return str(a / b if a % b else a // b)
-    if op == "+":
-        return str(a + b)
-    if op == "-":
-        return str(a - b)
-    return None
 
 
 def _prefer_web_context(spoken: str) -> bool:
@@ -755,77 +744,50 @@ def _prefer_web_context(spoken: str) -> bool:
     return False
 
 
-def _handle_spoken(spoken: str, trace_id: Optional[int] = None) -> None:
+def _handle_spoken(
+    spoken: str, trace_id: Optional[int] = None, use_web: str = "auto"
+) -> None:
     """Agent tool loop (with a tiny local-only fast path)."""
     set_current_trace_id(trace_id)
     try:
-        _handle_spoken_inner(spoken)
+        _handle_spoken_inner(spoken, use_web=use_web)
     finally:
         set_current_trace_id(None)
 
 
-def _handle_spoken_inner(spoken: str) -> None:
-    """Prefer tool-calling agent; keep a local-only greeting/math fast path."""
+def _handle_spoken_inner(spoken: str, use_web: str = "auto") -> None:
+    """Prefer tool-calling agent; keep a tiny greeting fast path."""
     text = (spoken or "").strip()
+    mode = use_web if use_web in ("auto", "on", "off") else "auto"
 
-    math = _try_local_math(text)
-    if math is not None and (
-        _LOCAL_ONLY_RE.match(text) or _MATH_EXPR_RE.search(text)
-    ):
-        # Prefer exact arithmetic for clear math questions.
-        if re.search(r"(?i)\b(what|whats|what's|is|equals?|compute|calculate)\b", text) or _LOCAL_ONLY_RE.match(text):
-            # Avoid treating "open app 2" style as math unless expression is the intent.
-            if re.search(r"(?i)[\+\-\*\/x×÷]", text):
-                reply = math
-                get_memory().log_activity(text, "answer", "local_math", reply)
-                event_bus.publish(
-                    utterance=text,
-                    kind="trace",
-                    text="Received input",
-                    detail="input",
-                    step="input",
-                    tool_input={"utterance": text},
-                )
-                event_bus.publish(
-                    utterance=text,
-                    kind="trace",
-                    text="Local math",
-                    detail="local_math",
-                    step="tool_result",
-                    tool="local_math",
-                    tool_input={"expression": text},
-                    tool_output={"result": reply},
-                )
-                event_bus.publish(
-                    utterance=text, kind="answer", text=reply, detail="local_math"
-                )
-                try:
-                    narrate_answer(reply)
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("tts answer skipped: %s", exc)
-                trace_step("final", kind="answer", detail="local_math", text=reply)
-                return
-
-    if text and _LOCAL_ONLY_RE.match(text):
-        trace_step("route", decision="local_only_fast")
-        reply = _try_local_math(text) or get_parser().generate_answer(text)
-        get_memory().log_activity(text, "answer", "local_llm", reply)
+    if text and _LOCAL_ONLY_RE.match(text) and mode != "on":
+        trace_step("route", decision="local_only_fast", use_web=mode)
+        # Skip the GGUF for pure greetings — avoids Metal decode failures under RAM pressure.
+        lower = text.lower().rstrip("!.? ")
+        if lower in {"who are you", "what can you do"}:
+            reply = get_parser().generate_answer(text)
+        else:
+            reply = (
+                "Hey — I'm MacAgent. Ask me anything, or say “what can you do?” "
+                "for a quick list."
+            )
+        get_memory().log_activity(text, "answer", "local_fast", reply)
         event_bus.publish(
             utterance=text,
             kind="answer",
             text=reply,
-            detail="local_llm",
+            detail="local_fast",
         )
         try:
             narrate_answer(reply)
         except Exception as exc:  # noqa: BLE001
             logger.debug("tts answer skipped: %s", exc)
-        trace_step("final", kind="answer", detail="local_llm", text=reply)
+        trace_step("final", kind="answer", detail="local_fast", text=reply)
         return
 
-    trace_step("route", decision="agent_loop")
-    logger.info("Agent loop for %r", text)
-    result = get_agent().run(text)
+    trace_step("route", decision="agent_loop", use_web=mode)
+    logger.info("Agent loop for %r (use_web=%s)", text, mode)
+    result = get_agent().run(text, use_web=mode)
     if result.get("action") == "confirm":
         logger.info(
             "Waiting for user confirm id=%s cmd=%r",
@@ -956,7 +918,7 @@ async def intercept_freeflow_stream(request: Request) -> JSONResponse:
     return _completion("EMPTY")
 
 
-async def _dispatch_spoken(spoken: str) -> bool:
+async def _dispatch_spoken(spoken: str, use_web: str = "auto") -> bool:
     """Run answer-or-act for one utterance. Returns False if skipped as duplicate."""
     key = spoken.strip().lower()
     if key in _in_flight or _should_skip_duplicate(spoken):
@@ -964,6 +926,7 @@ async def _dispatch_spoken(spoken: str) -> bool:
         return False
     _in_flight.add(key)
     tid = debug_traces.start(spoken, source="ask")
+    mode = use_web if use_web in ("auto", "on", "off") else "auto"
     event_bus.publish(
         utterance=spoken,
         kind="action",
@@ -975,7 +938,7 @@ async def _dispatch_spoken(spoken: str) -> bool:
     except Exception as exc:  # noqa: BLE001
         logger.debug("tts narrate thinking skipped: %s", exc)
     try:
-        await asyncio.to_thread(_handle_spoken, spoken, tid)
+        await asyncio.to_thread(_handle_spoken, spoken, tid, mode)
         debug_traces.finish(tid, status="ok")
     except Exception as exc:  # noqa: BLE001
         debug_traces.finish(tid, status="error", result=str(exc))

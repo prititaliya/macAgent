@@ -1,7 +1,7 @@
 {
   "host": "127.0.0.1",
   "port": 8081,
-  "model_path": "~/Models/qwen2.5-3b-instruct-q4_k_m.gguf",
+  "model_path": "/Users/jatin/Models/Qwen3-4B-Q4_K_M.gguf",
   "model_dir": "~/Models",
   "db_path": "",
   "default_browser": "chrome",

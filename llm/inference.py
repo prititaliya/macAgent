@@ -53,6 +53,11 @@ _BROWSER_RE = re.compile(
     r")\b"
 )
 _JSON_OBJ_RE = re.compile(r"\{[^{}]*\}", re.DOTALL)
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+_GEMMA_THINK_RE = re.compile(
+    r"<\|channel>thought\n.*?(?:<channel\|>|$)", re.DOTALL | re.IGNORECASE
+)
+_DEFAULT_MODEL = "~/Models/Qwen3-4B-Q4_K_M.gguf"
 
 
 def _load_settings() -> dict:
@@ -120,14 +125,113 @@ def _parse_intent_json(text: str, raw_query: str) -> Optional[dict[str, Any]]:
     return None
 
 
+def _is_qwen3(model_path: str) -> bool:
+    name = Path(model_path).name.lower()
+    return "qwen3" in name or "qwen-3" in name
+
+
+def _is_gemma(model_path: str) -> bool:
+    name = Path(model_path).name.lower()
+    return "gemma" in name
+
+
+def _is_phi(model_path: str) -> bool:
+    name = Path(model_path).name.lower()
+    return "phi-4" in name or "phi4" in name or name.startswith("phi-")
+
+
+def _model_too_heavy_for_mac(model_path: str) -> Optional[str]:
+    """Reject GGUFs that reliably OOM / llama_decode -3 on 8GB unified memory."""
+    path = Path(model_path).expanduser()
+    if not path.exists():
+        return None
+    gb = path.stat().st_size / (1024**3)
+    # ~5.5GB+ weights leave almost no room for Metal KV on 8GB machines.
+    if gb >= 5.5:
+        return (
+            f"{path.name} is {gb:.1f} GB — too large for reliable local use on this Mac. "
+            "Pick Qwen3-4B-Q4_K_M (or another ≤~4GB Instruct GGUF) instead."
+        )
+    return None
+
+
+def _model_display_name(model_path: str) -> str:
+    """Human-readable local model name for system prompts."""
+    name = Path(model_path).name
+    stem = name.removesuffix(".gguf")
+    lower = stem.lower()
+    if "phi-4-mini" in lower or "phi4-mini" in lower:
+        return "Microsoft Phi-4-mini-instruct (local GGUF)"
+    if "gemma-4" in lower or "gemma4" in lower:
+        return "Google Gemma 4 (local GGUF)"
+    if "qwen3" in lower or "qwen-3" in lower:
+        if "30b" in lower:
+            return "Qwen3-30B (local GGUF)"
+        if "4b" in lower:
+            return "Qwen3-4B (local GGUF)"
+        return "Qwen3 (local GGUF)"
+    return f"{stem} (local GGUF)"
+
+
+def _chat_prompt(
+    system: str,
+    user: str,
+    *,
+    model_path: str = "",
+    no_think: bool = True,
+) -> str:
+    """Build a chat prompt for the active model family."""
+    user_body = (user or "").rstrip()
+    if _is_gemma(model_path):
+        # Gemma 4 canonical turns (thinking off — no <|think|> in system).
+        # Do not prepend <bos>: llama-cpp adds it from the GGUF tokenizer.
+        return (
+            f"<|turn>system\n{system}<turn|>\n"
+            f"<|turn>user\n{user_body}<turn|>\n"
+            f"<|turn>model\n"
+        )
+    if _is_phi(model_path):
+        return (
+            f"<|system|>{system}<|end|>"
+            f"<|user|>{user_body}<|end|>"
+            f"<|assistant|>"
+        )
+    # ChatML (Qwen3); /no_think skips reasoning blocks.
+    if no_think and "/no_think" not in user_body and "/think" not in user_body:
+        user_body = f"{user_body}\n/no_think"
+    return (
+        f"<|im_start|>system\n{system}<|im_end|>\n"
+        f"<|im_start|>user\n{user_body}<|im_end|>\n"
+        f"<|im_start|>assistant\n"
+    )
+
+
+def _stop_tokens(model_path: str) -> list[str]:
+    if _is_gemma(model_path):
+        return ["<turn|>", "<|turn>"]
+    if _is_phi(model_path):
+        return ["<|end|>", "<|endoftext|>", "<|user|>"]
+    return ["<|im_end|>", "<|im_start|>"]
+
+
+def _strip_thinking(text: str) -> str:
+    """Remove model thinking blocks; keep the final answer."""
+    t = _THINK_RE.sub("", text or "").strip()
+    t = _GEMMA_THINK_RE.sub("", t).strip()
+    # Unclosed think (truncated generation)
+    if "<think>" in t.lower():
+        t = re.sub(r"(?is)<think>.*", "", t).strip()
+    if "<|channel>thought" in t.lower():
+        t = re.sub(r"(?is)<\|channel>thought.*", "", t).strip()
+    return t
+
+
 class LocalIntentParser:
     """Metal-backed intent parser. Lazy-loads the GGUF on first use."""
 
     def __init__(self, model_path: Optional[str] = None, grammar_path: Optional[str] = None):
         settings = _load_settings()
-        raw_model = model_path or settings.get(
-            "model_path", "~/Models/qwen2.5-3b-instruct-q4_k_m.gguf"
-        )
+        raw_model = model_path or settings.get("model_path", _DEFAULT_MODEL)
         self.model_path = str(Path(raw_model).expanduser())
         self.grammar_path = grammar_path or str(
             Path(__file__).resolve().parent / "grammar.gbnf"
@@ -158,15 +262,63 @@ class LocalIntentParser:
         if not Path(self.model_path).exists():
             raise FileNotFoundError(
                 f"Model missing at {self.model_path}. "
-                "Download the Qwen2.5-3B-Instruct Q4_K_M GGUF first."
+                "Download a GGUF (e.g. Qwen3-4B-Q4_K_M) into ~/Models."
             )
-        logger.info("Loading GGUF from %s (Metal n_gpu_layers=-1)", self.model_path)
+        heavy = _model_too_heavy_for_mac(self.model_path)
+        if heavy:
+            raise RuntimeError(heavy)
+        if _is_gemma(self.model_path):
+            n_ctx = 16384
+            n_gpu_layers = 20
+        elif _is_phi(self.model_path):
+            n_ctx = 4096
+            n_gpu_layers = -1
+        elif _is_qwen3(self.model_path):
+            # 8GB unified (MBA) cannot hold 4B Q4 + 8K KV reliably → llama_decode -3.
+            n_ctx = 4096
+            n_gpu_layers = -1
+        else:
+            n_ctx = 4096
+            n_gpu_layers = -1
+        logger.info(
+            "Loading GGUF from %s (n_gpu_layers=%s, n_ctx=%s)",
+            self.model_path,
+            n_gpu_layers,
+            n_ctx,
+        )
         self._llm = Llama(
             model_path=self.model_path,
-            n_ctx=4096,
-            n_gpu_layers=-1,
+            n_ctx=n_ctx,
+            n_gpu_layers=n_gpu_layers,
             verbose=False,
         )
+
+    def _complete(
+        self,
+        system: str,
+        user: str,
+        *,
+        max_tokens: int = 160,
+        temperature: float = 0.0,
+        stop_extra: Optional[list[str]] = None,
+        no_think: bool = True,
+    ) -> str:
+        """Run a chat completion and strip thinking blocks."""
+        self._ensure_loaded()
+        assert self._llm is not None
+        prompt = _chat_prompt(
+            system, user, model_path=self.model_path, no_think=no_think
+        )
+        stop = _stop_tokens(self.model_path)
+        if stop_extra:
+            stop = stop + list(stop_extra)
+        response = self._llm(
+            prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            stop=stop,
+        )
+        return _strip_thinking((response["choices"][0]["text"] or "").strip())
 
     def extract_intent(self, raw_text: str) -> dict[str, Any]:
         fallback = {
@@ -202,21 +354,9 @@ class LocalIntentParser:
             "Use search_fallback as a synonym of browse. "
             "raw_query must be the original spoken text."
         )
-        prompt = (
-            f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-            f"<|im_start|>user\n{raw_text}<|im_end|>\n"
-            f"<|im_start|>assistant\n"
-        )
-
         assert self._llm is not None
         try:
-            response = self._llm(
-                prompt,
-                max_tokens=128,
-                temperature=0.0,
-                stop=["<|im_end|>", "<|im_start|>", "\n\n"],
-            )
-            text = response["choices"][0]["text"]
+            text = self._complete(system_prompt, raw_text, max_tokens=128, temperature=0.0)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Intent LLM failed (%s); using fallback", exc)
             trace_step("intent_llm_error", system_prompt=system_prompt, error=str(exc))
@@ -276,10 +416,8 @@ class LocalIntentParser:
         user_prompt = (
             f"Purposes:\n{catalog}\n\nSpoken request: {utterance}\n\nAnswer:"
         )
-        prompt = (
-            f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-            f"<|im_start|>user\n{user_prompt}<|im_end|>\n"
-            f"<|im_start|>assistant\n"
+        prompt = _chat_prompt(
+            system_prompt, user_prompt, model_path=self.model_path, no_think=True
         )
 
         assert self._llm is not None
@@ -289,6 +427,7 @@ class LocalIntentParser:
                 max_tokens=16,
                 grammar=purpose_grammar,
                 temperature=0.0,
+                stop=_stop_tokens(self.model_path),
             )
             text = (response["choices"][0]["text"] or "").strip()
             if not text.startswith("SITE="):
@@ -314,8 +453,11 @@ class LocalIntentParser:
             return fallback
 
         runtime = build_runtime_context()
+        model_name = _model_display_name(self.model_path)
         system_prompt = (
             "You are MacAgent, a concise local macOS assistant. "
+            f"You run on-device using {model_name}. "
+            "If asked which model or LLM you use, name that model — do not invent another provider. "
             "Use the CONTEXT block (current time and user notes) when relevant. "
             "Answer in a few short sentences. "
             "If the question needs live or web data (scores, schedules, news, prices), "
@@ -326,20 +468,11 @@ class LocalIntentParser:
             f"CONTEXT:\n{runtime}\n\n"
             f"User question: {utterance}"
         )
-        prompt = (
-            f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-            f"<|im_start|>user\n{user_prompt}<|im_end|>\n"
-            f"<|im_start|>assistant\n"
-        )
         assert self._llm is not None
         try:
-            response = self._llm(
-                prompt,
-                max_tokens=192,
-                temperature=0.4,
-                stop=["<|im_end|>", "<|im_start|>"],
+            text = self._complete(
+                system_prompt, user_prompt, max_tokens=192, temperature=0.4
             )
-            text = (response["choices"][0]["text"] or "").strip()
             out = text or fallback
             trace_step(
                 "generate_answer",
@@ -381,20 +514,11 @@ class LocalIntentParser:
             f"User question: {utterance}\n\n"
             "Summary of what I know about you:"
         )
-        prompt = (
-            f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-            f"<|im_start|>user\n{user_prompt}<|im_end|>\n"
-            f"<|im_start|>assistant\n"
-        )
         assert self._llm is not None
         try:
-            response = self._llm(
-                prompt,
-                max_tokens=320,
-                temperature=0.2,
-                stop=["<|im_end|>", "<|im_start|>"],
+            text = self._complete(
+                system_prompt, user_prompt, max_tokens=320, temperature=0.2
             )
-            text = (response["choices"][0]["text"] or "").strip()
             out = text or fallback
             if _is_empty_refusal(out):
                 out = fallback
@@ -449,20 +573,11 @@ class LocalIntentParser:
             "Use any prices, model names, or comparison facts present. "
             "Do not claim the sources lack information if they contain relevant facts:"
         )
-        prompt = (
-            f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-            f"<|im_start|>user\n{user_prompt}<|im_end|>\n"
-            f"<|im_start|>assistant\n"
-        )
         assert self._llm is not None
         try:
-            response = self._llm(
-                prompt,
-                max_tokens=256,
-                temperature=0.2,
-                stop=["<|im_end|>", "<|im_start|>"],
+            text = self._complete(
+                system_prompt, user_prompt, max_tokens=256, temperature=0.2
             )
-            text = (response["choices"][0]["text"] or "").strip()
             out = text or fallback
             # Small models often refuse “about me” even when LinkedIn/snippets are rich.
             if _is_empty_refusal(out) and extractive:
@@ -506,20 +621,11 @@ class LocalIntentParser:
             f"Command output:\n{out}\n\n"
             "Formatted answer:"
         )
-        prompt = (
-            f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-            f"<|im_start|>user\n{user_prompt}<|im_end|>\n"
-            f"<|im_start|>assistant\n"
-        )
         assert self._llm is not None
         try:
-            response = self._llm(
-                prompt,
-                max_tokens=280,
-                temperature=0.1,
-                stop=["<|im_end|>", "<|im_start|>"],
+            text = self._complete(
+                system_prompt, user_prompt, max_tokens=280, temperature=0.1
             )
-            text = (response["choices"][0]["text"] or "").strip()
             trace_step(
                 "answer_from_command",
                 user=utterance,
@@ -538,14 +644,52 @@ class LocalIntentParser:
         tool_catalog: str,
     ) -> str:
         """Ask the model for the next tool call as a single JSON object."""
-        fallback = json.dumps(
-            {"tool": "respond", "args": {"text": "I could not plan the next step."}}
-        )
+        soft = {
+            "tool": "respond",
+            "args": {
+                "text": (
+                    "Hey — I'm MacAgent. Ask me anything, or say “what can you do?”"
+                )
+            },
+        }
+        hard = {
+            "tool": "respond",
+            "args": {
+                "text": (
+                    "I couldn't plan that step (model decode failed). "
+                    "Stay on Qwen3-4B, or try again with a shorter ask."
+                )
+            },
+        }
+        # Casual chat should never surface a planner failure.
+        utt = (utterance or "").strip()
+        if re.match(
+            r"(?i)^\s*("
+            r"yo+|hey+|hi+|hello+|sup+|howdy|thanks|thank\s+you|thx|"
+            r"ok|okay|cool|nice|great|awesome|lol|haha|bro+|dude|"
+            r"good\s+(morning|afternoon|evening|night)|"
+            r"how\s+are\s+(you|ya|u)|how('?s|\s+is)\s+it\s+going|"
+            r"how('?s|\s+is)\s+going|hows\s+going|how\s+goes\s+it|"
+            r"what'?s\s+up|wassup|whats\s+going\s+on|what'?s\s+going\s+on"
+            r")[\s!.?]*$",
+            utt,
+        ):
+            fallback = json.dumps(soft)
+        else:
+            fallback = json.dumps(hard)
         try:
             self._ensure_loaded()
         except (FileNotFoundError, RuntimeError) as exc:
             logger.warning("Tool plan skipped: %s", exc)
-            return fallback
+            return json.dumps(
+                {
+                    "tool": "respond",
+                    "args": {
+                        "text": f"Model isn't ready: {exc}",
+                        "goal_done": True,
+                    },
+                }
+            )
 
         runtime = build_runtime_context()
         hist_lines: list[str] = []
@@ -567,6 +711,8 @@ class LocalIntentParser:
 
         system_prompt = (
             "You are MacAgent's planner AND supervisor on macOS. "
+            f"You run on-device using {_model_display_name(self.model_path)}. "
+            "If the user asks which model you use, call tool respond with that model name. "
             "Choose exactly ONE next tool call as JSON: {\"tool\":\"name\",\"args\":{...}}. "
             "No markdown. No explanation. "
             "CRITICAL: Match the user's intent — never copy unrelated catalog examples. "
@@ -580,6 +726,10 @@ class LocalIntentParser:
             "respond honestly with what you know. "
             "To close/quit/kill an app or browser, use manage_system_resources with action=kill. "
             "Never use control_power_management or modify_system_setting for closing apps. "
+            "To turn Wi‑Fi/Bluetooth on or off, mute volume, or switch dark/light mode, use control_mac. "
+            "control_mac args MUST be {\"feature\":\"wifi|bluetooth|volume|appearance\",\"state\":\"on|off|toggle|mute|unmute|dark|light\"}. "
+            "Example: turn off wifi → {\"tool\":\"control_mac\",\"args\":{\"feature\":\"wifi\",\"state\":\"off\"}}. "
+            "Never use control_power_management or manage_system_resources kill for wifi/bluetooth. "
             "control_power_management is ONLY for sleep/display timeout/battery when the user asked for that. "
             "Multi-step is expected: one tool per step, keep going until the GOAL is done. "
             "Compound requests (open X and Y, find file and move it) need SEPARATE steps — "
@@ -587,6 +737,11 @@ class LocalIntentParser:
             "After listing/search, if the user explicitly asked to delete/move/open that result on the Mac, "
             "call the next tool — do NOT respond with only the listing. "
             "If they only asked a question, respond once you have a solid answer — do not invent Mac actions. "
+            "For factual world knowledge (how many parameters, who created X, GPT sizes, prices, news, timezones), "
+            "ALWAYS web_search first — never invent numbers with respond or run_python. "
+            "If the user wants a number calculated (what is 2+2, compute 20/40, solve …), use run_python "
+            "with a short print(...) script. If numbers appear only as examples inside notes to explain, "
+            "do NOT calculate — explain the concepts (respond or web_search). "
             "If a prior web_search answer said context was insufficient / missing prices, "
             "call web_search again with a sharper query (include model names + pricing + year). "
             "Use tool=respond only when the goal is finished or you must ask a clarifying question. "
@@ -603,20 +758,14 @@ class LocalIntentParser:
             f"Prior tool results:\n{history_block}\n\n"
             "Next tool JSON:"
         )
-        prompt = (
-            f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-            f"<|im_start|>user\n{user_prompt}<|im_end|>\n"
-            f"<|im_start|>assistant\n"
-        )
         assert self._llm is not None
         try:
-            response = self._llm(
-                prompt,
-                max_tokens=160,
-                temperature=0.0,
-                stop=["<|im_end|>", "<|im_start|>", "\n\n"],
+            text = self._complete(
+                system_prompt,
+                user_prompt,
+                max_tokens=200,
+                temperature=0.1,
             )
-            text = (response["choices"][0]["text"] or "").strip()
             trace_step(
                 "plan_tool_call",
                 system_prompt=system_prompt,
@@ -647,20 +796,11 @@ class LocalIntentParser:
         user_prompt = (
             f"Write a Python script that solves this and prints the result:\n{utterance}"
         )
-        prompt = (
-            f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-            f"<|im_start|>user\n{user_prompt}<|im_end|>\n"
-            f"<|im_start|>assistant\n"
-        )
         assert self._llm is not None
         try:
-            response = self._llm(
-                prompt,
-                max_tokens=320,
-                temperature=0.1,
-                stop=["<|im_end|>", "<|im_start|>"],
+            text = self._complete(
+                system_prompt, user_prompt, max_tokens=320, temperature=0.1
             )
-            text = (response["choices"][0]["text"] or "").strip()
             text = _strip_code_fences(text)
             trace_step("generate_python", user=utterance, raw_output=text[:1000])
             return text or fallback
@@ -694,20 +834,11 @@ class LocalIntentParser:
             f"Write one bash command that accomplishes this and prints useful output:\n"
             f"{utterance}"
         )
-        prompt = (
-            f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-            f"<|im_start|>user\n{user_prompt}<|im_end|>\n"
-            f"<|im_start|>assistant\n"
-        )
         assert self._llm is not None
         try:
-            response = self._llm(
-                prompt,
-                max_tokens=160,
-                temperature=0.1,
-                stop=["<|im_end|>", "<|im_start|>", "\n\n"],
+            text = self._complete(
+                system_prompt, user_prompt, max_tokens=160, temperature=0.1
             )
-            text = (response["choices"][0]["text"] or "").strip()
             text = _strip_code_fences(text)
             # Take first non-empty line; strip prompt junk.
             for line in text.splitlines():
@@ -759,20 +890,11 @@ class LocalIntentParser:
             f"Candidate answer:\n{(candidate or '')[:800]}\n\n"
             "JSON:"
         )
-        prompt = (
-            f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-            f"<|im_start|>user\n{user_prompt}<|im_end|>\n"
-            f"<|im_start|>assistant\n"
-        )
         assert self._llm is not None
         try:
-            response = self._llm(
-                prompt,
-                max_tokens=120,
-                temperature=0.0,
-                stop=["<|im_end|>", "<|im_start|>"],
+            text = self._complete(
+                system_prompt, user_prompt, max_tokens=120, temperature=0.0
             )
-            text = (response["choices"][0]["text"] or "").strip()
             data = None
             try:
                 data = json.loads(text)

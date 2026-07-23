@@ -34,12 +34,12 @@ ARCHFLAGS="-arch arm64" \
   pip install -r requirements.txt
 
 MODEL_DIR="${HOME}/Models"
-MODEL_FILE="${MODEL_DIR}/qwen2.5-3b-instruct-q4_k_m.gguf"
-MODEL_URL="https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf"
+MODEL_FILE="${MODEL_DIR}/Qwen3-4B-Q4_K_M.gguf"
+MODEL_URL="https://huggingface.co/Qwen/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf"
 
 mkdir -p "$MODEL_DIR"
 if [[ ! -f "$MODEL_FILE" ]]; then
-  echo "==> Downloading Qwen2.5-3B Q4_K_M (~2 GB) to ${MODEL_FILE}…"
+  echo "==> Downloading Qwen3-4B Q4_K_M (~2.3 GB) to ${MODEL_FILE}…"
   curl -L --progress-bar -o "$MODEL_FILE" "$MODEL_URL"
 else
   echo "==> Model already present: ${MODEL_FILE}"

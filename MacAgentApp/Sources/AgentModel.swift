@@ -13,6 +13,34 @@ struct TraceStep: Identifiable, Equatable {
     let body: String
 }
 
+struct DebugTraceItem: Identifiable, Equatable {
+    let id: Int
+    let utterance: String
+    let status: String
+    let source: String
+    let timestamp: Date?
+    let finishedAt: Date?
+    let resultSummary: String
+    let steps: [DebugTraceStep]
+    let raw: [String: Any]
+
+    static func == (lhs: DebugTraceItem, rhs: DebugTraceItem) -> Bool {
+        lhs.id == rhs.id
+            && lhs.status == rhs.status
+            && lhs.steps.count == rhs.steps.count
+            && lhs.resultSummary == rhs.resultSummary
+    }
+}
+
+struct DebugTraceStep: Identifiable, Equatable {
+    let id: Int
+    let name: String
+    let title: String
+    let summary: String
+    let detail: String
+    let isError: Bool
+}
+
 struct PendingConfirm: Identifiable, Equatable {
     let id: String
     let summary: String
@@ -43,7 +71,7 @@ final class AgentModel: ObservableObject {
     @Published var sites: [[String: Any]] = []
     @Published var apps: [[String: Any]] = []
     @Published var contextNotes = ""
-    @Published var debugJSON = "[]"
+    @Published var debugTraces: [DebugTraceItem] = []
     @Published var lastError: String?
     /// Available GGUF models from ~/Models (via daemon).
     @Published var availableModels: [[String: Any]] = []
@@ -51,6 +79,27 @@ final class AgentModel: ObservableObject {
     @Published var modelPath = ""
     @Published var modelLoaded = false
     @Published var modelSwitching = false
+
+    /// Short label for the active GGUF (shown under Answer).
+    var modelDisplayName: String {
+        let raw = modelPath.isEmpty ? "" : URL(fileURLWithPath: modelPath).lastPathComponent
+        guard !raw.isEmpty else { return "local model" }
+        let stem = raw.replacingOccurrences(of: ".gguf", with: "", options: .caseInsensitive)
+        let lower = stem.lowercased()
+        if lower.contains("phi-4-mini") || lower.contains("phi4-mini") {
+            return "Phi-4-mini"
+        }
+        if lower.contains("gemma-4") || lower.contains("gemma4") {
+            return "Gemma 4"
+        }
+        if lower.contains("qwen3") || lower.contains("qwen-3") {
+            if lower.contains("30b") { return "Qwen3-30B" }
+            if lower.contains("4b") { return "Qwen3-4B" }
+            return "Qwen3"
+        }
+        return stem
+    }
+
     /// TTS (Kokoro) prefs from daemon settings.json
     @Published var ttsEnabled = true
     @Published var ttsSpeakStatus = true
@@ -98,7 +147,13 @@ final class AgentModel: ObservableObject {
         }
     }
 
-    func ask(_ text: String) async {
+    /// Overlay Search chip: auto | on | off (sent as `use_web` on /v1/ask).
+    func ask(_ text: String, useWeb: String = "auto") async {
+        let mode: String
+        switch useWeb.lowercased() {
+        case "on", "off": mode = useWeb.lowercased()
+        default: mode = "auto"
+        }
         busy = true
         statusLine = "Thinking…"
         lastQuestion = text
@@ -116,7 +171,9 @@ final class AgentModel: ObservableObject {
             req.httpMethod = "POST"
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             req.timeoutInterval = 180
-            req.httpBody = try JSONSerialization.data(withJSONObject: ["text": text])
+            req.httpBody = try JSONSerialization.data(
+                withJSONObject: ["text": text, "use_web": mode]
+            )
             let (_, resp) = try await URLSession.shared.data(for: req)
             guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
                 throw URLError(.badServerResponse)
@@ -128,6 +185,63 @@ final class AgentModel: ObservableObject {
             answer = "Request failed: \(error.localizedDescription)"
             statusLine = ""
         }
+    }
+
+    /// Matches daemon gate in `llm/inference.py` / `main.py` (~5.5 GB+ rejected).
+    static let maxModelSizeGB: Double = 5.5
+
+    /// Paths of GGUFs reported by `/v1/models`.
+    var modelPaths: [String] {
+        availableModels.compactMap { $0["path"] as? String }
+    }
+
+    /// Models small enough for reliable local Metal use.
+    var usableModelPaths: [String] {
+        modelPaths.filter { !isModelTooHeavy($0) }
+    }
+
+    /// Models rejected by the daemon size gate (shown disabled in pickers).
+    var heavyModelPaths: [String] {
+        modelPaths.filter { isModelTooHeavy($0) }
+    }
+
+    func sizeGB(for path: String) -> Double? {
+        let item = availableModels.first { ($0["path"] as? String) == path }
+        if let gb = item?["size_gb"] as? Double { return gb }
+        if let gb = item?["size_gb"] as? Int { return Double(gb) }
+        if let n = item?["size_gb"] as? NSNumber { return n.doubleValue }
+        return nil
+    }
+
+    func isModelTooHeavy(_ path: String) -> Bool {
+        guard let gb = sizeGB(for: path) else { return false }
+        return gb >= Self.maxModelSizeGB
+    }
+
+    /// Qwen3-4B Instruct is the recommended local brain for MacAgent.
+    func isRecommendedModel(_ path: String) -> Bool {
+        let name = URL(fileURLWithPath: path).lastPathComponent.lowercased()
+        return name.contains("qwen3") && name.contains("4b") && !isModelTooHeavy(path)
+    }
+
+    /// Menu label for a GGUF path (name + size when known).
+    func labelForModelPath(_ path: String) -> String {
+        let item = availableModels.first { ($0["path"] as? String) == path }
+        let name = item?["name"] as? String
+            ?? URL(fileURLWithPath: path).lastPathComponent
+        if let gb = sizeGB(for: path) {
+            return String(format: "%@ (%.1f GB)", name, gb)
+        }
+        return name
+    }
+
+    /// Picker label with a quiet Recommended tag for Qwen3-4B.
+    func menuLabelForModelPath(_ path: String) -> String {
+        let base = labelForModelPath(path)
+        if isRecommendedModel(path) {
+            return "\(base) · Recommended"
+        }
+        return base
     }
 
     func respondToConfirm(approve: Bool) async {
@@ -179,14 +293,9 @@ final class AgentModel: ObservableObject {
            let notes = obj["notes"] as? String {
             contextNotes = notes
         }
-        if let obj = await getJSON("v1/debug/traces?limit=20"),
-           let items = obj["traces"] as? [[String: Any]],
-           let data = try? JSONSerialization.data(
-            withJSONObject: items,
-            options: [.prettyPrinted, .sortedKeys]
-           ),
-           let str = String(data: data, encoding: .utf8) {
-            debugJSON = str
+        if let obj = await getJSON("v1/debug/traces?limit=30"),
+           let items = obj["traces"] as? [[String: Any]] {
+            debugTraces = items.reversed().compactMap(Self.parseDebugTrace)
         }
         if let obj = await getJSON("v1/settings") {
             if let v = obj["tts_enabled"] as? Bool { ttsEnabled = v }
@@ -547,6 +656,122 @@ final class AgentModel: ObservableObject {
         } catch {
             return nil
         }
+    }
+
+    private static func parseDebugTrace(_ item: [String: Any]) -> DebugTraceItem? {
+        guard let id = item["id"] as? Int else { return nil }
+        let utterance = (item["utterance"] as? String) ?? ""
+        let status = (item["status"] as? String) ?? "unknown"
+        let source = (item["source"] as? String) ?? ""
+        let timestamp = (item["ts"] as? Double).map { Date(timeIntervalSince1970: $0) }
+        let finishedAt = (item["finished_ts"] as? Double).map { Date(timeIntervalSince1970: $0) }
+        let resultSummary = summarizeDebugValue(item["result"])
+        let rawSteps = (item["steps"] as? [[String: Any]]) ?? []
+        let steps = rawSteps.enumerated().map { index, step in
+            formatDebugStep(index: index, step: step)
+        }
+        return DebugTraceItem(
+            id: id,
+            utterance: utterance,
+            status: status,
+            source: source,
+            timestamp: timestamp,
+            finishedAt: finishedAt,
+            resultSummary: resultSummary,
+            steps: steps,
+            raw: item
+        )
+    }
+
+    private static func formatDebugStep(index: Int, step: [String: Any]) -> DebugTraceStep {
+        let name = (step["name"] as? String) ?? "step"
+        let isError = name.contains("error") || step["error"] != nil
+        let title: String
+        switch name {
+        case "route": title = "Route"
+        case "plan_tool_call": title = "Planner"
+        case "plan_tool_call_error": title = "Planner failed"
+        case "agent_tool_call": title = "Tool"
+        case "final": title = "Result"
+        case "answer_from_search", "answer_from_search_error": title = "Search answer"
+        case "answer_from_command": title = "Command answer"
+        case "intent_heuristic", "intent_llm_error", "intent_error": title = "Intent"
+        default:
+            title = name
+                .replacingOccurrences(of: "_", with: " ")
+                .capitalized
+        }
+
+        var summaryParts: [String] = []
+        if let decision = step["decision"] as? String { summaryParts.append(decision) }
+        if let useWeb = step["use_web"] as? String { summaryParts.append("search \(useWeb)") }
+        if let tool = step["tool"] as? String { summaryParts.append(tool) }
+        if let kind = step["kind"] as? String { summaryParts.append(kind) }
+        if let detail = step["detail"] as? String, !detail.isEmpty {
+            summaryParts.append(clip(detail, 80))
+        }
+        if let error = step["error"] as? String { summaryParts.append(clip(error, 100)) }
+        if let text = step["text"] as? String, !text.isEmpty, name == "final" {
+            summaryParts.append(clip(text, 100))
+        }
+        if let raw = step["raw_output"] as? String, !raw.isEmpty, name.contains("plan") {
+            summaryParts.append(clip(raw.replacingOccurrences(of: "\n", with: " "), 100))
+        }
+        if summaryParts.isEmpty {
+            let keys = step.keys.filter { !["name", "ts"].contains($0) }.sorted()
+            if !keys.isEmpty {
+                summaryParts.append(keys.joined(separator: ", "))
+            }
+        }
+
+        var detailLines: [String] = []
+        let preferred = [
+            "decision", "use_web", "tool", "args", "step", "kind", "detail",
+            "text", "error", "raw_output", "command", "user", "system_prompt", "user_prompt",
+        ]
+        var seen = Set<String>()
+        for key in preferred where step[key] != nil {
+            seen.insert(key)
+            detailLines.append("\(key): \(stringifyDebugValue(step[key]))")
+        }
+        for key in step.keys.sorted() where !seen.contains(key) && key != "name" && key != "ts" {
+            detailLines.append("\(key): \(stringifyDebugValue(step[key]))")
+        }
+
+        return DebugTraceStep(
+            id: index,
+            name: name,
+            title: title,
+            summary: summaryParts.isEmpty ? name : summaryParts.joined(separator: " · "),
+            detail: detailLines.joined(separator: "\n\n"),
+            isError: isError
+        )
+    }
+
+    private static func summarizeDebugValue(_ value: Any?) -> String {
+        guard let value else { return "" }
+        if let s = value as? String { return clip(s, 160) }
+        return clip(stringifyDebugValue(value), 160)
+    }
+
+    private static func stringifyDebugValue(_ value: Any?) -> String {
+        guard let value else { return "null" }
+        if let s = value as? String { return s }
+        if JSONSerialization.isValidJSONObject(value),
+           let data = try? JSONSerialization.data(
+            withJSONObject: value,
+            options: [.prettyPrinted, .sortedKeys]
+           ),
+           let text = String(data: data, encoding: .utf8) {
+            return text
+        }
+        return String(describing: value)
+    }
+
+    private static func clip(_ text: String, _ max: Int) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count > max else { return trimmed }
+        return String(trimmed.prefix(max - 1)) + "…"
     }
 
     private func postJSON(_ path: String, body: [String: Any]) async -> [String: Any]? {

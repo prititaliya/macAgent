@@ -19,6 +19,7 @@
 		87F6979CB5DA24A9E7B53DE4 /* HotkeyManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7E2CE36F376743B829ADB642 /* HotkeyManager.swift */; };
 		8F3DE8A84C63B160ECDA4AC3 /* PreferencesController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 447A36FFF6B6397D8B9B720F /* PreferencesController.swift */; };
 		9783F83B05FC6E6030ADBBBC /* MacAgentApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = C01C91F1A9E49285A42B7956 /* MacAgentApp.swift */; };
+		A7FEB54C8D43BD644C52A3DB /* MacAgentTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = 18CD73C09D449D6EBE31F7A0 /* MacAgentTheme.swift */; };
 		B3A768822048A0F8ED46626F /* MacAgentLogo.png in Resources */ = {isa = PBXBuildFile; fileRef = 2A74B0C4DEE120BE13342E3D /* MacAgentLogo.png */; };
 		DEBB2EBAF2B08F2D061B6C00 /* SpeechCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9FA6F1D12BCA27AD18F60FE7 /* SpeechCapture.swift */; };
 		E5CE12CE15AFEC2729CA116A /* UIBridgeServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = BDEC0568726266E5418F1542 /* UIBridgeServer.swift */; };
@@ -28,6 +29,7 @@
 /* Begin PBXFileReference section */
 		09447E68AAE10687942F7058 /* AgentModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentModel.swift; sourceTree = "<group>"; };
 		0EAF4E441A0123C855817320 /* Network.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Network.framework; path = System/Library/Frameworks/Network.framework; sourceTree = SDKROOT; };
+		18CD73C09D449D6EBE31F7A0 /* MacAgentTheme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MacAgentTheme.swift; sourceTree = "<group>"; };
 		20F7C939A0093C0A8624AC01 /* PreferencesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreferencesView.swift; sourceTree = "<group>"; };
 		2A74B0C4DEE120BE13342E3D /* MacAgentLogo.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = MacAgentLogo.png; sourceTree = "<group>"; };
 		2F84FE0D12C6CC7DCA522A87 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
@@ -88,6 +90,7 @@
 				7E2CE36F376743B829ADB642 /* HotkeyManager.swift */,
 				8AF965C5487C669D42350999 /* Info.plist */,
 				C01C91F1A9E49285A42B7956 /* MacAgentApp.swift */,
+				18CD73C09D449D6EBE31F7A0 /* MacAgentTheme.swift */,
 				729347A94E175DD29821AC2B /* OverlayAutoHide.swift */,
 				D69D18901D9440633C037AE4 /* OverlayController.swift */,
 				C64791C9045A7E87F2CFB790 /* OverlayView.swift */,
@@ -189,6 +192,7 @@
 				7849A3FD3CE06ECB070AFB7F /* DaemonManager.swift in Sources */,
 				87F6979CB5DA24A9E7B53DE4 /* HotkeyManager.swift in Sources */,
 				9783F83B05FC6E6030ADBBBC /* MacAgentApp.swift in Sources */,
+				A7FEB54C8D43BD644C52A3DB /* MacAgentTheme.swift in Sources */,
 				0099C779EB8AE8A5A4238A3D /* OverlayAutoHide.swift in Sources */,
 				5EACB5BCD66912337B82E660 /* OverlayController.swift in Sources */,
 				7CE92FB26DDEFCA76ECF2BE0 /* OverlayView.swift in Sources */,

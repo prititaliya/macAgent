@@ -19,6 +19,7 @@ from tools.mac_alerts import trigger_native_notification_from_args
 from tools.mac_diagnostics import manage_system_resources_from_args
 from tools.mac_search import spotlight_file_search_from_args
 from tools.mac_system import (
+    control_mac_from_args,
     control_power_management_from_args,
     modify_system_setting_from_args,
 )
@@ -63,17 +64,20 @@ Available tools (reply with ONE JSON object: {"tool":"...","args":{...}}):
 - open_url: {"url":"https://…"} — only if user asked to open a site (Chrome)
 - open_folder: {"query":"comp3370"} — find and open a folder in Finder (prefer over bash find)
 - open_system_settings: {"pane":"wifi|bluetooth|…"} — only if user asked to OPEN Settings GUI
+- control_mac: {"feature":"wifi|bluetooth|volume|appearance","state":"on|off|toggle|mute|unmute|dark|light"} — turn Wi‑Fi/Bluetooth on/off, mute volume, dark/light mode
 - manage_system_resources: {"action":"kill","target_process":"Google Chrome"} — CLOSE/QUIT/KILL an app or process; {"action":"list"} for top CPU/memory
-- modify_system_setting: {"domain":"NSGlobalDomain","key":"AppleInterfaceStyle","value":"Dark","value_type":"string"} — ONLY for prefs/defaults (dark mode, Dock); NOT for closing apps
-- control_power_management: {"setting":"sleep","value":10} — ONLY for pmset power/sleep timeouts when user asked about sleep/display timeout/battery; NEVER for closing apps
+- modify_system_setting: {"domain":"NSGlobalDomain","key":"AppleInterfaceStyle","value":"Dark","value_type":"string"} — ONLY for prefs/defaults (Dock etc.); prefer control_mac for dark mode / wifi
+- control_power_management: {"setting":"sleep","value":10} — ONLY for pmset power/sleep timeouts when user asked about sleep/display timeout/battery; NEVER for closing apps or wifi
 - spotlight_file_search: {"query":"invoice.pdf"} — fast system-wide Spotlight (mdfind); returns top 15 absolute paths
 - trigger_native_notification: {"title":"Done","subtitle":"MacAgent","message":"Task finished","play_sound":true} — Notification Center alert
 - run_bash: {"command":"…"} — file/shell tasks; multi-step OK (list then delete/open)
-- run_python: {"code":"print(2+4)"} — math / short scripts
+- run_python: {"code":"print(2+4)"} — ONLY when the user wants a calculation/result computed; print the answer
 - ui_snapshot / ui_click / ui_type / ui_key / ui_menu — only for explicit on-screen control
 - get_user_context / update_user_context — notes
 - search_past_interactions: {"query":"…","limit":5} — search prior asks/answers
+To turn Wi‑Fi / Bluetooth / mute / dark mode on or off → control_mac (NOT control_power_management, NOT manage_system_resources kill).
 To close/quit an app or browser → manage_system_resources kill (NOT control_power_management, NOT modify_system_setting).
+If the user asks you to calculate/compute a number → run_python (e.g. print(20/40)). Numbers inside notes/examples to explain are NOT calculator requests — respond/explain instead.
 If the user asks for TWO things (open X and Y), use one tool per step — never combine into one open_app name.
 After ls/find_files, if they asked to move/delete/open the result, call run_bash — do NOT respond with only the listing.
 If a tool failed (ok:false), do NOT repeat the same call — try a different tool or respond with the error.
@@ -98,6 +102,7 @@ class ToolRegistry:
             "open_url": self._open_url,
             "web_search": self._web_search,
             "open_system_settings": self._open_system_settings,
+            "control_mac": self._control_mac,
             "modify_system_setting": self._modify_system_setting,
             "control_power_management": self._control_power_management,
             "spotlight_file_search": self._spotlight_file_search,
@@ -513,6 +518,9 @@ class ToolRegistry:
             }
         subprocess.run(["open", url], check=False)
         return {"ok": True, "pane": key, "opened": url}
+
+    def _control_mac(self, args: dict[str, Any]) -> dict[str, Any]:
+        return control_mac_from_args(args)
 
     def _modify_system_setting(self, args: dict[str, Any]) -> dict[str, Any]:
         return modify_system_setting_from_args(args)

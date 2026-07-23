@@ -87,9 +87,11 @@ _APP_ALIASES: dict[str, str] = {
 _CHAT_RE = re.compile(
     r"(?i)^\s*("
     r"yo+|hey+|hi+|hello+|sup+|howdy|thanks|thank\s+you|thx|"
-    r"ok|okay|cool|nice|great|awesome|lol|haha|"
+    r"ok|okay|cool|nice|great|awesome|lol|haha|bro+|dude|"
     r"good\s+(morning|afternoon|evening|night)|"
-    r"how\s+are\s+you|what'?s\s+up|wassup"
+    r"how\s+are\s+(you|ya|u)|how('?s|\s+is)\s+it\s+going|"
+    r"how('?s|\s+is)\s+going|hows\s+going|how\s+goes\s+it|"
+    r"what'?s\s+up|wassup|whats\s+going\s+on|what'?s\s+going\s+on"
     r")[\s!.?]*$"
 )
 
@@ -118,11 +120,12 @@ _ABOUT_ME_RE = re.compile(
 
 _DESTRUCTIVE_UTTERANCE_RE = re.compile(
     r"(?i)\b("
-    r"shut\s*down|turn\s+off|power\s+off|restart|reboot|"
+    r"shut\s*down|power\s+off|"
+    r"turn\s+off\s+(my\s+)?(mac|pc|computer|machine|system)|"
     r"empty\s+(the\s+)?(bin|trash)|clear\s+(the\s+)?(bin|trash)|"
     r"\brm\b|\bdelete\b|\bremove\b|delete\s+all|wipe|"
     r"put\s+.+\s+to\s+sleep|sleep\s+(my\s+)?(mac|pc|computer)|go\s+to\s+sleep|"
-    r"log\s*out"
+    r"log\s*out|restart|reboot"
     r")\b"
 )
 
@@ -178,6 +181,7 @@ _CAPABILITIES_TEXT = """Here's what I can do on your Mac:
 
 • Answer questions (local model + web search when needed)
 • Open apps and Chrome URLs
+• Turn Wi‑Fi / Bluetooth on or off, mute volume, switch dark/light mode
 • Find files via Spotlight (fast) or shell
 • Change system prefs (defaults) and power settings (pmset) without opening GUI
 • List / kill top CPU & memory processes
@@ -187,7 +191,18 @@ _CAPABILITIES_TEXT = """Here's what I can do on your Mac:
 • Run short bash/Python for local tasks
 • Remember notes you save in Preferences
 
-Ask me like: “open Slack”, “spotlight invoice.pdf”, “notify me when done”, or “top CPU processes”."""
+Ask me like: “turn off wifi”, “open Slack”, “dark mode”, “mute”, or “top CPU processes”."""
+
+
+_SKIP_RESPOND_RE = re.compile(
+    r"(?i)("
+    r"almost ran a system action|"
+    r"won't change power|"
+    r"don'?t need screen control|"
+    r"won'?t run a destructive|"
+    r"what would you like me to do"
+    r")"
+)
 
 
 def _parse_tool_call(text: str) -> Optional[dict[str, Any]]:
@@ -225,11 +240,13 @@ class AgentLoop:
         self.parser = parser
         self.registry = registry or ToolRegistry()
 
-    def run(self, utterance: str) -> dict[str, Any]:
+    def run(self, utterance: str, use_web: str = "auto") -> dict[str, Any]:
         """Execute tool loop; returns final payload for SSE / activity."""
         history: list[dict[str, Any]] = []
         sources: list[Any] = []
         last_text = ""
+        mode = use_web if use_web in ("auto", "on", "off") else "auto"
+        self._use_web = mode
         subtasks = _decompose_compound_request(utterance)
         compound_state = {
             "subtasks": subtasks,
@@ -247,7 +264,7 @@ class AgentLoop:
             text="Received input",
             detail="input",
             step="input",
-            tool_input={"utterance": utterance},
+            tool_input={"utterance": utterance, "use_web": mode},
         )
         event_bus.publish(
             utterance=utterance,
@@ -396,8 +413,12 @@ class AgentLoop:
                     tool_input={"text": last_text},
                     tool_output={"text": last_text},
                 )
+                # Refusals / clarifying responds are terminal — don't loop the goal critic.
+                force_done = bool(args.get("goal_done")) or bool(
+                    _SKIP_RESPOND_RE.search(last_text)
+                )
                 finished = self._attempt_finish(
-                    utterance, last_text, sources, history
+                    utterance, last_text, sources, history, force=force_done
                 )
                 if finished is not None:
                     return finished
@@ -494,8 +515,17 @@ class AgentLoop:
             if tool == "run_python":
                 if result.get("ok") and (result.get("stdout") or "").strip():
                     out = str(result["stdout"]).strip()
-                    # Math / one-liners stay as-is; otherwise format for the question.
-                    if len(out) < 80 and "\n" not in out:
+                    # Bare numeric stdout is fine for pure calc asks; for explain/Q&A
+                    # turn it into a real answer (don't stop at "0.5").
+                    if (
+                        len(out) < 80
+                        and "\n" not in out
+                        and not _is_info_question(utterance)
+                        and not re.search(
+                            r"(?i)\b(explain|define|describe|what (are|is|does)|mean)\b",
+                            utterance or "",
+                        )
+                    ):
                         finished = self._attempt_finish(
                             utterance, out, sources, history
                         )
@@ -641,6 +671,7 @@ class AgentLoop:
                 "update_user_context",
                 "modify_system_setting",
                 "control_power_management",
+                "control_mac",
                 "trigger_native_notification",
             } and result.get("ok"):
                 msg = (
@@ -654,6 +685,8 @@ class AgentLoop:
                     msg = f"Opened System Settings ({result.get('pane') or 'general'})."
                 elif tool == "open_folder":
                     msg = result.get("message") or f"Opened folder {result.get('path')}"
+                elif tool == "control_mac":
+                    msg = result.get("message") or f"Updated {result.get('feature')}."
                 elif tool == "modify_system_setting":
                     msg = (
                         f"Updated {result.get('domain')}.{result.get('key')} "
@@ -672,6 +705,14 @@ class AgentLoop:
                 if finished is not None:
                     return finished
                 continue
+
+            if tool == "control_mac" and not result.get("ok"):
+                err = str(
+                    result.get("error")
+                    or result.get("message")
+                    or "Mac control failed"
+                )
+                return self._finish(utterance, err, sources, history)
 
             # UI tools: keep looping so the agent can multi-step; only stop on hard fail.
             if tool in {"ui_snapshot", "ui_click", "ui_type", "ui_key", "ui_menu"}:
@@ -818,22 +859,42 @@ class AgentLoop:
         history: list[dict[str, Any]],
         compound_state: Optional[dict[str, Any]] = None,
     ) -> Optional[dict[str, Any]]:
-        # Heuristic shortcuts for clear patterns (saves latency on 1.5B).
+        # Only light safety shortcuts — Mac actions go through the planner (Qwen3).
+        use_web = getattr(self, "_use_web", "auto") or "auto"
         scoped = _history_since_last_subtask_boundary(history)
         if not scoped:
-            quick = _heuristic_tool(utterance)
+            quick = _safety_heuristic_tool(utterance)
             if quick:
-                return quick
+                return _apply_use_web(utterance, quick, history=history, use_web=use_web)
+            # Don't let the local model invent world facts (params, who/when, …).
+            # Search On forces the web except for greetings / meta / about-me.
+            text = (utterance or "").strip()
+            force_web = (
+                use_web == "on"
+                and text
+                and not _CHAT_RE.match(text)
+                and not _META_RE.search(text)
+                and not _ABOUT_ME_RE.search(text)
+            )
+            if use_web != "off" and (force_web or _is_factual_lookup(utterance)):
+                return {"tool": "web_search", "args": {"query": utterance}}
 
         # After discovery, force the mutating follow-up when the goal is clear.
         follow = _forced_followup(utterance, scoped or history)
         if follow:
-            return follow
+            return _apply_use_web(
+                utterance, follow, history=scoped or history, use_web=use_web
+            )
 
         raw = self.parser.plan_tool_call(utterance, history, TOOL_CATALOG)
         parsed = _parse_tool_call(raw)
         if parsed:
-            return _sanitize_planned_call(utterance, parsed)
+            return _sanitize_planned_call(
+                utterance,
+                parsed,
+                history=scoped or history,
+                use_web=use_web,
+            )
         # Fallback: if we have web context already, respond; else chat/local — not web for "yo".
         if history:
             return {
@@ -846,6 +907,11 @@ class AgentLoop:
                 "args": {
                     "text": "Hey — I'm here. What do you want to do?"
                 },
+            }
+        if use_web == "off":
+            return {
+                "tool": "respond",
+                "args": {"text": self._local_answer(utterance)},
             }
         return {"tool": "web_search", "args": {"query": utterance}}
 
@@ -888,6 +954,8 @@ class AgentLoop:
                 return f"Terminated: {names}" if names else "Termination done."
             if tool == "trigger_native_notification" and result.get("ok"):
                 return f"Notification sent: {result.get('title') or 'MacAgent'}"
+            if tool == "control_mac" and result.get("ok"):
+                return str(result.get("message") or "Done.")
             if tool == "modify_system_setting" and result.get("ok"):
                 return (
                     f"Updated {result.get('domain')}.{result.get('key')} "
@@ -921,9 +989,6 @@ class AgentLoop:
         return self._local_answer(utterance)
 
     def _local_answer(self, utterance: str) -> str:
-        math = _try_simple_math(utterance)
-        if math is not None:
-            return math
         try:
             return self.parser.generate_answer(utterance)
         except Exception:  # noqa: BLE001
@@ -1303,21 +1368,21 @@ def _identical_failure_count(history: list[dict[str, Any]]) -> int:
     return count
 
 
-def _heuristic_tool(utterance: str) -> Optional[dict[str, Any]]:
+def _safety_heuristic_tool(utterance: str) -> Optional[dict[str, Any]]:
+    """Minimal fast-path only — greetings, help, notes, math, hard power/trash.
+
+    Everything else (wifi, open app, mute, search, …) is planned by the LLM.
+    """
     text = (utterance or "").strip()
-    lower = text.lower()
     if not text:
         return None
 
-    # Capability / help questions — never run UI automation for these.
     if _META_RE.search(text):
         return {"tool": "respond", "args": {"text": _CAPABILITIES_TEXT}}
 
-    # “What do you know about me?” — use Preferences notes, not a flaky web refuse.
     if _ABOUT_ME_RE.search(text):
         return {"tool": "__answer_about_user__", "args": {}}
 
-    # Greetings / small talk — never invent tools.
     if _CHAT_RE.match(text):
         return {
             "tool": "respond",
@@ -1326,10 +1391,66 @@ def _heuristic_tool(utterance: str) -> Optional[dict[str, Any]]:
             },
         }
 
-    # Simple arithmetic — answer locally, skip web search.
-    math = _try_simple_math(text)
-    if math is not None and re.search(r"(?i)[\+\-\*\/x×÷]", text):
-        return {"tool": "respond", "args": {"text": math}}
+    # Confirm-gated destructive actions — keep deterministic for safety.
+    if re.search(
+        r"(?i)\b("
+        r"empty\s+(the\s+)?(bin|trash|rubbish)|"
+        r"clear\s+(the\s+)?(bin|trash)|"
+        r"delete\s+(everything|all)\s+in\s+(the\s+)?(bin|trash)|"
+        r"take\s+out\s+(the\s+)?(bin|trash)"
+        r")\b",
+        text,
+    ):
+        return {
+            "tool": "run_bash",
+            "args": {"command": empty_trash_command()},
+        }
+
+    if re.search(
+        r"(?i)("
+        r"\b(shut\s*down|turn\s+off|power\s+off)\b.+\b(mac|pc|computer|machine|system)\b|"
+        r"\b(shut\s*down|turn\s+off|power\s+off)\s+(my\s+)?(mac|pc|computer|machine|system)\b|"
+        r"^(please\s+)?(can\s+you\s+)?(shut\s*down|turn\s+off|power\s+off)(\s+now)?\s*[.!]?\s*$"
+        r")",
+        text,
+    ):
+        return {"tool": "run_bash", "args": {"command": shutdown_command()}}
+    if re.search(
+        r"(?i)("
+        r"\b(restart|reboot)\b.+\b(mac|pc|computer|machine|system)\b|"
+        r"\b(restart|reboot)\s+(my\s+)?(mac|pc|computer|machine|system)\b"
+        r")",
+        text,
+    ):
+        return {"tool": "run_bash", "args": {"command": restart_command()}}
+    if re.search(
+        r"(?i)\b("
+        r"put\s+(the\s+|my\s+)?(mac|pc|computer|machine)\s+to\s+sleep|"
+        r"sleep\s+(my\s+)?(mac|pc|computer|machine)|"
+        r"go\s+to\s+sleep"
+        r")\b",
+        text,
+    ):
+        return {"tool": "run_bash", "args": {"command": sleep_command()}}
+
+    return None
+
+
+def _heuristic_tool(utterance: str) -> Optional[dict[str, Any]]:
+    """Legacy full heuristic map — kept for sanitize remaps / tests, not the main loop."""
+    text = (utterance or "").strip()
+    lower = text.lower()
+    if not text:
+        return None
+
+    safety = _safety_heuristic_tool(text)
+    if safety:
+        return safety
+
+    # Common Mac toggles (wifi / bluetooth / mute / dark mode).
+    control = _control_mac_heuristic(text)
+    if control:
+        return control
 
     # Close / quit / kill an app or browser (before planner can invent pmset).
     close_call = _close_app_heuristic(text)
@@ -1444,57 +1565,13 @@ def _heuristic_tool(utterance: str) -> Optional[dict[str, Any]]:
         if q:
             return {"tool": "spotlight_file_search", "args": {"query": q}}
 
-    # Explicit code / compute — model will write Python via generate path.
+    # Explicit "write/run python code" — not every word like calculate in notes.
     if re.search(
         r"(?i)\b(write|run|execute)\b.+\b(code|script|python|program)\b|"
-        r"\b(calculate|compute|evaluate|factorial|fibonacci|prime|"
-        r"sort this|parse json|regex)\b",
+        r"\b(factorial|fibonacci|prime|sort this|parse json|regex)\b",
         text,
     ):
         return {"tool": "__write_and_run_python__", "args": {}}
-
-    # Empty Trash / Bin — never /bin; always goes through confirm gate.
-    if re.search(
-        r"(?i)\b("
-        r"empty\s+(the\s+)?(bin|trash|rubbish)|"
-        r"clear\s+(the\s+)?(bin|trash)|"
-        r"delete\s+(everything|all)\s+in\s+(the\s+)?(bin|trash)|"
-        r"take\s+out\s+(the\s+)?(bin|trash)"
-        r")\b",
-        text,
-    ):
-        return {
-            "tool": "run_bash",
-            "args": {"command": empty_trash_command()},
-        }
-
-    # Power actions — only when clearly requested (never invent from "yo").
-    if re.search(
-        r"(?i)("
-        r"\b(shut\s*down|turn\s+off|power\s+off)\b.+\b(mac|pc|computer|machine|system)\b|"
-        r"\b(shut\s*down|turn\s+off|power\s+off)\s+(my\s+)?(mac|pc|computer|machine|system)\b|"
-        r"^(please\s+)?(can\s+you\s+)?(shut\s*down|turn\s+off|power\s+off)(\s+now)?\s*[.!]?\s*$"
-        r")",
-        text,
-    ):
-        return {"tool": "run_bash", "args": {"command": shutdown_command()}}
-    if re.search(
-        r"(?i)("
-        r"\b(restart|reboot)\b.+\b(mac|pc|computer|machine|system)\b|"
-        r"\b(restart|reboot)\s+(my\s+)?(mac|pc|computer|machine|system)\b"
-        r")",
-        text,
-    ):
-        return {"tool": "run_bash", "args": {"command": restart_command()}}
-    if re.search(
-        r"(?i)\b("
-        r"put\s+(the\s+|my\s+)?(mac|pc|computer|machine)\s+to\s+sleep|"
-        r"sleep\s+(my\s+)?(mac|pc|computer|machine)|"
-        r"go\s+to\s+sleep"
-        r")\b",
-        text,
-    ):
-        return {"tool": "run_bash", "args": {"command": sleep_command()}}
 
     # Recently downloaded / Downloads — bash, not a special-case tool.
     if re.search(
@@ -1627,9 +1704,29 @@ def _heuristic_tool(utterance: str) -> Optional[dict[str, Any]]:
             target = m.group(2).strip().rstrip(".?!")
             if target and not re.match(r"(?i)^source(d)?\b", target):
                 if "setting" in target.lower() or "preference" in target.lower():
+                    pane = "general"
+                    tl = target.lower()
+                    for key in (
+                        "wifi",
+                        "bluetooth",
+                        "accessibility",
+                        "privacy",
+                        "network",
+                        "keyboard",
+                        "displays",
+                        "sound",
+                        "battery",
+                        "notifications",
+                        "spotlight",
+                    ):
+                        if key in tl:
+                            pane = key
+                            break
+                    if "wi-fi" in tl or "wi fi" in tl:
+                        pane = "wifi"
                     return {
                         "tool": "open_system_settings",
-                        "args": {"pane": "general"},
+                        "args": {"pane": pane},
                     }
                 opened = _heuristic_open_target(target)
                 if opened:
@@ -1660,6 +1757,100 @@ def load_notes_safe() -> str:
         return ""
 
 
+def _control_mac_heuristic(utterance: str) -> Optional[dict[str, Any]]:
+    """Deterministic Wi‑Fi / Bluetooth / volume / appearance toggles."""
+    text = (utterance or "").strip()
+    if not text:
+        return None
+
+    # Don't steal "open wifi settings" — that path uses open_system_settings.
+    if _is_open_action(text) and re.search(
+        r"(?i)\b(settings?|preferences?|pane)\b", text
+    ):
+        return None
+
+    # Wi‑Fi
+    if re.search(r"(?i)\b(wi-?fi|wifi|wireless(\s+network)?|airport)\b", text):
+        if re.search(r"(?i)\b(turn|switch|put)\s+off\b|\bdisable\b|\bshut\s*off\b", text):
+            return {"tool": "control_mac", "args": {"feature": "wifi", "state": "off"}}
+        if re.search(r"(?i)\b(turn|switch|put)\s+on\b|\benable\b", text):
+            return {"tool": "control_mac", "args": {"feature": "wifi", "state": "on"}}
+        if re.search(r"(?i)\b(toggle|flip)\b", text):
+            return {
+                "tool": "control_mac",
+                "args": {"feature": "wifi", "state": "toggle"},
+            }
+
+    # Bluetooth
+    if re.search(r"(?i)\b(bluetooth|blue\s*tooth)\b", text):
+        if re.search(r"(?i)\b(turn|switch|put)\s+off\b|\bdisable\b|\bshut\s*off\b", text):
+            return {
+                "tool": "control_mac",
+                "args": {"feature": "bluetooth", "state": "off"},
+            }
+        if re.search(r"(?i)\b(turn|switch|put)\s+on\b|\benable\b", text):
+            return {
+                "tool": "control_mac",
+                "args": {"feature": "bluetooth", "state": "on"},
+            }
+        if re.search(r"(?i)\b(toggle|flip)\b", text):
+            return {
+                "tool": "control_mac",
+                "args": {"feature": "bluetooth", "state": "toggle"},
+            }
+
+    # Volume mute / unmute / set level
+    if re.search(r"(?i)\bunmute\b", text) or re.search(
+        r"(?i)\b(turn|switch)\s+(the\s+)?(volume|sound)\s+on\b", text
+    ):
+        return {"tool": "control_mac", "args": {"feature": "volume", "state": "unmute"}}
+    if re.search(r"(?i)\bmute\b", text) or re.search(
+        r"(?i)\b(turn|switch)\s+(the\s+)?(volume|sound)\s+off\b", text
+    ):
+        return {"tool": "control_mac", "args": {"feature": "volume", "state": "mute"}}
+    vol_m = re.search(
+        r"(?i)\b(set|change)\s+(the\s+)?(volume|sound)\s+(to\s+)?(?P<n>\d{1,3})\s*%?",
+        text,
+    )
+    if vol_m:
+        return {
+            "tool": "control_mac",
+            "args": {"feature": "volume", "state": vol_m.group("n")},
+        }
+
+    # Appearance
+    if re.search(r"(?i)\b(dark\s*mode|dark\s*theme)\b", text):
+        if re.search(r"(?i)\b(turn|switch|put)\s+off\b|\bdisable\b|\blight\b", text):
+            return {
+                "tool": "control_mac",
+                "args": {"feature": "appearance", "state": "light"},
+            }
+        return {"tool": "control_mac", "args": {"feature": "appearance", "state": "dark"}}
+    if re.search(r"(?i)\b(light\s*mode|light\s*theme)\b", text):
+        return {
+            "tool": "control_mac",
+            "args": {"feature": "appearance", "state": "light"},
+        }
+    if re.search(r"(?i)\b(toggle|switch)\s+(the\s+)?(appearance|theme)\b", text):
+        return {
+            "tool": "control_mac",
+            "args": {"feature": "appearance", "state": "toggle"},
+        }
+
+    return None
+
+
+def _refuse_system_action(utterance: str, message: str) -> dict[str, Any]:
+    """On a wrong planned tool, remap to a real heuristic action when possible."""
+    remapped = _control_mac_heuristic(utterance) or _close_app_heuristic(utterance)
+    if remapped:
+        return remapped
+    return {
+        "tool": "respond",
+        "args": {"text": message, "goal_done": True},
+    }
+
+
 def _command_is_destructive(command: str) -> bool:
     from tools.run_bash import classify_command
 
@@ -1667,12 +1858,43 @@ def _command_is_destructive(command: str) -> bool:
 
 
 def _sanitize_planned_call(
-    utterance: str, call: dict[str, Any]
+    utterance: str,
+    call: dict[str, Any],
+    history: Optional[list[dict[str, Any]]] = None,
+    use_web: str = "auto",
 ) -> dict[str, Any]:
     """Block hallucinated destructive / UI tools on casual chat."""
     tool = (call.get("tool") or "").strip()
     args = call.get("args") if isinstance(call.get("args"), dict) else {}
     text = (utterance or "").strip()
+    hist = history or []
+    mode = use_web if use_web in ("auto", "on", "off") else "auto"
+
+    # Factual lookups must search before respond / run_python hallucinations.
+    if (
+        mode != "off"
+        and _is_factual_lookup(text)
+        and tool in {"respond", "run_python"}
+    ):
+        if not any((h.get("call") or {}).get("tool") == "web_search" for h in hist):
+            return {"tool": "web_search", "args": {"query": text}}
+
+    if mode == "on" and tool == "respond" and not _CHAT_RE.match(text):
+        if not any((h.get("call") or {}).get("tool") == "web_search" for h in hist):
+            if not _META_RE.search(text):
+                return {"tool": "web_search", "args": {"query": text}}
+
+    if mode == "off" and tool == "web_search":
+        return {
+            "tool": "respond",
+            "args": {
+                "text": (
+                    "Web search is off for this ask. "
+                    "Turn Search to Auto or On, or ask me to do something local."
+                ),
+                "goal_done": True,
+            },
+        }
 
     if _CHAT_RE.match(text) or _META_RE.search(text):
         if tool != "respond":
@@ -1681,7 +1903,8 @@ def _sanitize_planned_call(
             return {
                 "tool": "respond",
                 "args": {
-                    "text": "Hey — I'm MacAgent. Ask me anything, or say “what can you do?”"
+                    "text": "Hey — I'm MacAgent. Ask me anything, or say “what can you do?”",
+                    "goal_done": True,
                 },
             }
 
@@ -1694,18 +1917,50 @@ def _sanitize_planned_call(
     }:
         return {"tool": "__answer_about_user__", "args": {}}
 
-    if tool == "run_bash":
-        cmd = str(args.get("command") or "")
-        if _command_is_destructive(cmd) and not _DESTRUCTIVE_UTTERANCE_RE.search(text):
+    # Prefer deterministic Mac toggles over whatever the small planner invented.
+    if tool != "control_mac":
+        control = _control_mac_heuristic(text)
+        if control and tool in {
+            "control_power_management",
+            "modify_system_setting",
+            "manage_system_resources",
+            "run_bash",
+            "open_system_settings",
+            "ui_snapshot",
+            "ui_click",
+            "ui_type",
+            "ui_key",
+            "ui_menu",
+        }:
+            return control
+
+    # Never allow control_mac unless the utterance clearly asks for that toggle.
+    # IQ2/small planners invent "dark mode" from catalog examples on unrelated Q&A.
+    if tool == "control_mac":
+        expected = _control_mac_heuristic(text)
+        if not expected:
+            if mode != "off" and _is_info_question(text):
+                return {"tool": "web_search", "args": {"query": text}}
             return {
                 "tool": "respond",
                 "args": {
                     "text": (
-                        "I almost ran a system action you didn't ask for — skipped it. "
-                        "What would you like me to do?"
-                    )
+                        "I won't change Wi‑Fi / volume / appearance unless you ask "
+                        "(e.g. “dark mode”, “mute”, “turn off wifi”)."
+                    ),
+                    "goal_done": True,
                 },
             }
+        return expected
+
+    if tool == "run_bash":
+        cmd = str(args.get("command") or "")
+        if _command_is_destructive(cmd) and not _DESTRUCTIVE_UTTERANCE_RE.search(text):
+            return _refuse_system_action(
+                text,
+                "I almost ran a system action you didn't ask for — skipped it. "
+                "What would you like me to do?",
+            )
 
     if tool in {"ui_snapshot", "ui_click", "ui_type", "ui_key", "ui_menu"}:
         if not _is_action_request(text) or _CHAT_RE.match(text):
@@ -1715,7 +1970,8 @@ def _sanitize_planned_call(
                     "text": (
                         "I don't need screen control for that. "
                         "Ask a question or tell me what to open/do."
-                    )
+                    ),
+                    "goal_done": True,
                 },
             }
 
@@ -1725,34 +1981,35 @@ def _sanitize_planned_call(
         "control_power_management",
         "manage_system_resources",
         "trigger_native_notification",
+        "control_mac",
     }:
         if _CHAT_RE.match(text) or (
             tool == "manage_system_resources"
             and str(args.get("action") or "").lower() == "kill"
             and not re.search(r"(?i)\b(kill|quit|force[\s-]?quit|terminate|close)\b", text)
         ):
-            return {
-                "tool": "respond",
-                "args": {
-                    "text": (
-                        "I almost ran a system action you didn't ask for — skipped it. "
-                        "What would you like me to do?"
-                    )
-                },
-            }
+            return _refuse_system_action(
+                text,
+                "I almost ran a system action you didn't ask for — skipped it. "
+                "What would you like me to do?",
+            )
 
     # Catalog-example hijack: pmset / defaults only when the user asked for that.
     if tool == "control_power_management" and not _POWER_UTTERANCE_RE.search(text):
         close = _close_app_heuristic(text)
         if close:
             return close
+        control = _control_mac_heuristic(text)
+        if control:
+            return control
         return {
             "tool": "respond",
             "args": {
                 "text": (
                     "I won't change power/sleep settings unless you ask for that. "
                     "If you meant to close an app, say e.g. “close Chrome”."
-                )
+                ),
+                "goal_done": True,
             },
         }
 
@@ -1760,6 +2017,11 @@ def _sanitize_planned_call(
         close = _close_app_heuristic(text)
         if close:
             return close
+        control = _control_mac_heuristic(text)
+        if control:
+            return control
+        if mode != "off" and _is_info_question(text):
+            return {"tool": "web_search", "args": {"query": text}}
         if re.search(r"(?i)\b(close|quit|kill)\b", text):
             return {
                 "tool": "respond",
@@ -1767,9 +2029,74 @@ def _sanitize_planned_call(
                     "text": (
                         "To close an app, ask me to quit it by name "
                         "(e.g. “close Chrome”) — I won't change system prefs for that."
-                    )
+                    ),
+                    "goal_done": True,
                 },
             }
+
+    # Info questions must not run Mac mutation tools the planner invents.
+    if _is_info_question(text) and tool in {
+        "modify_system_setting",
+        "control_power_management",
+        "manage_system_resources",
+        "open_system_settings",
+        "ui_snapshot",
+        "ui_click",
+        "ui_type",
+        "ui_key",
+        "ui_menu",
+    }:
+        if mode == "off":
+            return {
+                "tool": "respond",
+                "args": {
+                    "text": (
+                        "Web search is off for this ask. "
+                        "Turn Search to Auto or On to look that up online."
+                    ),
+                    "goal_done": True,
+                },
+            }
+        return {"tool": "web_search", "args": {"query": text}}
+
+    return _apply_use_web(
+        utterance,
+        {"tool": tool, "args": args},
+        history=hist,
+        use_web=mode,
+    )
+
+
+def _apply_use_web(
+    utterance: str,
+    call: dict[str, Any],
+    *,
+    history: Optional[list[dict[str, Any]]] = None,
+    use_web: str = "auto",
+) -> dict[str, Any]:
+    """Honor overlay Search chip: auto | on | off."""
+    mode = use_web if use_web in ("auto", "on", "off") else "auto"
+    tool = (call.get("tool") or "").strip()
+    text = (utterance or "").strip()
+    hist = history or []
+
+    if mode == "off" and tool == "web_search":
+        return {
+            "tool": "respond",
+            "args": {
+                "text": (
+                    "Web search is off for this ask. "
+                    "Turn Search to Auto or On, or ask me to do something local."
+                ),
+                "goal_done": True,
+            },
+        }
+
+    if mode == "on" and tool == "respond" and text and not _CHAT_RE.match(text):
+        if _META_RE.search(text) or _ABOUT_ME_RE.search(text):
+            return call
+        if not any((h.get("call") or {}).get("tool") == "web_search" for h in hist):
+            return {"tool": "web_search", "args": {"query": text}}
 
     return call
 
@@ -1813,6 +2140,7 @@ def _history_has_successful_mutation(history: list[dict[str, Any]]) -> bool:
             "open_system_settings",
             "modify_system_setting",
             "control_power_management",
+            "control_mac",
             "trigger_native_notification",
         }:
             if result.get("ok"):
@@ -1973,6 +2301,25 @@ def _goal_status(
         ):
             return "incomplete"
         return "unknown"
+
+    # Wi‑Fi / Bluetooth / mute / appearance — done once control_mac succeeds.
+    if re.search(
+        r"(?i)\b("
+        r"wi-?fi|wifi|bluetooth|mute|unmute|"
+        r"dark\s*mode|light\s*mode|appearance|theme"
+        r")\b",
+        text,
+    ) and re.search(
+        r"(?i)\b(turn|switch|put|enable|disable|toggle|set|mute|unmute)\b",
+        text,
+    ):
+        if any(
+            (h.get("call") or {}).get("tool") == "control_mac"
+            and (h.get("result") or {}).get("ok")
+            for h in history
+        ):
+            return "done"
+        return "incomplete"
 
     return "unknown"
 
@@ -2443,6 +2790,57 @@ def _is_open_action(utterance: str) -> bool:
     return bool(_OPEN_RE.search(cleaned))
 
 
+def _is_factual_lookup(utterance: str) -> bool:
+    """True when the answer needs live/world knowledge, not local invention."""
+    text = (utterance or "").strip()
+    if not text or not _is_info_question(text):
+        return False
+    # Explaining pasted notes / definitions — local model can use the paste.
+    if re.search(r"(?i)\b(explain|define|describe)\b.+\b(these|this|above|following)\b", text):
+        return False
+    if len(text) > 280 and re.search(r"(?i)\b(explain|define|describe)\b", text):
+        return False
+    return bool(
+        re.search(
+            r"(?i)\b("
+            r"how many|how much|how (big|large|old|tall|wide)|"
+            r"who (made|created|developed|founded|owns|wrote|invented)|"
+            r"when (was|were|did|is|are)|"
+            r"where (is|was|are)|"
+            r"parameter|params?|billion|million|"
+            r"gpt-?\s*\d|chatgpt|llama|claude|gemini|qwen|mistral|"
+            r"population|capital of|released|founded|"
+            r"current (time|price|weather|score|news)|"
+            r"latest|who won|what time"
+            r")\b",
+            text,
+        )
+    )
+
+
+def _is_info_question(utterance: str) -> bool:
+    """True for factual / conversational questions that should not mutate the Mac."""
+    text = (utterance or "").strip()
+    if not text:
+        return False
+    if _CHAT_RE.match(text) or _META_RE.search(text):
+        return False
+    # Explicit Mac toggles are not "info questions".
+    if _control_mac_heuristic(text) or _close_app_heuristic(text):
+        return False
+    if re.search(
+        r"(?i)^\s*(what|whats|what's|why|who|when|where|which|whose|whom|"
+        r"how\s+(much|many|long|far|old|come)|"
+        r"is\s+there|are\s+there|tell\s+me|explain|define|"
+        r"what\s+time|whats?\s+time|current\s+time)\b",
+        text,
+    ):
+        return True
+    if text.endswith("?") and not _is_action_request(text):
+        return True
+    return False
+
+
 def _is_action_request(utterance: str) -> bool:
     """True when the user wants something done on the Mac, not just answered."""
     text = (utterance or "").strip()
@@ -2526,24 +2924,3 @@ def _friendly_ls_answer(utterance: str, stdout: str) -> Optional[str]:
         prefix = "[folder] " if kind == "folder" else ""
         lines.append(f"{i}. {prefix}{name}  ·  {when}")
     return "\n".join(lines)
-
-
-_MATH_EXPR_RE = re.compile(r"(?i)(\d+)\s*([\+\-\*\/x×÷])\s*(\d+)")
-
-
-def _try_simple_math(text: str) -> Optional[str]:
-    m = _MATH_EXPR_RE.search(text or "")
-    if not m:
-        return None
-    a, op, b = int(m.group(1)), m.group(2), int(m.group(3))
-    if op in {"x", "X", "×", "*"}:
-        return str(a * b)
-    if op in {"÷", "/"}:
-        if b == 0:
-            return "undefined (division by zero)"
-        return str(a / b if a % b else a // b)
-    if op == "+":
-        return str(a + b)
-    if op == "-":
-        return str(a - b)
-    return None
