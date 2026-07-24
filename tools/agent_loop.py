@@ -410,101 +410,132 @@ class AgentLoop:
                         for c in (env.get("commands") or [])
                         if str(c).strip()
                     ][:5]
-
-                    for cmd in commands:
-                        if _command_is_destructive(
-                            cmd
-                        ) and not _DESTRUCTIVE_UTTERANCE_RE.search(utterance or ""):
-                            clear_cloud_handoff()
-                            return self._finish(
-                                utterance,
-                                "Cloud suggested a destructive command I won't run "
-                                "unless you explicitly ask (e.g. delete / empty trash). "
-                                f"Guidance was: {guidance or cmd}",
-                                sources,
-                                history,
-                            )
-                        call = {"tool": "run_bash", "args": {"command": cmd}}
-                        event_bus.publish(
-                            utterance=utterance,
-                            kind="trace",
-                            text="Calling run_bash",
-                            detail="tool_call",
-                            step="tool_call",
-                            tool="run_bash",
-                            tool_input={"command": cmd},
-                        )
+                    # Opening news sites is not research — drop browser opens.
+                    if any(_is_browser_open_command(c) for c in commands):
+                        commands = [
+                            c for c in commands if not _is_browser_open_command(c)
+                        ]
+                    # Pure web-research asks with no local shell work → web_search loop.
+                    if (
+                        mode != "off"
+                        and _needs_web_research(utterance)
+                        and not commands
+                    ):
+                        clear_cloud_handoff()
                         event_bus.publish(
                             utterance=utterance,
                             kind="action",
-                            text="Tool: run_bash",
+                            text="Searching the web…",
                             detail="pending",
                         )
-                        result = self.registry.run("run_bash", {"command": cmd})
-                        history.append({"call": call, "result": result})
-                        trace_step(
-                            "agent_tool_result",
-                            step=len(history) - 1,
-                            tool="run_bash",
-                            result=_trim(result),
-                            cloud_handoff=True,
-                        )
+                        narrate("researching")
+                        # Fall through to the tool loop (web_search).
+                    elif commands:
+                        for cmd in commands:
+                            if _command_is_destructive(
+                                cmd
+                            ) and not _DESTRUCTIVE_UTTERANCE_RE.search(
+                                utterance or ""
+                            ):
+                                clear_cloud_handoff()
+                                return self._finish(
+                                    utterance,
+                                    "Cloud suggested a destructive command I won't run "
+                                    "unless you explicitly ask (e.g. delete / empty trash). "
+                                    f"Guidance was: {guidance or cmd}",
+                                    sources,
+                                    history,
+                                )
+                            call = {"tool": "run_bash", "args": {"command": cmd}}
+                            event_bus.publish(
+                                utterance=utterance,
+                                kind="trace",
+                                text="Calling run_bash",
+                                detail="tool_call",
+                                step="tool_call",
+                                tool="run_bash",
+                                tool_input={"command": cmd},
+                            )
+                            event_bus.publish(
+                                utterance=utterance,
+                                kind="action",
+                                text="Tool: run_bash",
+                                detail="pending",
+                            )
+                            result = self.registry.run("run_bash", {"command": cmd})
+                            history.append({"call": call, "result": result})
+                            trace_step(
+                                "agent_tool_result",
+                                step=len(history) - 1,
+                                tool="run_bash",
+                                result=_trim(result),
+                                cloud_handoff=True,
+                            )
+                            event_bus.publish(
+                                utterance=utterance,
+                                kind="trace",
+                                text="run_bash → output",
+                                detail="tool_result",
+                                step="tool_result",
+                                tool="run_bash",
+                                tool_input={"command": cmd},
+                                tool_output=_trim(result),
+                            )
+                            if result.get("needs_confirm"):
+                                return self._request_confirm(
+                                    utterance,
+                                    command=str(result.get("command") or cmd),
+                                    summary=str(
+                                        result.get("summary") or guidance or cmd
+                                    ),
+                                    sources=sources,
+                                    history=history,
+                                )
+
+                        # If commands produced useful stdout, answer from that and stop.
+                        bash_outs: list[tuple[str, str]] = []
+                        for item in history:
+                            call = item.get("call") or {}
+                            result = item.get("result") or {}
+                            if call.get("tool") != "run_bash":
+                                continue
+                            out = (result.get("stdout") or "").strip()
+                            if result.get("ok") and out:
+                                bash_outs.append(
+                                    (
+                                        str(
+                                            (call.get("args") or {}).get("command")
+                                            or ""
+                                        ),
+                                        out,
+                                    )
+                                )
+                        if bash_outs:
+                            cmd, out = bash_outs[-1]
+                            text = self._format_command_answer(utterance, cmd, out)
+                            if guidance and text and len(out) < 80:
+                                text = f"{text}\n\n({guidance[:240]})"
+                            clear_cloud_handoff()
+                            return self._finish(
+                                utterance, text or out, sources, history
+                            )
+
+                        # No usable command output — continue into the local planner.
                         event_bus.publish(
                             utterance=utterance,
-                            kind="trace",
-                            text="run_bash → output",
-                            detail="tool_result",
-                            step="tool_result",
-                            tool="run_bash",
-                            tool_input={"command": cmd},
-                            tool_output=_trim(result),
+                            kind="action",
+                            text="Planning with cloud guidance…",
+                            detail="pending",
                         )
-                        if result.get("needs_confirm"):
-                            return self._request_confirm(
-                                utterance,
-                                command=str(result.get("command") or cmd),
-                                summary=str(
-                                    result.get("summary") or guidance or cmd
-                                ),
-                                sources=sources,
-                                history=history,
-                            )
-
-                    # If commands produced useful stdout, answer from that and stop.
-                    bash_outs: list[tuple[str, str]] = []
-                    for item in history:
-                        call = item.get("call") or {}
-                        result = item.get("result") or {}
-                        if call.get("tool") != "run_bash":
-                            continue
-                        out = (result.get("stdout") or "").strip()
-                        if result.get("ok") and out:
-                            bash_outs.append(
-                                (
-                                    str(
-                                        (call.get("args") or {}).get("command") or ""
-                                    ),
-                                    out,
-                                )
-                            )
-                    if bash_outs:
-                        cmd, out = bash_outs[-1]
-                        text = self._format_command_answer(utterance, cmd, out)
-                        if guidance and text and len(out) < 80:
-                            text = f"{text}\n\n({guidance[:240]})"
-                        clear_cloud_handoff()
-                        return self._finish(
-                            utterance, text or out, sources, history
+                        narrate("planning")
+                    else:
+                        event_bus.publish(
+                            utterance=utterance,
+                            kind="action",
+                            text="Planning…",
+                            detail="pending",
                         )
-
-                    # No usable command output — continue into the local planner.
-                    event_bus.publish(
-                        utterance=utterance,
-                        kind="action",
-                        text="Planning with cloud guidance…",
-                        detail="pending",
-                    )
-                    narrate("planning")
+                        narrate("planning")
                 else:
                     # Local-only knowledge path — no planner/catalog burn.
                     event_bus.publish(
@@ -1284,6 +1315,18 @@ class AgentLoop:
                         if finished is not None:
                             return finished
                         continue
+                    # Opening a URL in Safari is not an answer to a research ask.
+                    if _is_browser_open_command(cmd) and (
+                        _needs_web_research(utterance)
+                        or _utterance_wants_web_search(utterance)
+                    ):
+                        event_bus.publish(
+                            utterance=utterance,
+                            kind="action",
+                            text="Searching the web…",
+                            detail="pending",
+                        )
+                        continue
                     text = "Done." if not cmd else f"Done (`{cmd}`)."
                     finished = self._attempt_finish(
                         active, text, sources, history
@@ -1586,8 +1629,12 @@ class AgentLoop:
                 cloud_ok = self.parser._cloud.should_use_cloud(utterance)
             except Exception:  # noqa: BLE001
                 cloud_ok = False
-            if use_web != "off" and (force_web or _is_factual_lookup(utterance)):
-                if cloud_ok and use_web != "on":
+            if use_web != "off" and (
+                force_web
+                or _is_factual_lookup(utterance)
+                or _needs_web_research(utterance)
+            ):
+                if cloud_ok and use_web != "on" and not _needs_web_research(utterance):
                     return {
                         "tool": "respond",
                         "args": {"text": self._local_answer(utterance)},
@@ -1729,6 +1776,9 @@ class AgentLoop:
             pass
         text = (utterance or "").strip()
         if not text:
+            return False
+        # Live web research (news, announcements, citations) → web_search tool loop.
+        if mode != "off" and _needs_web_research(text):
             return False
         # Live Mac / filesystem / UI asks stay on the tool loop.
         try:
@@ -2982,6 +3032,15 @@ def _sanitize_planned_call(
                     return {"tool": tool, "args": merged}
                 break
 
+    # Misrouted open-URL on a research ask → web_search.
+    if (
+        tool == "run_bash"
+        and _is_browser_open_command(str(args.get("command") or ""))
+        and mode != "off"
+        and (_needs_web_research(text) or _utterance_wants_web_search(text))
+    ):
+        return {"tool": "web_search", "args": {"query": text}}
+
     # On-disk Downloads / files must run locally — never cloud inventing "I ran ls".
     # Do not force a canned "latest download" command; let the planner/bash writer decide.
     if tool in {"respond", "web_search"} and re.search(
@@ -3610,14 +3669,43 @@ def _utterance_wants_web_search(text: str) -> bool:
     return bool(
         re.search(
             r"(?i)\b("
-            r"search\s+(the\s+)?web|look\s+up\s+online|google|"
-            r"latest|current\s+stable|newest\s+(stable\s+)?(release|version)|"
+            r"search\s+(the\s+)?web|search\s+for|look\s+up(\s+online)?|google|"
+            r"latest|recent\s+(announcements?|news|releases?)|"
+            r"current\s+stable|newest\s+(stable\s+)?(release|version)|"
             r"what('?s|\s+is)\s+the\s+latest|"
-            r"from\s+the\s+(web|internet)|online\b"
+            r"from\s+the\s+(web|internet)|online\b|"
+            r"last\s+\d+\s+(hours?|days?)|past\s+\d+\s+(hours?|days?)|"
+            r"with\s+(direct\s+)?(inline\s+)?citations?|"
+            r"news\s+(about|on|regarding)"
             r")\b",
             text or "",
         )
     )
+
+
+def _needs_web_research(text: str) -> bool:
+    """True when the ask needs live web results (not opening Safari tabs)."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if _utterance_wants_web_search(t):
+        return True
+    return bool(
+        re.search(
+            r"(?i)\b("
+            r"announcements?|press\s+release|model\s+releases?|"
+            r"hardware\s+releases?|summarize.{0,40}(news|announcements?)|"
+            r"provide\s+a\s+summary.{0,40}citations?"
+            r")\b",
+            t,
+        )
+    )
+
+
+def _is_browser_open_command(command: str) -> bool:
+    """True for ``open https://…`` / ``open http://…`` (opens Safari, no research)."""
+    cmd = (command or "").strip()
+    return bool(re.match(r"(?i)^open\s+(https?://|www\.)", cmd))
 
 
 def _preferred_local_check_command(text: str) -> Optional[str]:
@@ -4489,10 +4577,13 @@ def _is_info_question(utterance: str) -> bool:
     # Explicit Mac toggles are not "info questions".
     if _control_mac_heuristic(text) or _close_app_heuristic(text):
         return False
+    if _needs_web_research(text):
+        return True
     if re.search(
         r"(?i)^\s*(what|whats|what's|why|who|when|where|which|whose|whom|"
         r"how\s+(much|many|long|far|old|come)|"
         r"is\s+there|are\s+there|tell\s+me|explain|define|"
+        r"search\s+for|find\s+(recent|latest)|provide\s+a\s+summary|"
         r"what\s+time|whats?\s+time|current\s+time)\b",
         text,
     ):
