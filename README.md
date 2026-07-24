@@ -242,7 +242,8 @@ git push origin main --tags
 | `llm/inference.py` | Local GGUF planner / answers |
 | `llm/cloud.py` | Optional OpenAI-compatible cloud |
 | `automation/` | setup, DMG build, dev scripts |
-| `config/settings.json` | Model path, TTS, port, cloud |
+| `config/settings.example.json` | Template settings (copy → `settings.json`, gitignored) |
+| `config/settings.json` | Local model path, TTS, port, cloud API key *(not in git)* |
 | `CHANGELOG.md` | Release notes |
 
 The older `MacAgent/` Dock UI is **deprecated** — use `MacAgentApp/`.

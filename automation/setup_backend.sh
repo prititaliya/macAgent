@@ -46,6 +46,11 @@ else
 fi
 
 SETTINGS="$ROOT/config/settings.json"
+EXAMPLE="$ROOT/config/settings.example.json"
+if [[ ! -f "$SETTINGS" && -f "$EXAMPLE" ]]; then
+  cp "$EXAMPLE" "$SETTINGS"
+  echo "==> Created config/settings.json from settings.example.json"
+fi
 if [[ -f "$SETTINGS" ]]; then
   python3 - <<PY
 import json, os

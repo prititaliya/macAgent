@@ -9,3 +9,6 @@ MacAgentApp/DerivedData/
 /tmp/MacAgentDerived/
 dist/
 MacAgentApp/DerivedDataRelease/
+
+# Local secrets / machine paths (copy from settings.example.json)
+config/settings.json
