@@ -617,7 +617,17 @@ class AgentLoop:
                 )
                 if self.parser._cloud.cloud_ready():
                     narrate("thinking")
-                command = self.parser.generate_bash(utterance)
+                # Prefer an explicit next_hint / prior plan over regenerating.
+                hinted = _command_from_goal_hints(history)
+                command = hinted or self.parser.generate_bash(utterance)
+                if not (command or "").strip():
+                    return self._finish(
+                        utterance,
+                        "I couldn't build a safe shell command for that. "
+                        "Try naming the exact folder path (e.g. ~/Documents/…).",
+                        sources,
+                        history,
+                    )
                 call = {"tool": "run_bash", "args": {"command": command}}
                 tool = "run_bash"
                 args = {"command": command}
@@ -1025,28 +1035,40 @@ class AgentLoop:
                     continue
                 # Empty stdout + stderr (e.g. GNU -printf on macOS) is a failure, not "Done".
                 if err and not out:
-                    # Broken quoting / shell syntax → ask cloud (sanitized) for a rewrite once.
+                    # Broken quoting / shell syntax → prefer a known-good rewrite
+                    # before asking cloud (cloud often returns empty).
                     if re.search(
                         r"(?i)syntax error|unexpected token|unmatched|parse error",
                         err,
                     ) and not any(
                         (h.get("result") or {}).get("cloud_bash_retry") for h in history
                     ):
-                        event_bus.publish(
-                            utterance=utterance,
-                            kind="action",
-                            text="Asking cloud for a safer shell command…",
-                            detail="pending",
-                        )
-                        narrate("thinking")
-                        rewritten = self.parser.generate_bash(utterance)
-                        if rewritten and rewritten != cmd:
+                        local_fix = _repair_bash_command(cmd, utterance)
+                        try:
+                            from llm.inference import (
+                                _deterministic_zip_command,
+                                _deterministic_create_command,
+                            )
+
+                            if not local_fix:
+                                local_fix = _deterministic_zip_command(
+                                    utterance
+                                ) or _deterministic_create_command(utterance)
+                        except Exception:  # noqa: BLE001
+                            pass
+                        if local_fix and local_fix != cmd:
+                            event_bus.publish(
+                                utterance=utterance,
+                                kind="action",
+                                text="Retrying with a safer shell command…",
+                                detail="pending",
+                            )
                             call = {
                                 "tool": "run_bash",
-                                "args": {"command": rewritten},
+                                "args": {"command": local_fix},
                             }
                             result = self.registry.run(
-                                "run_bash", {"command": rewritten}
+                                "run_bash", {"command": local_fix}
                             )
                             result = dict(result)
                             result["cloud_bash_retry"] = True
@@ -1056,27 +1078,23 @@ class AgentLoop:
                                 step=step,
                                 tool="run_bash",
                                 result=_trim(result),
-                                cloud_bash_retry=True,
+                                local_bash_retry=True,
                             )
                             out2 = (result.get("stdout") or "").strip()
                             err2 = (
                                 result.get("error") or result.get("stderr") or ""
                             ).strip()
-                            if result.get("ok") and out2:
-                                text = self._format_command_answer(
-                                    utterance, rewritten, out2
-                                )
-                                finished = self._attempt_finish(
-                                    active, text, sources, history
-                                )
-                                if finished is not None:
-                                    return finished
-                                continue
                             if result.get("ok"):
                                 text = (
-                                    "Done."
-                                    if not rewritten
-                                    else f"Done (`{rewritten}`)."
+                                    self._format_command_answer(
+                                        utterance, local_fix, out2
+                                    )
+                                    if out2
+                                    else (
+                                        f"Done (`{local_fix}`)."
+                                        if local_fix
+                                        else "Done."
+                                    )
                                 )
                                 finished = self._attempt_finish(
                                     active, text, sources, history
@@ -1085,7 +1103,64 @@ class AgentLoop:
                                     return finished
                                 continue
                             err = err2 or err
-                            cmd = rewritten
+                            cmd = local_fix
+                        else:
+                            event_bus.publish(
+                                utterance=utterance,
+                                kind="action",
+                                text="Asking cloud for a safer shell command…",
+                                detail="pending",
+                            )
+                            narrate("thinking")
+                            rewritten = self.parser.generate_bash(utterance)
+                            if rewritten and rewritten != cmd:
+                                call = {
+                                    "tool": "run_bash",
+                                    "args": {"command": rewritten},
+                                }
+                                result = self.registry.run(
+                                    "run_bash", {"command": rewritten}
+                                )
+                                result = dict(result)
+                                result["cloud_bash_retry"] = True
+                                history.append({"call": call, "result": result})
+                                trace_step(
+                                    "agent_tool_result",
+                                    step=step,
+                                    tool="run_bash",
+                                    result=_trim(result),
+                                    cloud_bash_retry=True,
+                                )
+                                out2 = (result.get("stdout") or "").strip()
+                                err2 = (
+                                    result.get("error")
+                                    or result.get("stderr")
+                                    or ""
+                                ).strip()
+                                if result.get("ok") and out2:
+                                    text = self._format_command_answer(
+                                        utterance, rewritten, out2
+                                    )
+                                    finished = self._attempt_finish(
+                                        active, text, sources, history
+                                    )
+                                    if finished is not None:
+                                        return finished
+                                    continue
+                                if result.get("ok"):
+                                    text = (
+                                        "Done."
+                                        if not rewritten
+                                        else f"Done (`{rewritten}`)."
+                                    )
+                                    finished = self._attempt_finish(
+                                        active, text, sources, history
+                                    )
+                                    if finished is not None:
+                                        return finished
+                                    continue
+                                err = err2 or err
+                                cmd = rewritten
                     repaired = _repair_bash_command(cmd, utterance)
                     already = any(
                         str(((h.get("call") or {}).get("args") or {}).get("command") or "")
@@ -1125,7 +1200,7 @@ class AgentLoop:
                             continue
                         finished = self._attempt_finish(
                             active,
-                            f"Shell error: {err2 or err}",
+                            f"Shell error: {_scrub_answer_paths(err2 or err)}",
                             sources,
                             history,
                             force=True,
@@ -1135,7 +1210,7 @@ class AgentLoop:
                         continue
                     finished = self._attempt_finish(
                         active,
-                        f"Shell error: {err}",
+                        f"Shell error: {_scrub_answer_paths(err)}",
                         sources,
                         history,
                         force=True,
@@ -1265,7 +1340,7 @@ class AgentLoop:
                             continue
                         finished = self._attempt_finish(
                             active,
-                            f"Shell error: {err2 or err or 'no output'}",
+                            f"Shell error: {_scrub_answer_paths(err2 or err or 'no output')}",
                             sources,
                             history,
                             force=True,
@@ -1275,7 +1350,7 @@ class AgentLoop:
                         continue
                 finished = self._attempt_finish(
                     active,
-                    f"Shell error: {err or 'command failed'}",
+                    f"Shell error: {_scrub_answer_paths(err or 'command failed')}",
                     sources,
                     history,
                     force=True,
@@ -2105,30 +2180,41 @@ class AgentLoop:
         event_bus.publish(
             utterance=utterance,
             kind="answer",
-            text=text,
+            text=_scrub_answer_paths(text),
             detail="agent",
             sources=normalized or None,
             backend=backend,
         )
         try:
-            narrate_answer(text or "")
+            narrate_answer(_scrub_answer_paths(text or ""))
         except Exception as exc:  # noqa: BLE001
             logger.debug("tts answer skipped: %s", exc)
         trace_step(
             "final",
             kind="answer",
             detail="agent",
-            text=text,
+            text=_scrub_answer_paths(text),
             backend=backend,
             tools=[h.get("call", {}).get("tool") for h in history],
         )
         return {
             "action": "answer",
-            "answer": text,
+            "answer": _scrub_answer_paths(text),
             "sources": normalized,
             "steps": len(history),
             "backend": backend,
         }
+
+
+def _scrub_answer_paths(text: str) -> str:
+    """Never show /Users/<name>/… in overlay answers — use ~."""
+    try:
+        from tools.run_bash import scrub_home_paths_for_display
+
+        return scrub_home_paths_for_display(text or "")
+    except Exception:  # noqa: BLE001
+        t = text or ""
+        return re.sub(r"/Users/[^/\s\"']+", "~", t)
 
 
 def _trim(obj: Any, limit: int = 1200) -> Any:
@@ -2312,6 +2398,35 @@ def _repair_bash_command(command: str, utterance: str = "") -> Optional[str]:
     """
     cmd = (command or "").strip()
     blob = f"{cmd}\n{utterance or ''}"
+
+    # quote_paths_with_spaces bug remnant: find "~/Downloads -type …"
+    if re.search(r'(?i)\bfind\s+"~/', cmd) and re.search(
+        r'(?i)"~/\w[\w /.-]*\s+-[a-zA-Z]', cmd
+    ):
+        try:
+            from llm.inference import _deterministic_zip_command
+
+            zipped = _deterministic_zip_command(utterance or "")
+            if zipped:
+                return zipped
+        except Exception:  # noqa: BLE001
+            pass
+        fixed = re.sub(
+            r'(?i)\b(find|cd|ls|du)\s+"(~/[^"]*?)\s+(-[a-zA-Z])',
+            r"\1 \2 \3",
+            cmd,
+        )
+        fixed = re.sub(
+            r'(?i)\s+"(~/[^"]*?)\s+(-[a-zA-Z])',
+            r" \1 \2",
+            fixed,
+        )
+        # Drop stray quote fragments left after the mangled name pattern.
+        fixed = re.sub(r""""'\*\.(\w+)'""", r"'*.\1'", fixed)
+        fixed = re.sub(r'''"'\*\.(\w+)'"''', r"'*.\1'", fixed)
+        if fixed != cmd and not _bash_command_looks_broken(fixed):
+            return fixed
+
     # Whole-volume / root finds are empty or hang; biggest-file asks → home scan.
     root_find = bool(
         re.search(r"(?i)\bfind\s+(/Volumes(?:/\S*)?|/(?:\s|$)|/System\b)", cmd)
@@ -2334,6 +2449,42 @@ def _repair_bash_command(command: str, utterance: str = "") -> Optional[str]:
         repaired = re.sub(r"\s{2,}", " ", repaired).strip()
         if repaired and repaired != cmd:
             return repaired
+
+    # Clear zip-PDFs asks: prefer a known-good pipeline over a broken find -exec.
+    if re.search(r"(?i)\b(zip|compress|archive)\b", utterance or "") and (
+        _bash_command_looks_broken(cmd)
+        or re.search(r'(?i)syntax|\\\\";|"~/Downloads\s+-', cmd)
+    ):
+        try:
+            from llm.inference import _deterministic_zip_command
+
+            zipped = _deterministic_zip_command(utterance or "")
+            if zipped and zipped != cmd:
+                return zipped
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Broken curl (URL on next line / missing URL) or explicit reachability ask.
+    if re.search(r"(?i)\bcurl\b", cmd) or re.search(
+        r"(?i)\breachable\b|\bresponse\s+time\b|\blatency\b|\bping\b",
+        utterance or "",
+    ):
+        try:
+            from llm.inference import _deterministic_reachability_command
+
+            reach = _deterministic_reachability_command(utterance or "")
+            if reach and reach != cmd:
+                return reach
+        except Exception:  # noqa: BLE001
+            pass
+        # Soft fix: join newline before https:// into one curl argv.
+        if re.search(r"(?i)\bcurl\b", cmd) and re.search(
+            r"(?i)\n\s*https?://", cmd
+        ):
+            joined = re.sub(r"\n\s*(https?://\S+)", r" \1", cmd)
+            joined = re.sub(r"\s{2,}", " ", joined).strip()
+            if joined != cmd and not _bash_command_looks_broken(joined):
+                return joined
     return None
 
 
@@ -2760,15 +2911,51 @@ def _sanitize_planned_call(
     if tool == "run_bash":
         cmd = str(args.get("command") or "")
         if _bash_command_looks_broken(cmd):
+            # Prefer repairing a nearly-right plan over regenerating (Downloads trap).
+            from llm.inference import (
+                _deterministic_create_command,
+                _deterministic_reachability_command,
+                _deterministic_zip_command,
+                _repair_dropped_home_folder,
+            )
+
+            repaired_path = _repair_dropped_home_folder(cmd, text)
+            if repaired_path and not _bash_command_looks_broken(repaired_path):
+                return {"tool": "run_bash", "args": {"command": repaired_path}}
+            deterministic = (
+                _deterministic_create_command(text)
+                or _deterministic_zip_command(text)
+                or _deterministic_reachability_command(text)
+            )
+            if deterministic:
+                return {"tool": "run_bash", "args": {"command": deterministic}}
             return {"tool": "__write_and_run_bash__", "args": {}}
         # Coerce version-check asks to a single reliable local command.
         # Avoids `python3 && python && pip` dying on missing `python`.
         local_cmd = _preferred_local_check_command(text)
         if local_cmd and _needs_local_machine_check(text) and cmd.strip() != local_cmd:
             return {"tool": "run_bash", "args": {"command": local_cmd}}
+        # Reachability / latency — always use the known-good multi-probe curl.
+        try:
+            from llm.inference import _deterministic_reachability_command
+
+            reach = _deterministic_reachability_command(text)
+        except Exception:  # noqa: BLE001
+            reach = ""
+        if reach:
+            return {"tool": "run_bash", "args": {"command": reach}}
         # Never curl|grep the web from bash when the user asked to search.
         if local_cmd and re.search(r"(?i)\b(curl|wget)\b", cmd):
             return {"tool": "run_bash", "args": {"command": local_cmd}}
+        # Dropped ~/Documents → ~/Name hallucination from the planner.
+        try:
+            from llm.inference import _repair_dropped_home_folder
+
+            anchored = _repair_dropped_home_folder(cmd, text)
+            if anchored and anchored != cmd and not _bash_command_looks_broken(anchored):
+                cmd = anchored
+        except Exception:  # noqa: BLE001
+            pass
         repaired = _repair_bash_command(cmd, text)
         if repaired and repaired != cmd:
             cmd = repaired
@@ -2777,6 +2964,8 @@ def _sanitize_planned_call(
         quoted = quote_paths_with_spaces(cmd)
         if quoted != str(args.get("command") or "").strip():
             return {"tool": "run_bash", "args": {"command": quoted}}
+        if cmd != str(args.get("command") or "").strip():
+            return {"tool": "run_bash", "args": {"command": cmd}}
 
     # After open_app, stamp the app name onto ui_type so keys hit Calculator not the overlay.
     if tool in {"ui_type", "ui_key", "ui_click", "ui_snapshot"}:
@@ -3113,7 +3302,7 @@ def _history_has_successful_mutation(history: list[dict[str, Any]]) -> bool:
                 return True  # confirm gate is the correct terminal for delete
             if result.get("ok") and not _is_discovery_bash(cmd):
                 if re.search(
-                    r"(?i)\b(rm|rmdir|mv|empty|trash|shut\s*down|restart|sleep)\b",
+                    r"(?i)\b(rm|rmdir|mv|cp|empty|trash|shut\s*down|restart|sleep)\b",
                     cmd,
                 ):
                     return True
@@ -3123,6 +3312,21 @@ def _history_has_successful_mutation(history: list[dict[str, Any]]) -> bool:
             ):
                 return True
     return False
+
+
+def _bash_respects_home_folder(command: str, utterance: str) -> bool:
+    """False when the ask required ~/Documents but the command omitted it."""
+    try:
+        from llm.inference import _home_folder_from_ask
+    except Exception:  # noqa: BLE001
+        return True
+    folder = _home_folder_from_ask(utterance)
+    if not folder:
+        return True
+    cmd = command or ""
+    if not re.search(r"(?i)\b(mkdir|touch|echo|printf|mv|cp)\b", cmd):
+        return True
+    return bool(re.search(rf"(?i)(?:~/|\$HOME/){re.escape(folder)}\b", cmd))
 
 
 def _history_has_command_containing(history: list[dict[str, Any]], needle: str) -> bool:
@@ -3220,6 +3424,36 @@ def _goal_status(
         if saw_tool and only_discovery:
             return "incomplete"
         if not saw_tool and cand:
+            return "incomplete"
+        return "unknown"
+
+    # Create folder / file — require the mutating bash and the right parent folder.
+    if re.search(
+        r"(?i)\b(create|make|new)\b.*\b(folder|director(?:y|ies)|file)\b"
+        r"|\b(folder|director(?:y|ies)|file)\b.*\b(create|make|new)\b",
+        text,
+    ):
+        saw_create = False
+        wrong_folder = False
+        only_discovery = True
+        for item in history:
+            call = item.get("call") or {}
+            result = item.get("result") or {}
+            if call.get("tool") != "run_bash":
+                continue
+            cmd = str((call.get("args") or {}).get("command") or "")
+            if _is_discovery_bash(cmd):
+                continue
+            only_discovery = False
+            if result.get("ok") and re.search(r"(?i)\b(mkdir|touch|echo|printf)\b", cmd):
+                saw_create = True
+                if not _bash_respects_home_folder(cmd, text):
+                    wrong_folder = True
+        if wrong_folder:
+            return "incomplete"
+        if saw_create:
+            return "done"
+        if only_discovery:
             return "incomplete"
         return "unknown"
 
@@ -3399,6 +3633,14 @@ def _preferred_local_check_command(text: str) -> Optional[str]:
         return "java -version 2>&1"
     if re.search(r"(?i)\b(macos|mac\s*os)\s+version|sw_vers\b", t):
         return "sw_vers"
+    try:
+        from llm.inference import _deterministic_reachability_command
+
+        reach = _deterministic_reachability_command(t)
+        if reach:
+            return reach
+    except Exception:  # noqa: BLE001
+        pass
     return None
 
 
@@ -3435,7 +3677,14 @@ def _extract_suggested_shell_commands(text: str) -> list[str]:
     """Pull runnable shell snippets out of intermediate advice / answers."""
     out: list[str] = []
     seen: set[str] = set()
-    for m in re.finditer(r"`([^`\n]{2,160})`", text or ""):
+
+    # Critic / planner hints: run_bash cmd='mkdir …' or bare mkdir …
+    hint_cmd = _command_from_next_hint(text)
+    if hint_cmd and hint_cmd not in seen:
+        seen.add(hint_cmd)
+        out.append(hint_cmd)
+
+    for m in re.finditer(r"`([^`\n]{2,200})`", text or ""):
         cmd = m.group(1).strip().lstrip("$").strip()
         if not cmd or cmd in seen:
             continue
@@ -3449,12 +3698,52 @@ def _extract_suggested_shell_commands(text: str) -> list[str]:
                 continue
         if re.match(
             r"(?i)^(python|python3|node|npm|npx|brew|pip|pip3|sw_vers|uname|"
-            r"which|ls|df|du|git|ruby|java|system_profiler|defaults)\b",
+            r"which|ls|df|du|git|ruby|java|system_profiler|defaults|"
+            r"mkdir|touch|echo|printf|open|mv|cp|rm|find)\b",
             cmd,
         ) or re.search(r"(?i)--version|-V\b", cmd):
             seen.add(cmd)
             out.append(cmd)
     return out[:3]
+
+
+def _command_from_next_hint(hint: str) -> Optional[str]:
+    """Extract a runnable shell command from a goal-check next_hint."""
+    h = (hint or "").strip()
+    if not h or h.lower() in {"none", "n/a", "null"}:
+        return None
+    m = re.search(
+        r"(?i)run_bash\s+cmd\s*=\s*['\"](.+)['\"]\s*$",
+        h,
+        re.DOTALL,
+    )
+    if m:
+        cmd = m.group(1).strip()
+        cmd = cmd.replace('\\"', '"').replace("\\'", "'")
+        return cmd or None
+    m = re.search(r"(?i)\bcmd\s*=\s*['\"](.+)['\"]\s*$", h, re.DOTALL)
+    if m:
+        cmd = m.group(1).strip().replace('\\"', '"').replace("\\'", "'")
+        return cmd or None
+    if re.match(
+        r"(?i)^(mkdir|touch|echo|printf|ls|mv|cp|rm|open|find|python3|node)\b",
+        h,
+    ):
+        return h
+    return None
+
+
+def _command_from_goal_hints(history: list[dict[str, Any]]) -> Optional[str]:
+    """Latest goal-check next_hint command, if any."""
+    for item in reversed(history or []):
+        call = item.get("call") or {}
+        result = item.get("result") or {}
+        if call.get("tool") != "_goal_check":
+            continue
+        cmd = _command_from_next_hint(str(result.get("next_hint") or ""))
+        if cmd and not _bash_command_looks_broken(cmd):
+            return cmd
+    return None
 
 
 def _history_has_successful_bash(history: list[dict[str, Any]]) -> bool:
@@ -3611,6 +3900,10 @@ def _suggested_cmds_from_history(history: list[dict[str, Any]]) -> list[str]:
                 or ""
             )
         elif tool == "_goal_check":
+            # Prefer the critic's next_hint (often the exact mkdir to run).
+            hint = _command_from_next_hint(str(result.get("next_hint") or ""))
+            if hint:
+                return [hint]
             blob = str(result.get("candidate") or "")
         if blob:
             cmds = _extract_suggested_shell_commands(blob)
@@ -3745,6 +4038,19 @@ def _forced_followup(
     if _is_action_request(text) or _needs_local_machine_check(text):
         last_tool = ((history[-1].get("call") or {}).get("tool") or "")
         ran_bash = _history_has_successful_bash(history)
+        # Critic / planner already named the exact next command — run it even
+        # after a wasted discovery ls (e.g. Downloads).
+        suggested = _suggested_cmds_from_history(history)
+        if suggested:
+            cmd0 = suggested[0]
+            already = any(
+                str(((h.get("call") or {}).get("args") or {}).get("command") or "").strip()
+                == cmd0.strip()
+                for h in history
+                if (h.get("call") or {}).get("tool") == "run_bash"
+            )
+            if not already and not _bash_command_looks_broken(cmd0):
+                return {"tool": "run_bash", "args": {"command": cmd0}}
         # Local version known, but user also asked to search the web for "latest".
         if (
             ran_bash
@@ -3768,9 +4074,6 @@ def _forced_followup(
                 local_cmd = _preferred_local_check_command(text)
                 if local_cmd and not _history_has_command_containing(history, local_cmd):
                     return {"tool": "run_bash", "args": {"command": local_cmd}}
-            suggested = _suggested_cmds_from_history(history)
-            if suggested:
-                return {"tool": "run_bash", "args": {"command": suggested[0]}}
             local_cmd = _preferred_local_check_command(text)
             if local_cmd:
                 return {"tool": "run_bash", "args": {"command": local_cmd}}
@@ -3783,6 +4086,27 @@ def _forced_followup(
                     or ""
                 )
             ):
+                return {"tool": "__write_and_run_bash__", "args": {}}
+        # Discovery-only so far on a create/mutate ask → force the real command.
+        if ran_bash and last_tool in {"run_bash", "_goal_check"}:
+            only_discovery = True
+            for item in history:
+                call = item.get("call") or {}
+                if call.get("tool") != "run_bash":
+                    continue
+                cmd = str((call.get("args") or {}).get("command") or "")
+                if not _is_discovery_bash(cmd):
+                    only_discovery = False
+                    break
+            if only_discovery:
+                try:
+                    from llm.inference import _deterministic_create_command
+
+                    create_cmd = _deterministic_create_command(text)
+                except Exception:  # noqa: BLE001
+                    create_cmd = ""
+                if create_cmd:
+                    return {"tool": "run_bash", "args": {"command": create_cmd}}
                 return {"tool": "__write_and_run_bash__", "args": {}}
 
     # Close/quit was mis-planned (e.g. pmset) — force the kill tool once.

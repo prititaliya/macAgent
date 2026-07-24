@@ -1613,8 +1613,8 @@ class LocalIntentParser:
         but only sends a scrubbed ask — no absolute home paths, username, or IPs.
         The returned command uses ``~`` / ``$HOME``; we localize before run.
         """
-        fallback = "ls -lt ~/Downloads | head -20"
         text_in = (utterance or "").strip()
+        fallback = _bash_fallback_for_ask(text_in)
 
         # Local version checks — never curl the web from bash.
         if re.search(r"(?i)\bpython\b", text_in) and re.search(
@@ -1623,12 +1623,29 @@ class LocalIntentParser:
         ):
             return "python3 --version"
 
+        # Deterministic create-folder asks — don't risk Downloads / path hallucination.
+        deterministic = _deterministic_create_command(text_in)
+        if not deterministic:
+            deterministic = _deterministic_zip_command(text_in)
+        if not deterministic:
+            deterministic = _deterministic_reachability_command(text_in)
+        if deterministic:
+            trace_step(
+                "generate_bash",
+                user=utterance,
+                backend="deterministic",
+                raw_output=deterministic[:1000],
+            )
+            return deterministic
+
         system_prompt = (
             "You write ONE short bash command for macOS (bash/zsh). "
             "Reply with ONLY the command — no markdown, no explanation, no leading $. "
             "Privacy: the ask is generic. Use ONLY ~ or $HOME for home paths — "
             "NEVER /Users/<name>, never real usernames, never absolute machine paths. "
-            "Match the user's folder/file names exactly. "
+            "Match the user's folder/file names AND parent paths exactly "
+            "(if they said ~/Documents/…, the command MUST use ~/Documents/… — "
+            "never drop Documents/Desktop/Downloads and create under ~/). "
             "CRITICAL quoting: names with spaces, &, (), [], or quotes must be wrapped "
             "in SINGLE quotes so the shell does not split them "
             "(e.g. mkdir -p ~/Documents/'Project Alpha & Beta (2026)'). "
@@ -1637,7 +1654,8 @@ class LocalIntentParser:
             "printf/echo, touch, mv, cp, rm, open, open -R (reveal in Finder), "
             "shasum -a 256, md5 -r. "
             "Do the FULL ask in one command when possible. "
-            "No curl/wget, no sudo, no rm -rf /, no disk erase."
+            "No curl/wget, no sudo, no rm -rf /, no disk erase. "
+            "Only list ~/Downloads when the user asked about downloads."
         )
         # Scrub local identity before the model sees the ask (cloud or local).
         from llm.cloud import sanitize_for_cloud, restore_placeholders
@@ -1658,44 +1676,69 @@ class LocalIntentParser:
 
         text = ""
         used_cloud = False
-        if self._cloud.cloud_ready():
-            try:
-                text = self._cloud.complete(
-                    system_prompt,
-                    user_prompt,
-                    utterance,  # routing utterance; force bypasses local-task block
-                    max_tokens=400,
-                    temperature=0.1,
-                    force=True,
-                )
-                used_cloud = True
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("cloud generate_bash failed; trying local: %s", exc)
-                trace_step("generate_bash_cloud_fallback", error=str(exc))
-
-        if not (text or "").strip():
-            try:
-                self._ensure_loaded()
-            except (FileNotFoundError, RuntimeError) as exc:
-                logger.warning("generate_bash skipped: %s", exc)
-                return fallback
+        # Local-first for shell: cloud often returns empty on scrubbed Mac path asks,
+        # which only adds a scary Debug error before we fall back anyway.
+        try:
+            self._ensure_loaded()
             assert self._llm is not None
-            try:
-                text = self._complete(
-                    system_prompt, user_prompt, max_tokens=320, temperature=0.1
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("generate_bash failed: %s", exc)
-                return fallback
+            text = self._complete(
+                system_prompt, user_prompt, max_tokens=320, temperature=0.1
+            )
+        except (FileNotFoundError, RuntimeError) as exc:
+            logger.warning("generate_bash local unavailable: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("generate_bash local failed: %s", exc)
 
         text = _strip_code_fences(text or "")
-        for line in text.splitlines():
+        for line in (text or "").splitlines():
             line = line.strip().lstrip("$").strip()
             if line and not line.lower().startswith("bash"):
                 text = line
                 break
-        text = restore_placeholders(text, restore_map)
-        text = _localize_bash_command(text)
+        if text:
+            text = restore_placeholders(text, restore_map)
+            text = _localize_bash_command(text)
+            text = _repair_dropped_home_folder(text, text_in)
+
+        need_cloud = (not (text or "").strip()) or _bash_looks_broken_cmd(text or "")
+        if need_cloud and self._cloud.cloud_ready():
+            try:
+                cloud_text = self._cloud.complete(
+                    system_prompt,
+                    user_prompt,
+                    utterance,
+                    max_tokens=400,
+                    temperature=0.1,
+                    force=True,
+                )
+                cloud_text = _strip_code_fences(cloud_text or "")
+                for line in cloud_text.splitlines():
+                    line = line.strip().lstrip("$").strip()
+                    if line and not line.lower().startswith("bash"):
+                        cloud_text = line
+                        break
+                cloud_text = restore_placeholders(cloud_text, restore_map)
+                cloud_text = _localize_bash_command(cloud_text)
+                cloud_text = _repair_dropped_home_folder(cloud_text, text_in)
+                if (cloud_text or "").strip() and not _bash_looks_broken_cmd(cloud_text):
+                    text = cloud_text
+                    used_cloud = True
+                else:
+                    # Empty/broken cloud — quiet skip (not a Debug error).
+                    logger.info("generate_bash: cloud returned empty/broken; keeping local")
+                    trace_step("generate_bash_cloud_skip", reason="empty_or_broken")
+            except Exception as exc:  # noqa: BLE001
+                # Soft-skip empty responses; only surface real HTTP/config failures.
+                msg = str(exc)
+                if re.search(r"(?i)empty|no choices", msg):
+                    logger.info("generate_bash: cloud empty; keeping local")
+                    trace_step("generate_bash_cloud_skip", reason="empty")
+                else:
+                    logger.warning("cloud generate_bash failed; keeping local: %s", exc)
+                    trace_step("generate_bash_cloud_fallback", error=msg[:300])
+
+        if not (text or "").strip():
+            return fallback
 
         if re.search(r"(?i)invoice", text or "") and not re.search(
             r"(?i)invoice", text_in
@@ -1706,6 +1749,10 @@ class LocalIntentParser:
         if re.search(r"(?i)\b(curl|wget)\b", text or ""):
             if re.search(r"(?i)\bpython\b", text_in):
                 return "python3 --version"
+            # Allow curl only for explicit reachability / latency checks.
+            reach = _deterministic_reachability_command(text_in)
+            if reach:
+                return reach
             return fallback
         if _bash_looks_broken_cmd(text):
             logger.warning("generate_bash produced broken cmd; using fallback")
@@ -1716,6 +1763,14 @@ class LocalIntentParser:
             text = quote_paths_with_spaces(text)
         except Exception:  # noqa: BLE001
             pass
+        # Never ship a Downloads listing for an unrelated ask.
+        if (
+            text
+            and re.search(r"(?i)~/Downloads", text)
+            and not re.search(r"(?i)\bdownl", text_in)
+        ):
+            logger.warning("generate_bash ignored unrelated Downloads cmd")
+            return fallback
         trace_step(
             "generate_bash",
             user=utterance,
@@ -1760,7 +1815,11 @@ class LocalIntentParser:
             "(delete/remove/open-app/launch/move/empty trash/change setting) that has not happened. "
             "done=false if tools ran but the candidate answer does not address the question "
             "(quality fail — suggest a corrective next_hint). "
-            "done=true if the Mac action is complete or a clarifying question is appropriate."
+            "done=false if a folder/file was created under the wrong parent "
+            "(e.g. user asked for ~/Documents/… but tools used ~/… without Documents). "
+            "done=true if the Mac action is complete or a clarifying question is appropriate. "
+            "When done=false and the fix is obvious, next_hint must be the exact run_bash "
+            "command to run next (not vague advice)."
         )
         user_prompt = (
             f"User request: {utterance}\n\n"
@@ -1824,10 +1883,18 @@ def _bash_looks_broken_cmd(command: str) -> bool:
         return True
     if cmd.count("'") % 2 == 1 or cmd.count('"') % 2 == 1:
         return True
-    # Classic broken join: "~/Documents/"Name with spaces"
-    if re.search(r'''["']~/[^"']*["'][^"'\s]''', cmd) or re.search(
-        r'''["']/[^"']*["'][^"'\s]''', cmd
+    # curl with URL on the next line (planner newline inside -w string / after it).
+    if re.search(r"(?i)\bcurl\b", cmd) and re.search(
+        r"(?i)\n\s*https?://", cmd
     ):
+        return True
+    if re.search(r"(?i)\bcurl\b", cmd) and not re.search(
+        r"(?i)https?://|\s+[a-z0-9.-]+\.[a-z]{2,}(?:/|\s|$)", cmd
+    ):
+        return True
+    # Classic broken join: "~/Documents/"Name with spaces"
+    # (not valid adjacent segments like "Folder"/"file.txt")
+    if _has_broken_path_quote_join(cmd):
         return True
     # Unquoted bare & (not &&) — almost always a botched name like "A & B".
     if re.search(r"(?<!&)&(?!&)", cmd) and not re.search(
@@ -1842,6 +1909,302 @@ def _bash_looks_broken_cmd(command: str) -> bool:
     ):
         return True
     return False
+
+
+def _has_broken_path_quote_join(command: str) -> bool:
+    """True for ``\"~/Documents/\"Name with spaces`` mid-path quote closes.
+
+    Quote-state aware so ``\"Folder\"/\"file.txt\"`` is allowed.
+    """
+    quote: str | None = None
+    i = 0
+    n = len(command or "")
+    while i < n:
+        ch = command[i]
+        if quote:
+            if ch == quote and (i == 0 or command[i - 1] != "\\"):
+                prev = command[i - 1] if i > 0 else ""
+                nxt = command[i + 1] if i + 1 < n else ""
+                if prev == "/" and nxt and nxt not in " \t\n|;&=<>)$'\"":
+                    return True
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
+        i += 1
+    return False
+
+
+_HOME_FOLDER_NAMES = (
+    "Documents",
+    "Desktop",
+    "Downloads",
+    "Movies",
+    "Music",
+    "Pictures",
+)
+
+
+def _home_folder_from_ask(utterance: str) -> str | None:
+    """Return Documents/Desktop/… when the ask targets that home folder."""
+    text = utterance or ""
+    # Prefer explicit ~/Documents (or "in Documents named …").
+    m = re.search(
+        r"(?i)(?:in|under|into|on)\s+(?:~/|\$HOME/)?("
+        + "|".join(_HOME_FOLDER_NAMES)
+        + r")\b",
+        text,
+    )
+    if m:
+        for name in _HOME_FOLDER_NAMES:
+            if name.lower() == m.group(1).lower():
+                return name
+    m = re.search(
+        r"(?i)(?:~/|\$HOME/)(" + "|".join(_HOME_FOLDER_NAMES) + r")\b",
+        text,
+    )
+    if m:
+        for name in _HOME_FOLDER_NAMES:
+            if name.lower() == m.group(1).lower():
+                return name
+    return None
+
+
+def _repair_dropped_home_folder(command: str, utterance: str) -> str:
+    """If the ask required ~/Documents but the cmd used ~/Name, inject Documents."""
+    cmd = command or ""
+    folder = _home_folder_from_ask(utterance)
+    if not cmd or not folder:
+        return cmd
+    if re.search(rf"(?i)(?:~/|\$HOME/){re.escape(folder)}\b", cmd):
+        return cmd
+    # Only rewrite creates / opens that landed directly under ~.
+    if not re.search(r"(?i)\b(mkdir|touch|echo|printf|open)\b", cmd):
+        return cmd
+
+    known = "|".join(re.escape(n) for n in _HOME_FOLDER_NAMES)
+
+    def _inject_quoted(m: re.Match[str]) -> str:
+        q, name = m.group(1), m.group(2)
+        if re.match(rf"(?i)^({known})(/|$)", name):
+            return m.group(0)
+        return f"{q}~/{folder}/{name}{q}"
+
+    # '~/Foo bar' or "~/Foo bar"
+    repaired = re.sub(r"(['\"])~/([^'\"]+)\1", _inject_quoted, cmd)
+
+    def _inject_bare(m: re.Match[str]) -> str:
+        name = m.group(1)
+        if re.match(rf"(?i)^({known})(/|$)", name):
+            return m.group(0)
+        return f"~/{folder}/{name}"
+
+    # Unquoted ~/Name (single path component)
+    repaired = re.sub(
+        rf"(?<![\w/])~/({known}|[^\s/'\";|&]+)",
+        _inject_bare,
+        repaired,
+    )
+    return repaired
+
+
+def _deterministic_create_command(utterance: str) -> str:
+    """Build mkdir/echo/open -R when the ask is a clear create-folder request."""
+    text = (utterance or "").strip()
+    if not text:
+        return ""
+    if not re.search(r"(?i)\b(create|make|new)\b", text):
+        return ""
+    if not re.search(r"(?i)\b(folder|director(?:y|ies)|file)\b", text):
+        return ""
+
+    folder = _home_folder_from_ask(text) or "Documents"
+    # folder … named 'X'
+    name_m = re.search(
+        r"(?i)(?:folder|directory)\s+(?:in\s+\S+\s+)?(?:named|called)\s+"
+        r"['\"]([^'\"]+)['\"]",
+        text,
+    )
+    if not name_m:
+        name_m = re.search(
+            r"(?i)(?:named|called)\s+['\"]([^'\"]+)['\"]",
+            text,
+        )
+    if not name_m:
+        return ""
+    dirname = name_m.group(1).strip()
+    if not dirname:
+        return ""
+
+    # Optional file inside: named 'Y' containing 'Z' / with 'Z'
+    file_m = re.search(
+        r"(?i)(?:text\s+)?file\s+(?:inside\s+(?:it\s+)?)?(?:named|called)\s+"
+        r"['\"]([^'\"]+)['\"]",
+        text,
+    )
+    content_m = re.search(
+        r"(?i)(?:containing|with(?:\s+contents?)?|that\s+says)\s+['\"]([^'\"]+)['\"]",
+        text,
+    )
+    reveal = bool(re.search(r"(?i)\b(reveal|show|open|finder)\b", text))
+
+    import shlex
+
+    base = f"~/{folder}/{dirname}"
+    parts: list[str] = [f"mkdir -p {shlex.quote(base)}"]
+    if file_m:
+        fname = file_m.group(1).strip()
+        fpath = f"{base}/{fname}"
+        if content_m:
+            body = content_m.group(1)
+            parts.append(f"printf '%s\\n' {shlex.quote(body)} > {shlex.quote(fpath)}")
+        else:
+            parts.append(f"touch {shlex.quote(fpath)}")
+    if reveal:
+        parts.append(f"open -R {shlex.quote(base)}")
+    return " && ".join(parts)
+
+
+def _deterministic_zip_command(utterance: str) -> str:
+    """Zip matching files from Downloads/Desktop/Documents to a Desktop archive."""
+    text = (utterance or "").strip()
+    if not text:
+        return ""
+    if not re.search(r"(?i)\b(zip|compress|archive)\b", text):
+        return ""
+
+    src = "Downloads"
+    if re.search(r"(?i)\bin\s+(?:my\s+)?documents\b|\bdocuments\s+folder\b", text):
+        src = "Documents"
+    elif re.search(r"(?i)\bin\s+(?:my\s+)?desktop\b|\bdesktop\s+folder\b", text):
+        src = "Desktop"
+    elif re.search(r"(?i)\bdownl", text):
+        src = "Downloads"
+    else:
+        return ""
+
+    ext = "pdf"
+    m_ext = re.search(
+        r"(?i)\b(pdf|png|jpe?g|gif|txt|csv|docx?|xlsx?|pptx?)\b",
+        text,
+    )
+    if m_ext:
+        ext = m_ext.group(1).lower()
+        if ext == "jpeg":
+            ext = "jpg"
+        elif ext == "doc":
+            ext = "doc"
+        elif ext == "docx":
+            ext = "docx"
+
+    zip_m = re.search(
+        r"(?i)(?:named|called)\s+['\"]([^'\"]+\.zip)['\"]",
+        text,
+    )
+    if not zip_m:
+        zip_m = re.search(r"(?i)['\"]([^'\"]+\.zip)['\"]", text)
+    zip_name = (zip_m.group(1) if zip_m else f"{ext.upper()}_Archive.zip").strip()
+
+    dest = "Desktop"
+    if re.search(r"(?i)\b(?:on|to|onto)\s+(?:my\s+)?documents\b", text):
+        dest = "Documents"
+
+    reveal = bool(re.search(r"(?i)\b(reveal|show|finder|open)\b", text))
+
+    import shlex
+
+    archive = f"~/{dest}/{zip_name}"
+    pattern = f"*.{ext}"
+    # -print0 + xargs -0 keeps spaces in filenames; -j stores basenames only.
+    cmd = (
+        f"find ~/{src} -type f -name {shlex.quote(pattern)} -print0 | "
+        f"xargs -0 zip -j {shlex.quote(archive)}"
+    )
+    if reveal:
+        cmd += f" && open -R {shlex.quote(archive)}"
+    return cmd
+
+
+def _host_from_reachability_ask(utterance: str) -> str:
+    """Extract a hostname/URL host from a reachability / latency ask."""
+    text = utterance or ""
+    m = re.search(r"(?i)https?://([a-z0-9.-]+\.[a-z]{2,})", text)
+    if m:
+        return m.group(1).lower().rstrip(".")
+    # Prefer explicit "github.com is reachable" / "ping example.com"
+    m = re.search(
+        r"(?i)\b((?:[a-z0-9-]+\.)+[a-z]{2,})\b",
+        text,
+    )
+    if not m:
+        return ""
+    host = m.group(1).lower().rstrip(".")
+    # Skip junk like "response.time" false positives — require a real TLD-ish host.
+    if host.count(".") < 1:
+        return ""
+    if re.search(
+        r"(?i)^(www\.)?(average|response|terminal|internet)\.",
+        host,
+    ):
+        return ""
+    return host
+
+
+def _deterministic_reachability_command(utterance: str) -> str:
+    """curl latency probe when the user asked if a site is reachable / response time."""
+    text = (utterance or "").strip()
+    if not text:
+        return ""
+    wants = bool(
+        re.search(
+            r"(?i)\b("
+            r"reachable|reachability|ping|latency|response\s+time|"
+            r"how\s+fast|average\s+(response|latency)|"
+            r"check\s+if.{0,60}\b(up|down|online|reachable)"
+            r")\b",
+            text,
+        )
+    )
+    if not wants:
+        return ""
+
+    host = _host_from_reachability_ask(text)
+    if not host:
+        return ""
+    url = f"https://{host}"
+    # 3 probes; awk averages (no bc dependency).
+    return (
+        f"{{ "
+        f"for i in 1 2 3; do "
+        f"curl -sS -o /dev/null -w '%{{time_total}}\\n' "
+        f"--connect-timeout 5 --max-time 15 {url} || echo FAIL; "
+        f"done; "
+        f"}} | awk -v host={host} '"
+        r'{if($1=="FAIL") next; s+=$1; n++} '
+        r'END{if(n) printf "reachable=yes host=%s probes=%d avg_total=%.3fs\n", host, n, s/n; '
+        r'else printf "reachable=no host=%s\n", host}'
+        "'"
+    )
+
+
+def _bash_fallback_for_ask(utterance: str) -> str:
+    """Ask-aware fallback — never ls Downloads for unrelated tasks."""
+    text = (utterance or "").strip()
+    created = _deterministic_create_command(text)
+    if created:
+        return created
+    zipped = _deterministic_zip_command(text)
+    if zipped:
+        return zipped
+    reach = _deterministic_reachability_command(text)
+    if reach:
+        return reach
+    if re.search(r"(?i)\bdownl", text):
+        return "ls -lt ~/Downloads | head -20"
+    return ""
 
 
 def _ampersand_only_inside_quotes(command: str) -> bool:

@@ -111,6 +111,90 @@ def sleep_command() -> str:
     return _SLEEP_CMD
 
 
+def expand_home_paths(command: str) -> str:
+    """Expand ``~/`` and ``$HOME/`` to an absolute home path, safely quoted.
+
+    Bash tilde expansion breaks when the username contains spaces
+    (``~/Desktop/x`` → ``/Users/Prit Italiya/Desktop/x`` splits into two words).
+    Always rewrite to a single quoted absolute path before ``bash -lc``.
+    """
+    cmd = command or ""
+    if not cmd:
+        return cmd
+    home = str(_HOME)
+    if "HOME" in os.environ and os.environ["HOME"]:
+        home = os.environ["HOME"]
+
+    import shlex
+
+    # Only expand when ~ is at a path boundary (start or after space/;|&(=).
+    out: list[str] = []
+    i = 0
+    n = len(cmd)
+    quote: Optional[str] = None
+    while i < n:
+        ch = cmd[i]
+        if quote:
+            out.append(ch)
+            if ch == quote and (i == 0 or cmd[i - 1] != "\\"):
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        at_boundary = i == 0 or cmd[i - 1] in " \t\n;|&(="
+        if at_boundary and cmd.startswith("~/", i):
+            j = i + 2
+            while j < n and cmd[j] not in " \t\n;|&<>(){}\"'":
+                j += 1
+            rest = cmd[i + 2 : j]
+            full = f"{home}/{rest}" if rest else home
+            out.append(shlex.quote(full))
+            i = j
+            continue
+        if at_boundary and cmd.startswith("~", i) and (
+            i + 1 >= n or cmd[i + 1] in " \t\n;|&<>(){}\"'"
+        ):
+            out.append(shlex.quote(home))
+            i += 1
+            continue
+        if at_boundary and cmd.startswith("$HOME/", i):
+            j = i + 6
+            while j < n and cmd[j] not in " \t\n;|&<>(){}\"'":
+                j += 1
+            rest = cmd[i + 6 : j]
+            full = f"{home}/{rest}" if rest else home
+            out.append(shlex.quote(full))
+            i = j
+            continue
+        if at_boundary and cmd.startswith("$HOME", i) and (
+            i + 5 >= n or cmd[i + 5] in " \t\n;|&<>(){}\"'"
+        ):
+            out.append(shlex.quote(home))
+            i += 5
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def scrub_home_paths_for_display(text: str) -> str:
+    """Replace absolute home paths with ``~`` so usernames don't leak in answers."""
+    t = text or ""
+    if not t:
+        return t
+    home = str(_HOME)
+    if home and home in t:
+        t = t.replace(home, "~")
+    # Any /Users/<name>/… → ~/…
+    t = re.sub(r"/Users/[^/\s\"']+", "~", t)
+    t = re.sub(r"/home/[^/\s\"']+", "~", t)
+    return t
+
+
 def quote_paths_with_spaces(command: str) -> str:
     """Double-quote unquoted ~/… and absolute paths that contain spaces.
 
@@ -151,6 +235,10 @@ def quote_paths_with_spaces(command: str) -> str:
             ch = cmd[j]
             if ch in "|&;<>(){}\n":
                 break
+            # ~/Documents/"Name with spaces" — stop before the quoted segment;
+            # the main loop's quote tracker owns the rest.
+            if ch in ("'", '"'):
+                break
             # Redirections / next flag after a space: " 2>" " >/dev" " -"
             if ch in " \t":
                 k = j + 1
@@ -161,15 +249,27 @@ def quote_paths_with_spaces(command: str) -> str:
                 nxt = cmd[k:]
                 if nxt.startswith("2>") or nxt.startswith(">&") or nxt[0] in "<>|&;":
                     break
+                # find … -exec … ~/dir/ \;  — don't swallow " \;" into the path.
+                if nxt.startswith("\\") or nxt.startswith(";"):
+                    break
+                # Trailing-slash dir then a new token (flags / \; / operators).
+                so_far = cmd[idx:j]
+                if so_far.endswith("/"):
+                    break
                 # Space then a new absolute/tilde path → end current path.
                 if _at_path_start(k):
                     break
-                # Space then an option flag (e.g. " -l") after the path.
-                if nxt.startswith("-") and (k + 1 >= n or not nxt[1].isdigit()):
-                    # Allow "file - copy.pdf" style names; only stop for
-                    # common short flags after whitespace.
-                    if re.match(r"-[a-zA-Z]{1,3}(?:\s|$)", nxt):
-                        break
+                # Space then a flag: -type, -name, -exec, -l, -rf, …
+                # (Not "file - copy.pdf" where '-' is followed by whitespace.)
+                if len(nxt) >= 2 and nxt[0] == "-" and nxt[1].isalpha():
+                    break
+                if re.match(
+                    r"(?i)-(type|name|iname|path|ipath|exec|execdir|print0?|"
+                    r"maxdepth|mindepth|mtime|size|user|group|perm|delete|"
+                    r"print|ls|empty)\b",
+                    nxt,
+                ):
+                    break
             j += 1
         return j
 
@@ -248,6 +348,8 @@ def run_bash(
     cmd = (command or "").strip()
     if not cmd:
         return {"ok": False, "error": "command required"}
+    # Expand ~/ before quoting — required when HOME contains spaces.
+    cmd = expand_home_paths(cmd)
     # LLM often emits unquoted paths with spaces — fix before bash splits them.
     cmd = quote_paths_with_spaces(cmd)
     if len(cmd) > _MAX_CMD_CHARS:
@@ -257,14 +359,16 @@ def run_bash(
     if kind == "hard_block":
         return {
             "ok": False,
-            "error": "command blocked: too dangerous (system paths / privilege escalation)",
-            "command": cmd[:800],
+            "error": scrub_home_paths_for_display(
+                "command blocked: too dangerous (system paths / privilege escalation)"
+            ),
+            "command": scrub_home_paths_for_display(cmd[:800]),
         }
     if kind == "needs_confirm" and not confirmed:
         return {
             "ok": False,
             "needs_confirm": True,
-            "command": cmd[:800],
+            "command": scrub_home_paths_for_display(cmd[:800]),
             "summary": summarize_command(cmd),
             "error": "needs_confirm",
         }
@@ -279,7 +383,7 @@ def run_bash(
                 "command blocked: unbounded find under ~ is too slow — "
                 "add -maxdepth (e.g. find ~/Documents -maxdepth 4 -iname '*name*')"
             ),
-            "command": cmd[:800],
+            "command": scrub_home_paths_for_display(cmd[:800]),
         }
     if _ROOT_FIND_RE.search(cmd) and "-maxdepth" not in cmd.lower():
         return {
@@ -288,7 +392,7 @@ def run_bash(
                 "command blocked: scanning / or /Volumes without -maxdepth is "
                 "too slow/empty — search under $HOME with -maxdepth instead"
             ),
-            "command": cmd[:800],
+            "command": scrub_home_paths_for_display(cmd[:800]),
         }
     try:
         # pipefail so `find … | sort | head` fails when find dies mid-pipeline.
@@ -301,8 +405,8 @@ def run_bash(
             env=env,
             check=False,
         )
-        stdout = (proc.stdout or "")[:_MAX_OUTPUT]
-        stderr = (proc.stderr or "")[:_MAX_OUTPUT]
+        stdout = scrub_home_paths_for_display((proc.stdout or "")[:_MAX_OUTPUT])
+        stderr = scrub_home_paths_for_display((proc.stderr or "")[:_MAX_OUTPUT])
         ok = proc.returncode == 0
         # `… | sort | head -n N` often exits 141 (SIGPIPE) once head closes the pipe.
         # That still means we got the lines we asked for.
@@ -324,7 +428,7 @@ def run_bash(
             "returncode": proc.returncode,
             "stdout": stdout.strip(),
             "stderr": stderr.strip(),
-            "command": cmd[:800],
+            "command": scrub_home_paths_for_display(cmd[:800]),
             "confirmed": confirmed,
         }
         if not ok and not stdout.strip():
@@ -338,7 +442,11 @@ def run_bash(
         return {
             "ok": False,
             "error": f"timed out after {effective_timeout}s",
-            "command": cmd[:800],
+            "command": scrub_home_paths_for_display(cmd[:800]),
         }
     except OSError as exc:
-        return {"ok": False, "error": str(exc), "command": cmd[:800]}
+        return {
+            "ok": False,
+            "error": scrub_home_paths_for_display(str(exc)),
+            "command": scrub_home_paths_for_display(cmd[:800]),
+        }
