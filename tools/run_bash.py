@@ -7,7 +7,7 @@ import os
 import re
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +111,97 @@ def sleep_command() -> str:
     return _SLEEP_CMD
 
 
+def quote_paths_with_spaces(command: str) -> str:
+    """Double-quote unquoted ~/… and absolute paths that contain spaces.
+
+    Fixes LLM output like ``open ~/Downloads/My File.pdf`` which bash
+    otherwise splits into multiple arguments.
+    """
+    cmd = command or ""
+    if " " not in cmd:
+        return cmd
+
+    out: list[str] = []
+    i = 0
+    n = len(cmd)
+    quote: Optional[str] = None
+
+    def _at_path_start(idx: int) -> bool:
+        if idx > 0 and cmd[idx - 1] not in " \t\n;|&(=":
+            return False
+        rest = cmd[idx:]
+        if rest.startswith("~/") or rest.startswith("$HOME/"):
+            return True
+        if rest.startswith("/"):
+            # Absolute path (not a lone slash / flag).
+            return bool(
+                re.match(
+                    r"/(?:Users|Volumes|tmp|private|var|Applications|System|"
+                    r"Library|opt|usr)/",
+                    rest,
+                )
+                or re.match(r"/[^/\s][^\s]*\s", rest)
+            )
+        return False
+
+    def _path_end(idx: int) -> int:
+        """Scan from path start; include spaces until a shell metachar boundary."""
+        j = idx
+        while j < n:
+            ch = cmd[j]
+            if ch in "|&;<>(){}\n":
+                break
+            # Redirections / next flag after a space: " 2>" " >/dev" " -"
+            if ch in " \t":
+                k = j + 1
+                while k < n and cmd[k] in " \t":
+                    k += 1
+                if k >= n:
+                    break
+                nxt = cmd[k:]
+                if nxt.startswith("2>") or nxt.startswith(">&") or nxt[0] in "<>|&;":
+                    break
+                # Space then a new absolute/tilde path → end current path.
+                if _at_path_start(k):
+                    break
+                # Space then an option flag (e.g. " -l") after the path.
+                if nxt.startswith("-") and (k + 1 >= n or not nxt[1].isdigit()):
+                    # Allow "file - copy.pdf" style names; only stop for
+                    # common short flags after whitespace.
+                    if re.match(r"-[a-zA-Z]{1,3}(?:\s|$)", nxt):
+                        break
+            j += 1
+        return j
+
+    while i < n:
+        ch = cmd[i]
+        if quote:
+            out.append(ch)
+            if ch == quote and (i == 0 or cmd[i - 1] != "\\"):
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        if _at_path_start(i):
+            end = _path_end(i)
+            path = cmd[i:end]
+            if " " in path and not (path.startswith('"') or path.startswith("'")):
+                escaped = path.replace("\\", "\\\\").replace('"', '\\"')
+                out.append(f'"{escaped}"')
+            else:
+                out.append(path)
+            i = end
+            continue
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
+
+
 def summarize_command(command: str) -> str:
     cmd = (command or "").strip()
     lower = cmd.lower()
@@ -157,6 +248,8 @@ def run_bash(
     cmd = (command or "").strip()
     if not cmd:
         return {"ok": False, "error": "command required"}
+    # LLM often emits unquoted paths with spaces — fix before bash splits them.
+    cmd = quote_paths_with_spaces(cmd)
     if len(cmd) > _MAX_CMD_CHARS:
         return {"ok": False, "error": f"command too long (max {_MAX_CMD_CHARS} chars)"}
 

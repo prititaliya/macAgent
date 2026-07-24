@@ -602,15 +602,21 @@ class AgentLoop:
                 )
                 return self._finish(utterance, reply, sources, history)
 
-            # Special: generate bash then run it.
+            # Special: generate bash then run it (cloud when configured; scrubbed ask).
             if tool == "__write_and_run_bash__":
                 event_bus.publish(
                     utterance=utterance,
                     kind="action",
-                    text="Writing & running shell…",
+                    text=(
+                        "Asking cloud for shell…"
+                        if self.parser._cloud.cloud_ready()
+                        else "Writing & running shell…"
+                    ),
                     detail="pending",
                     step="shellgen",
                 )
+                if self.parser._cloud.cloud_ready():
+                    narrate("thinking")
                 command = self.parser.generate_bash(utterance)
                 call = {"tool": "run_bash", "args": {"command": command}}
                 tool = "run_bash"
@@ -1019,6 +1025,67 @@ class AgentLoop:
                     continue
                 # Empty stdout + stderr (e.g. GNU -printf on macOS) is a failure, not "Done".
                 if err and not out:
+                    # Broken quoting / shell syntax → ask cloud (sanitized) for a rewrite once.
+                    if re.search(
+                        r"(?i)syntax error|unexpected token|unmatched|parse error",
+                        err,
+                    ) and not any(
+                        (h.get("result") or {}).get("cloud_bash_retry") for h in history
+                    ):
+                        event_bus.publish(
+                            utterance=utterance,
+                            kind="action",
+                            text="Asking cloud for a safer shell command…",
+                            detail="pending",
+                        )
+                        narrate("thinking")
+                        rewritten = self.parser.generate_bash(utterance)
+                        if rewritten and rewritten != cmd:
+                            call = {
+                                "tool": "run_bash",
+                                "args": {"command": rewritten},
+                            }
+                            result = self.registry.run(
+                                "run_bash", {"command": rewritten}
+                            )
+                            result = dict(result)
+                            result["cloud_bash_retry"] = True
+                            history.append({"call": call, "result": result})
+                            trace_step(
+                                "agent_tool_result",
+                                step=step,
+                                tool="run_bash",
+                                result=_trim(result),
+                                cloud_bash_retry=True,
+                            )
+                            out2 = (result.get("stdout") or "").strip()
+                            err2 = (
+                                result.get("error") or result.get("stderr") or ""
+                            ).strip()
+                            if result.get("ok") and out2:
+                                text = self._format_command_answer(
+                                    utterance, rewritten, out2
+                                )
+                                finished = self._attempt_finish(
+                                    active, text, sources, history
+                                )
+                                if finished is not None:
+                                    return finished
+                                continue
+                            if result.get("ok"):
+                                text = (
+                                    "Done."
+                                    if not rewritten
+                                    else f"Done (`{rewritten}`)."
+                                )
+                                finished = self._attempt_finish(
+                                    active, text, sources, history
+                                )
+                                if finished is not None:
+                                    return finished
+                                continue
+                            err = err2 or err
+                            cmd = rewritten
                     repaired = _repair_bash_command(cmd, utterance)
                     already = any(
                         str(((h.get("call") or {}).get("args") or {}).get("command") or "")
@@ -2174,11 +2241,6 @@ def _identical_failure_count(history: list[dict[str, Any]]) -> int:
     return count
 
 
-_LATEST_DOWNLOAD_BASH = (
-    'f=$(ls -t ~/Downloads/* 2>/dev/null | head -1); '
-    'if [ -n "$f" ]; then ls -lh "$f"; echo "$f"; '
-    'else echo "Downloads is empty"; fi'
-)
 
 # Scoped home scan — never walk / or /Volumes (often empty/hangs).
 _BIGGEST_FILE_BASH = (
@@ -2243,21 +2305,13 @@ def _path_from_prior_assistant() -> Optional[str]:
 
 
 def _repair_bash_command(command: str, utterance: str = "") -> Optional[str]:
-    """Rewrite known-bad Linux-only commands into macOS-safe equivalents."""
+    """Rewrite known-bad Linux-only flags into macOS-safe equivalents.
+
+    Does not replace whole commands with canned Downloads/latest templates —
+    the model owns the plan; we only fix portability nits.
+    """
     cmd = (command or "").strip()
     blob = f"{cmd}\n{utterance or ''}"
-    # GNU find flags macOS BSD find does not support.
-    gnu_only = bool(
-        re.search(r"(?i)-printf\b|-stat\s+-c\b|find\b.+\s+-printf\b", cmd)
-    )
-    wants_download = bool(re.search(r"(?i)downl|Downloads", blob))
-    if wants_download and (
-        gnu_only
-        or re.search(r"(?i)find\s+~/Downloads|find\s+\"?\$HOME/Downloads", cmd)
-    ):
-        return _LATEST_DOWNLOAD_BASH
-    if gnu_only and re.search(r"(?i)Downloads", cmd):
-        return _LATEST_DOWNLOAD_BASH
     # Whole-volume / root finds are empty or hang; biggest-file asks → home scan.
     root_find = bool(
         re.search(r"(?i)\bfind\s+(/Volumes(?:/\S*)?|/(?:\s|$)|/System\b)", cmd)
@@ -2274,28 +2328,28 @@ def _repair_bash_command(command: str, utterance: str = "") -> Optional[str]:
         return re.sub(r"(?i)\bsha256sum\b", "shasum -a 256", cmd)
     if re.search(r"(?i)\bmd5sum\b", cmd):
         return re.sub(r"(?i)\bmd5sum\b", "md5 -r", cmd)
+    # Drop GNU-only find flags macOS BSD find rejects (keep the rest of the cmd).
+    if re.search(r"(?i)-printf\b", cmd):
+        repaired = re.sub(r"(?i)\s*-printf\s+'[^']*'|\s*-printf\s+\"[^\"]*\"|\s*-printf\s+\S+", "", cmd)
+        repaired = re.sub(r"\s{2,}", " ", repaired).strip()
+        if repaired and repaired != cmd:
+            return repaired
     return None
 
 
 def _bash_command_looks_broken(command: str) -> bool:
     """True when a planner-invented shell string is truncated or nonsensical."""
+    try:
+        from llm.inference import _bash_looks_broken_cmd
+
+        if _bash_looks_broken_cmd(command):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
     cmd = (command or "").strip()
     if not cmd:
         return True
     if len(cmd) > 700:
-        return True
-    # Truncated mid-pipeline / escape.
-    if re.search(r"[|\\&;]\s*$", cmd) or cmd.endswith("\\"):
-        return True
-    # Unbalanced quotes.
-    if cmd.count("'") % 2 == 1 or cmd.count('"') % 2 == 1:
-        return True
-    # Nested find|xargs|find loops the small model invents (never useful).
-    if len(re.findall(r"(?i)\bfind\b", cmd)) >= 3:
-        return True
-    if len(re.findall(r"(?i)\bxargs\b", cmd)) >= 2 and re.search(
-        r"(?i)\bfind\b", cmd
-    ):
         return True
     # Obviously incomplete JSON-ish or cut mid-token.
     if re.search(r"(?i)\b(xargs|find|awk|sort)\s*$", cmd):
@@ -2717,7 +2771,12 @@ def _sanitize_planned_call(
             return {"tool": "run_bash", "args": {"command": local_cmd}}
         repaired = _repair_bash_command(cmd, text)
         if repaired and repaired != cmd:
-            return {"tool": "run_bash", "args": {"command": repaired}}
+            cmd = repaired
+        from tools.run_bash import quote_paths_with_spaces
+
+        quoted = quote_paths_with_spaces(cmd)
+        if quoted != str(args.get("command") or "").strip():
+            return {"tool": "run_bash", "args": {"command": quoted}}
 
     # After open_app, stamp the app name onto ui_type so keys hit Calculator not the overlay.
     if tool in {"ui_type", "ui_key", "ui_click", "ui_snapshot"}:
@@ -2735,13 +2794,11 @@ def _sanitize_planned_call(
                 break
 
     # On-disk Downloads / files must run locally — never cloud inventing "I ran ls".
+    # Do not force a canned "latest download" command; let the planner/bash writer decide.
     if tool in {"respond", "web_search"} and re.search(
         r"(?i)\bdownl", text
     ):
-        return {
-            "tool": "run_bash",
-            "args": {"command": _LATEST_DOWNLOAD_BASH},
-        }
+        return {"tool": "__write_and_run_bash__", "args": {}}
 
     # Factual lookups must search before respond / run_python hallucinations.
     if (
@@ -3764,6 +3821,7 @@ def _forced_followup(
     if _is_open_action(text) and re.search(r"(?i)download", text):
         if _history_has_command_containing(history, "open "):
             return None
+        # Only open a path we already discovered — never invent "latest download".
         path = _first_path_from_history(history)
         if path:
             q = shlex.quote(path)
@@ -3773,16 +3831,7 @@ def _forced_followup(
                     "command": f"open {q} && echo Opened: {q}",
                 },
             }
-        return {
-            "tool": "run_bash",
-            "args": {
-                "command": (
-                    'f=$(ls -t ~/Downloads/* 2>/dev/null | head -1); '
-                    'if [ -n "$f" ]; then open "$f"; echo "Opened: $f"; '
-                    'else echo "Downloads is empty"; fi'
-                )
-            },
-        }
+        return None
 
     if _MOVE_RE.search(text) or _COPY_RE.search(text):
         verb = "cp" if _COPY_RE.search(text) else "mv"

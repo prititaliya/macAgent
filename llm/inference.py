@@ -1607,35 +1607,14 @@ class LocalIntentParser:
             return fallback
 
     def generate_bash(self, utterance: str) -> str:
-        """Write a short bash command for a local macOS file/shell task."""
+        """Write a short bash command for a local macOS file/shell task.
+
+        Prefers cloud (when configured) for correct quoting / multi-step shell,
+        but only sends a scrubbed ask — no absolute home paths, username, or IPs.
+        The returned command uses ``~`` / ``$HOME``; we localize before run.
+        """
         fallback = "ls -lt ~/Downloads | head -20"
         text_in = (utterance or "").strip()
-
-        # Downloads asks (incl. typos like "downloded"): real ls, never invent paths.
-        if re.search(r"(?i)\bdownl", text_in):
-            if re.search(r"(?i)\b(delete|remove|rm|trash)\b", text_in):
-                return (
-                    'f=$(ls -t ~/Downloads/* 2>/dev/null | head -1); '
-                    'if [ -n "$f" ]; then rm -f "$f" && echo "Deleted: $f"; '
-                    'else echo "Downloads is empty"; fi'
-                )
-            if re.search(r"(?i)\b(move|mv)\b", text_in):
-                return (
-                    'f=$(ls -t ~/Downloads/* 2>/dev/null | head -1); '
-                    'if [ -n "$f" ]; then mv "$f" ~/Desktop/ && echo "Moved: ~/Desktop/$(basename "$f")"; '
-                    'else echo "Downloads is empty"; fi'
-                )
-            # recent / latest / "give me … downloaded file"
-            if re.search(
-                r"(?i)\b(recent|latest|last|newest|downl)\b",
-                text_in,
-            ) and not re.search(r"(?i)\b(list|show\s+all|all\s+my)\b", text_in):
-                return (
-                    'f=$(ls -t ~/Downloads/* 2>/dev/null | head -1); '
-                    'if [ -n "$f" ]; then ls -lh "$f"; echo "$f"; '
-                    'else echo "Downloads is empty"; fi'
-                )
-            return "ls -lt ~/Downloads | head -20"
 
         # Local version checks — never curl the web from bash.
         if re.search(r"(?i)\bpython\b", text_in) and re.search(
@@ -1644,92 +1623,108 @@ class LocalIntentParser:
         ):
             return "python3 --version"
 
-        try:
-            self._ensure_loaded()
-        except (FileNotFoundError, RuntimeError) as exc:
-            logger.warning("generate_bash skipped: %s", exc)
-            return fallback
-
         system_prompt = (
-            "You write ONE short bash command for macOS (zsh/bash). "
+            "You write ONE short bash command for macOS (bash/zsh). "
             "Reply with ONLY the command — no markdown, no explanation, no leading $. "
-            "Match the user's words exactly — do not invent filenames or folders "
-            "from examples (never substitute 'invoice' or '~/Documents' unless asked). "
-            "Keep commands SHORT (under ~300 chars). Never nest find|xargs|find loops. "
-            "Prefer: ls, find -maxdepth (BSD/macOS find — NEVER -printf or GNU-only flags), "
-            "open, head, sort, stat, du, pwd, echo, shasum -a 256 (not sha256sum), md5 -r. "
-            "NEVER use curl, wget, or scrape websites — web facts use the web_search tool, "
-            "not bash. For installed Python/Node/etc on THIS Mac use only "
-            "`python3 --version` / `node --version` (no && curl). "
-            "Never use mdfind, Spotlight, or find -printf. "
-            "For Downloads / recently downloaded → "
-            "ls -t ~/Downloads/* 2>/dev/null | head -1  (then ls -lh that path). "
-            "If the user asked to DELETE/REMOVE the latest download, emit a command that "
-            "resolves the newest file in ~/Downloads and rm's it (print Deleted: path). "
-            "If they asked to MOVE/COPY the latest download (e.g. to Desktop), emit a command "
-            "that resolves the newest file in ~/Downloads and mv/cp's it (print Moved: path). "
-            "For finding duplicate files under a folder: checksum with shasum -a 256, "
-            "group matching hashes, keep the newest (largest mtime) and rm older dupes — "
-            "print each Deleted: path. Scope with -maxdepth when possible. "
-            "Home is ~. Print useful stdout. Do not use sudo, rm -rf /, curl|sh, or disk erase. "
-            "To empty the macOS Trash/Bin use: "
-            "osascript -e 'tell application \"Finder\" to empty the trash' "
-            "— never rm /bin or touch system paths."
+            "Privacy: the ask is generic. Use ONLY ~ or $HOME for home paths — "
+            "NEVER /Users/<name>, never real usernames, never absolute machine paths. "
+            "Match the user's folder/file names exactly. "
+            "CRITICAL quoting: names with spaces, &, (), [], or quotes must be wrapped "
+            "in SINGLE quotes so the shell does not split them "
+            "(e.g. mkdir -p ~/Documents/'Project Alpha & Beta (2026)'). "
+            "Never break a path across mismatched quotes. "
+            "Prefer: ls, find -maxdepth (BSD find — never -printf), zip, mkdir -p, "
+            "printf/echo, touch, mv, cp, rm, open, open -R (reveal in Finder), "
+            "shasum -a 256, md5 -r. "
+            "Do the FULL ask in one command when possible. "
+            "No curl/wget, no sudo, no rm -rf /, no disk erase."
         )
-        user_prompt = (
-            f"Write one LOCAL macOS bash command (no curl/wget) that prints useful output:\n"
-            f"{text_in}"
-        )
-        assert self._llm is not None
+        # Scrub local identity before the model sees the ask (cloud or local).
+        from llm.cloud import sanitize_for_cloud, restore_placeholders
+        from pathlib import Path as _Path
+
+        generic_ask, restore_map = sanitize_for_cloud(text_in)
         try:
-            text = self._complete(
-                system_prompt, user_prompt, max_tokens=220, temperature=0.1
-            )
-            text = _strip_code_fences(text)
-            # Take first non-empty line; strip prompt junk.
-            for line in text.splitlines():
-                line = line.strip().lstrip("$").strip()
-                if line and not line.lower().startswith("bash"):
-                    text = line
-                    break
-            # Guard: never keep a canned example that ignores the user ask.
-            if re.search(r"(?i)invoice", text or "") and not re.search(
-                r"(?i)invoice", text_in
-            ):
+            home = str(_Path.home())
+            if home and home in generic_ask:
+                generic_ask = generic_ask.replace(home, "~")
+        except Exception:  # noqa: BLE001
+            pass
+        user_prompt = (
+            "Write one portable macOS bash command (paths with ~ only) "
+            "that prints useful stdout for this ask:\n"
+            f"{generic_ask}"
+        )
+
+        text = ""
+        used_cloud = False
+        if self._cloud.cloud_ready():
+            try:
+                text = self._cloud.complete(
+                    system_prompt,
+                    user_prompt,
+                    utterance,  # routing utterance; force bypasses local-task block
+                    max_tokens=400,
+                    temperature=0.1,
+                    force=True,
+                )
+                used_cloud = True
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("cloud generate_bash failed; trying local: %s", exc)
+                trace_step("generate_bash_cloud_fallback", error=str(exc))
+
+        if not (text or "").strip():
+            try:
+                self._ensure_loaded()
+            except (FileNotFoundError, RuntimeError) as exc:
+                logger.warning("generate_bash skipped: %s", exc)
                 return fallback
-            # Soft macOS fixes the small model often misses.
-            text = re.sub(r"(?i)\bsha256sum\b", "shasum -a 256", text or "")
-            text = re.sub(r"(?i)\bmd5sum\b", "md5 -r", text)
-            if re.search(r"(?i)\b(curl|wget)\b", text or ""):
-                if re.search(r"(?i)\bpython\b", text_in):
-                    return "python3 --version"
+            assert self._llm is not None
+            try:
+                text = self._complete(
+                    system_prompt, user_prompt, max_tokens=320, temperature=0.1
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("generate_bash failed: %s", exc)
                 return fallback
-            if _bash_looks_broken_cmd(text):
-                logger.warning("generate_bash produced broken cmd; using fallback")
-                return fallback
-            trace_step("generate_bash", user=utterance, raw_output=text[:1000])
-            return text or fallback
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("generate_bash failed: %s", exc)
+
+        text = _strip_code_fences(text or "")
+        for line in text.splitlines():
+            line = line.strip().lstrip("$").strip()
+            if line and not line.lower().startswith("bash"):
+                text = line
+                break
+        text = restore_placeholders(text, restore_map)
+        text = _localize_bash_command(text)
+
+        if re.search(r"(?i)invoice", text or "") and not re.search(
+            r"(?i)invoice", text_in
+        ):
             return fallback
+        text = re.sub(r"(?i)\bsha256sum\b", "shasum -a 256", text or "")
+        text = re.sub(r"(?i)\bmd5sum\b", "md5 -r", text)
+        if re.search(r"(?i)\b(curl|wget)\b", text or ""):
+            if re.search(r"(?i)\bpython\b", text_in):
+                return "python3 --version"
+            return fallback
+        if _bash_looks_broken_cmd(text):
+            logger.warning("generate_bash produced broken cmd; using fallback")
+            return fallback
+        try:
+            from tools.run_bash import quote_paths_with_spaces
 
+            text = quote_paths_with_spaces(text)
+        except Exception:  # noqa: BLE001
+            pass
+        trace_step(
+            "generate_bash",
+            user=utterance,
+            backend="cloud" if used_cloud else "local",
+            raw_output=(text or "")[:1000],
+        )
+        self.last_answer_backend = "cloud" if used_cloud else "local"
+        return text or fallback
 
-def _bash_looks_broken_cmd(command: str) -> bool:
-    """Local copy of broken-cmd checks for generate_bash (no agent_loop import)."""
-    cmd = (command or "").strip()
-    if not cmd or len(cmd) > 700:
-        return True
-    if re.search(r"[|\\&;]\s*$", cmd) or cmd.endswith("\\"):
-        return True
-    if cmd.count("'") % 2 == 1 or cmd.count('"') % 2 == 1:
-        return True
-    if len(re.findall(r"(?i)\bfind\b", cmd)) >= 3:
-        return True
-    if len(re.findall(r"(?i)\bxargs\b", cmd)) >= 2 and re.search(
-        r"(?i)\bfind\b", cmd
-    ):
-        return True
-    return False
 
     def check_goal_done(
         self,
@@ -1803,6 +1798,79 @@ def _bash_looks_broken_cmd(command: str) -> bool:
             logger.warning("check_goal_done failed: %s", exc)
             trace_step("check_goal_done_error", error=str(exc))
             return fallback
+
+def _localize_bash_command(command: str) -> str:
+    """Map foreign /Users/… paths from cloud advice onto this Mac's home."""
+    cmd = command or ""
+    if not cmd:
+        return cmd
+    from pathlib import Path as _Path
+
+    home = str(_Path.home())
+    # /Users/someOtherName/... → ~/...
+    cmd = re.sub(r"/Users/[^/\s\"']+", "~", cmd)
+    cmd = re.sub(r"/home/[^/\s\"']+", "~", cmd)
+    if home:
+        cmd = cmd.replace(home, "~")
+    return cmd
+
+
+def _bash_looks_broken_cmd(command: str) -> bool:
+    """Local copy of broken-cmd checks for generate_bash (no agent_loop import)."""
+    cmd = (command or "").strip()
+    if not cmd or len(cmd) > 700:
+        return True
+    if re.search(r"[|\\&;]\s*$", cmd) or cmd.endswith("\\"):
+        return True
+    if cmd.count("'") % 2 == 1 or cmd.count('"') % 2 == 1:
+        return True
+    # Classic broken join: "~/Documents/"Name with spaces"
+    if re.search(r'''["']~/[^"']*["'][^"'\s]''', cmd) or re.search(
+        r'''["']/[^"']*["'][^"'\s]''', cmd
+    ):
+        return True
+    # Unquoted bare & (not &&) — almost always a botched name like "A & B".
+    if re.search(r"(?<!&)&(?!&)", cmd) and not re.search(
+        r"(?i)>\s*&|<&|2>&1", cmd
+    ):
+        if not _ampersand_only_inside_quotes(cmd):
+            return True
+    if len(re.findall(r"(?i)\bfind\b", cmd)) >= 3:
+        return True
+    if len(re.findall(r"(?i)\bxargs\b", cmd)) >= 2 and re.search(
+        r"(?i)\bfind\b", cmd
+    ):
+        return True
+    return False
+
+
+def _ampersand_only_inside_quotes(command: str) -> bool:
+    quote: str | None = None
+    i = 0
+    n = len(command or "")
+    while i < n:
+        ch = command[i]
+        if quote:
+            if ch == quote and (i == 0 or command[i - 1] != "\\"):
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
+        if ch == "&":
+            nxt = command[i + 1] if i + 1 < n else ""
+            prev = command[i - 1] if i > 0 else ""
+            if nxt == "&" or prev == "&":
+                i += 1
+                continue
+            if re.match(r"2>&1|>&|<&", command[max(0, i - 1) : i + 3] or ""):
+                i += 1
+                continue
+            return False
+        i += 1
+    return True
 
 
 def _strip_code_fences(text: str) -> str:

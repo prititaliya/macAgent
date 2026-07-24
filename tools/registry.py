@@ -62,7 +62,7 @@ Tools (ONE JSON: {"tool":"...","args":{...}}):
 - modify_system_setting — defaults prefs only (prefer control_mac for wifi/dark)
 - control_power_management — pmset sleep/display/battery ONLY (never quit apps / wifi)
 - trigger_native_notification {"title","message"}
-- run_bash {"command"} — ls/find(-maxdepth)/mv/rm/open; no mdfind
+- run_bash {"command"} — ls/find(-maxdepth)/mv/rm/open; quote paths with spaces; no mdfind
 - run_python {"code"} — print(...) for calculations only
 - ui_snapshot {"limit":40} — read on-screen UI (Accessibility)
 - ui_click {"name":"5","role":"button"} — click a control by name

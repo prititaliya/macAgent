@@ -192,6 +192,7 @@ defaults write com.zachlatta.freeflow post_processing_timeout_seconds -float 120
 | Model errors | Verify `model_path` in `config/settings.json` points to a valid `.gguf` file |
 | Hotkey doesn't work | System Settings → Privacy → Accessibility → enable **MacAgent** |
 | UI click/type fails after rebuild | Accessibility: MacAgent Off→On, quit menu-bar app, reopen `/Applications/MacAgent.app` |
+| DMG says app is “damaged” | Gatekeeper quarantine on unsigned build. After dragging to Applications: `xattr -cr /Applications/MacAgent.app` then open again |
 | Cloud answers still say local model | Enable cloud + API key in Preferences; scraped pages force cloud when configured |
 | Rebuild overlay from source | `./automation/open_macagent.sh` |
 

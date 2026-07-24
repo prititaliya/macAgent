@@ -42,10 +42,17 @@ if [[ ! -d "$APP" ]]; then
   exit 1
 fi
 
+# Ad-hoc sign so Gatekeeper doesn't report an unsigned download as "damaged".
+# (Developer ID + notarization still required for zero-friction installs.)
+echo "Ad-hoc signing…"
+codesign --force --deep --sign - "$APP"
+xattr -cr "$APP" 2>/dev/null || true
+
 rm -rf "$STAGE" "$DIST/$DMG_NAME"
 mkdir -p "$STAGE" "$DIST"
 
 cp -R "$APP" "$STAGE/MacAgent.app"
+xattr -cr "$STAGE/MacAgent.app" 2>/dev/null || true
 ln -s /Applications "$STAGE/Applications"
 
 cat > "$STAGE/README.txt" <<EOF
@@ -53,12 +60,16 @@ MacAgent ${VERSION}
 ===================
 
 1. Drag MacAgent.app into Applications.
-2. Clone the backend (one-time):
+2. If macOS says the app is "damaged", it is Gatekeeper quarantine on an
+   unsigned build — not a corrupt download. In Terminal run:
+     xattr -cr /Applications/MacAgent.app
+   then open MacAgent from Applications again.
+3. Clone the backend (one-time):
      git clone https://github.com/prititaliya/macAgent.git ~/MacAgent
      cd ~/MacAgent && ./automation/setup_backend.sh
-3. Open MacAgent from Applications (menu bar sparkles icon).
-4. Grant Accessibility when prompted (needed for Control-Option-Space).
-5. Press Control-Option-Space to summon the overlay.
+4. Open MacAgent from Applications (menu bar sparkles icon).
+5. Grant Accessibility when prompted (needed for Control-Option-Space).
+6. Press Control-Option-Space to summon the overlay.
 
 Full setup guide: https://github.com/prititaliya/macAgent#setup
 
