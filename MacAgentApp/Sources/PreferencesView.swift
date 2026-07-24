@@ -1,8 +1,9 @@
 import SwiftUI
 import AppKit
+import ApplicationServices
 
 private enum PrefsPane: String, CaseIterable, Identifiable, Hashable {
-    case model, overlay, voice, privacy, notes
+    case model, cloud, overlay, voice, privacy, notes
     case sites, apps, history, debug
 
     var id: String { rawValue }
@@ -10,6 +11,7 @@ private enum PrefsPane: String, CaseIterable, Identifiable, Hashable {
     var title: String {
         switch self {
         case .model: return "Model"
+        case .cloud: return "Cloud"
         case .overlay: return "Overlay"
         case .voice: return "Voice"
         case .privacy: return "Privacy"
@@ -24,6 +26,7 @@ private enum PrefsPane: String, CaseIterable, Identifiable, Hashable {
     var systemImage: String {
         switch self {
         case .model: return "cpu"
+        case .cloud: return "cloud"
         case .overlay: return "rectangle.on.rectangle"
         case .voice: return "speaker.wave.2"
         case .privacy: return "lock.shield"
@@ -35,7 +38,7 @@ private enum PrefsPane: String, CaseIterable, Identifiable, Hashable {
         }
     }
 
-    static let general: [PrefsPane] = [.model, .overlay, .voice, .privacy, .notes]
+    static let general: [PrefsPane] = [.model, .cloud, .overlay, .voice, .privacy, .notes]
     static let data: [PrefsPane] = [.sites, .apps, .history, .debug]
 }
 
@@ -65,6 +68,7 @@ struct PreferencesView: View {
             Group {
                 switch pane {
                 case .model: ModelPrefsPane()
+                case .cloud: CloudPrefsPane()
                 case .overlay: OverlayPrefsPane()
                 case .voice: VoicePrefsPane()
                 case .privacy: PrivacyPrefsPane()
@@ -162,7 +166,7 @@ private struct ModelPrefsPane: View {
 
     var body: some View {
         PrefsPage(
-            subtitle: "On-device GGUF for planning and answers. Qwen3-4B is the best balance of quality and speed on Apple Silicon.",
+            subtitle: "On-device GGUF for planning and answers. Qwen3-4B is recommended; Llama 3.2, Phi-3.5, Qwen 2.5 7B Q4, and SmolLM also work. Switching reloads the model and uses the matching chat template.",
             section: "Local model"
         ) {
             PrefsCard {
@@ -272,6 +276,188 @@ private struct ModelPrefsPane: View {
     }
 }
 
+// MARK: - Cloud
+
+private struct CloudPrefsPane: View {
+    @EnvironmentObject var model: AgentModel
+    @State private var enabled = false
+    @State private var provider: CloudProviderPreset = .openai
+    @State private var baseURL = CloudProviderPreset.openai.baseURL
+    @State private var apiKeyDraft = ""
+    @State private var modelName = CloudProviderPreset.openai.defaultModel
+    @State private var routeGeneral = true
+    @State private var saving = false
+
+    var body: some View {
+        PrefsPage(
+            subtitle: "Pick a provider preset, or Custom for any OpenAI-compatible base URL. Mac actions stay on the local GGUF.",
+            section: "Inference Engine / Cloud"
+        ) {
+            PrefsCard {
+                Toggle("Enable Cloud Acceleration", isOn: $enabled)
+                    .disabled(saving)
+                    .onChange(of: enabled) { on in
+                        Task {
+                            await model.saveCloudSettings(enabled: on, routeGeneral: routeGeneral)
+                        }
+                    }
+
+                Divider()
+
+                PrefsRow(
+                    title: "Provider",
+                    subtitle: provider == .custom
+                        ? "Enter any OpenAI-compatible base URL below."
+                        : "Fills the default base URL and model for this provider."
+                ) {
+                    Picker("", selection: $provider) {
+                        ForEach(CloudProviderPreset.allCases) { preset in
+                            Text(preset.label).tag(preset)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .frame(width: 180)
+                    .disabled(saving)
+                    .onChange(of: provider) { preset in
+                        applyPreset(preset, replaceModel: true)
+                    }
+                }
+
+                Divider()
+
+                PrefsRow(
+                    title: "Base URL",
+                    subtitle: provider == .custom
+                        ? "Full API root (app appends /chat/completions)."
+                        : provider.baseURL
+                ) {
+                    TextField("https://…", text: $baseURL)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(minWidth: 260)
+                        .disabled(saving || provider != .custom)
+                }
+
+                Divider()
+
+                PrefsRow(
+                    title: "API Key",
+                    subtitle: model.cloudApiKeySet
+                        ? "Stored on this Mac (\(model.cloudApiKeyMasked)). Leave blank to keep."
+                        : "Paste your real key, then Save."
+                ) {
+                    SecureField(provider.keyPlaceholder, text: $apiKeyDraft)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(minWidth: 220)
+                        .disabled(saving)
+                }
+
+                Divider()
+
+                PrefsRow(
+                    title: "Model name",
+                    subtitle: "Default for \(provider.label): \(provider.defaultModel)"
+                ) {
+                    TextField(provider.defaultModel, text: $modelName)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(minWidth: 200)
+                        .disabled(saving)
+                }
+
+                Divider()
+
+                Toggle("Route general knowledge queries to cloud", isOn: $routeGeneral)
+                    .disabled(saving || !enabled)
+
+                Divider()
+
+                HStack {
+                    Spacer()
+                    Button(saving ? "Saving…" : "Save") {
+                        Task { await save() }
+                    }
+                    .disabled(saving || !model.daemonOnline)
+                    .keyboardShortcut(.defaultAction)
+                }
+            }
+
+            Text(
+                "Presets: OpenAI, DeepSeek, Google (Gemini), Groq. Custom is for OpenRouter, Together, local gateways, etc.\n\n"
+                    + "Privacy: file/app/bash/screen actions always use the local GGUF. Cloud prompts are sanitized "
+                    + "before upload. On API failure, MacAgent falls back to local."
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.top, 4)
+        }
+        .onAppear { syncFromModel() }
+        .onChange(of: model.cloudEnabled) { _ in syncFromModel() }
+        .onChange(of: model.cloudProvider) { _ in syncFromModel() }
+        .onChange(of: model.cloudBaseURL) { _ in syncFromModel() }
+        .onChange(of: model.cloudModelName) { _ in syncFromModel() }
+        .onChange(of: model.cloudRouteGeneral) { _ in syncFromModel() }
+    }
+
+    private func applyPreset(_ preset: CloudProviderPreset, replaceModel: Bool) {
+        if preset != .custom {
+            baseURL = preset.baseURL
+        }
+        if replaceModel {
+            modelName = preset.defaultModel
+        }
+    }
+
+    private func syncFromModel() {
+        enabled = model.cloudEnabled
+        let inferred = CloudProviderPreset.from(id: model.cloudProvider)
+        provider = inferred == .custom
+            ? CloudProviderPreset.infer(fromBaseURL: model.cloudBaseURL)
+            : inferred
+        baseURL = model.cloudBaseURL
+        modelName = model.cloudModelName
+            .replacingOccurrences(of: "\r", with: "\n")
+            .components(separatedBy: "\n")
+            .first?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            ?? model.cloudModelName
+        routeGeneral = model.cloudRouteGeneral
+    }
+
+    private func save() async {
+        saving = true
+        defer { saving = false }
+        var cleanedURL = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        if provider != .custom {
+            cleanedURL = provider.baseURL
+        } else {
+            let lower = cleanedURL.lowercased()
+            if lower.contains("googleapis.com") || lower.contains("gemini") || lower.contains("generativelanguage") {
+                if !lower.contains("v1beta/openai") {
+                    cleanedURL = CloudProviderPreset.google.baseURL
+                }
+            }
+        }
+        let cleanedName = modelName
+            .replacingOccurrences(of: "\r", with: "\n")
+            .components(separatedBy: "\n")
+            .first?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            ?? modelName
+        await model.saveCloudSettings(
+            enabled: enabled,
+            provider: provider.rawValue,
+            baseURL: cleanedURL,
+            apiKey: apiKeyDraft.isEmpty ? nil : apiKeyDraft,
+            modelName: cleanedName.isEmpty ? provider.defaultModel : cleanedName,
+            routeGeneral: routeGeneral
+        )
+        apiKeyDraft = ""
+        baseURL = cleanedURL
+        modelName = cleanedName.isEmpty ? provider.defaultModel : cleanedName
+    }
+}
+
 // MARK: - Overlay
 
 private struct OverlayPrefsPane: View {
@@ -374,17 +560,54 @@ private struct VoicePrefsPane: View {
 // MARK: - Privacy
 
 private struct PrivacyPrefsPane: View {
+    @State private var axTrusted = AXIsProcessTrusted()
+    @State private var axMessage = ""
+
     var body: some View {
         PrefsPage(subtitle: "macOS permissions MacAgent needs for UI control and voice dictation.") {
             PrefsCard {
                 PrefsRow(
                     title: "Accessibility",
-                    subtitle: "Enable MacAgent.app (not AEServer) for screen and UI actions."
+                    subtitle: axTrusted
+                        ? "Granted for this MacAgent.app — click/type should work."
+                        : "macOS says this copy is NOT trusted (toggle can look On after a rebuild)."
                 ) {
-                    Button("Open Settings") {
-                        openPref("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+                    HStack(spacing: 8) {
+                        Circle()
+                            .fill(axTrusted ? Color.green : Color.orange)
+                            .frame(width: 8, height: 8)
+                        Text(axTrusted ? "On" : "Off")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(axTrusted ? .green : .orange)
+                        Button("Request Access") {
+                            let result = UIBridgeServer.ensureAccessibility(prompt: true)
+                            axTrusted = (result["trusted"] as? Bool) == true
+                            axMessage = (result["error"] as? String)
+                                ?? (result["message"] as? String)
+                                ?? ""
+                            openAccessibilitySettings()
+                        }
+                        Button("Open Settings") {
+                            openAccessibilitySettings()
+                        }
                     }
                 }
+
+                if !axMessage.isEmpty {
+                    Text(axMessage)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Text(
+                    "After installing a new DMG/build: System Settings → Accessibility → "
+                    + "turn MacAgent OFF, then ON, Quit MacAgent, reopen. "
+                    + "Enable /Applications/MacAgent.app only — not AEServer or Terminal."
+                )
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
 
                 Divider()
 
@@ -409,6 +632,18 @@ private struct PrivacyPrefsPane: View {
                 }
             }
         }
+        .onAppear { refreshAx() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            refreshAx()
+        }
+    }
+
+    private func refreshAx() {
+        axTrusted = AXIsProcessTrusted()
+    }
+
+    private func openAccessibilitySettings() {
+        openPref("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
     }
 
     private func openPref(_ raw: String) {
@@ -905,6 +1140,9 @@ private struct DebugTraceDetailView: View {
               let text = String(data: data, encoding: .utf8)
         else {
             return String(describing: obj)
+        }
+        if text.count > 40_000 {
+            return String(text.prefix(40_000)) + "…"
         }
         return text
     }

@@ -19,11 +19,11 @@ _BRIDGE = "http://127.0.0.1:8082/"
 _TIMEOUT = 20.0
 
 _ACCESS_MSG = (
-    "MacAgent needs Accessibility to control the screen. "
-    "You already may have enabled it — keep MacAgent.app ON in "
-    "System Settings → Privacy & Security → Accessibility, "
-    "and keep the MacAgent app running (not just the daemon). "
-    "AEServer is unrelated; leave it alone."
+    "macOS says this MacAgent.app is not trusted for Accessibility "
+    "(the toggle can still look On after a rebuild). "
+    "System Settings → Privacy & Security → Accessibility: turn MacAgent OFF, "
+    "then ON again. Quit MacAgent fully and reopen /Applications/MacAgent.app — "
+    "not AEServer, Terminal, or an old Xcode build."
 )
 
 _BRIDGE_DOWN = (
@@ -39,7 +39,10 @@ def _bridge(op: str, **kwargs: Any) -> dict[str, Any]:
     req = urllib.request.Request(
         _BRIDGE,
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "Content-Length": str(len(body)),
+        },
         method="POST",
     )
     try:
@@ -82,8 +85,11 @@ def ui_click(name: str = "", role: str = "button", index: int = 1) -> dict[str, 
     )
 
 
-def ui_type(text: str) -> dict[str, Any]:
-    return _bridge("type", text=text or "")
+def ui_type(text: str, app: str = "") -> dict[str, Any]:
+    payload: dict[str, Any] = {"text": text or ""}
+    if (app or "").strip():
+        payload["app"] = app.strip()
+    return _bridge("type", **payload)
 
 
 def ui_key(key: str = "return", modifiers: str = "") -> dict[str, Any]:

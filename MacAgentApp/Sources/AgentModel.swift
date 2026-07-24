@@ -47,6 +47,79 @@ struct PendingConfirm: Identifiable, Equatable {
     let command: String
 }
 
+/// Built-in OpenAI-compatible cloud providers (Custom = any other base URL).
+enum CloudProviderPreset: String, CaseIterable, Identifiable {
+    case openai, deepseek, google, groq, custom
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .openai: return "OpenAI"
+        case .deepseek: return "DeepSeek"
+        case .google: return "Google (Gemini)"
+        case .groq: return "Groq"
+        case .custom: return "Custom"
+        }
+    }
+
+    var baseURL: String {
+        switch self {
+        case .openai: return "https://api.openai.com/v1"
+        case .deepseek: return "https://api.deepseek.com/v1"
+        case .google: return "https://generativelanguage.googleapis.com/v1beta/openai"
+        case .groq: return "https://api.groq.com/openai/v1"
+        case .custom: return "https://api.openai.com/v1"
+        }
+    }
+
+    var defaultModel: String {
+        switch self {
+        case .openai: return "gpt-4o-mini"
+        case .deepseek: return "deepseek-chat"
+        case .google: return "gemini-2.0-flash"
+        case .groq: return "llama-3.3-70b-versatile"
+        case .custom: return "gpt-4o-mini"
+        }
+    }
+
+    var keyPlaceholder: String {
+        switch self {
+        case .google: return "Gemini API key"
+        case .groq: return "gsk_…"
+        case .deepseek: return "sk-…"
+        case .openai: return "sk-…"
+        case .custom: return "API key"
+        }
+    }
+
+    static var fallbackCatalog: [[String: Any]] {
+        allCases.map {
+            [
+                "id": $0.rawValue,
+                "label": $0.label,
+                "base_url": $0.baseURL,
+                "model_name": $0.defaultModel,
+            ] as [String: Any]
+        }
+    }
+
+    static func from(id: String) -> CloudProviderPreset {
+        CloudProviderPreset(rawValue: id.lowercased()) ?? .custom
+    }
+
+    static func infer(fromBaseURL url: String) -> CloudProviderPreset {
+        let lower = url.lowercased()
+        if lower.contains("deepseek.com") { return .deepseek }
+        if lower.contains("groq.com") { return .groq }
+        if lower.contains("googleapis.com") || lower.contains("generativelanguage") || lower.contains("gemini") {
+            return .google
+        }
+        if lower.contains("api.openai.com") { return .openai }
+        return .custom
+    }
+}
+
 @MainActor
 final class AgentModel: ObservableObject {
     static let shared = AgentModel()
@@ -73,6 +146,19 @@ final class AgentModel: ObservableObject {
     @Published var contextNotes = ""
     @Published var debugTraces: [DebugTraceItem] = []
     @Published var lastError: String?
+
+    /// Full answer text while streaming; `answer` catches up char-by-char.
+    private var streamTarget = ""
+    private var typewriterTask: Task<Void, Never>?
+    private var streamFinalizing = false
+    /// True while the typewriter is revealing characters (keeps plain text until done).
+    @Published var isStreamingAnswer = false
+
+    /// Follow-up mode: next asks include prior Q&A as conversation context.
+    @Published var followUpEnabled = false
+    /// Completed turns in the active follow-up thread (oldest → newest).
+    @Published var conversationTurns: [(user: String, assistant: String)] = []
+
     /// Available GGUF models from ~/Models (via daemon).
     @Published var availableModels: [[String: Any]] = []
     @Published var modelDir = ""
@@ -89,15 +175,71 @@ final class AgentModel: ObservableObject {
         if lower.contains("phi-4-mini") || lower.contains("phi4-mini") {
             return "Phi-4-mini"
         }
+        if lower.contains("phi-3.5") || lower.contains("phi3.5") {
+            return "Phi-3.5 Mini"
+        }
+        if lower.contains("phi-3") || lower.contains("phi3") {
+            return "Phi-3"
+        }
         if lower.contains("gemma-4") || lower.contains("gemma4") {
             return "Gemma 4"
+        }
+        if lower.contains("smollm") || lower.contains("smol-lm") {
+            return "SmolLM"
+        }
+        if lower.contains("llama-3") || lower.contains("llama3") {
+            if lower.contains("3.2") || lower.contains("3_2") {
+                if lower.contains("1b") { return "Llama 3.2 1B" }
+                if lower.contains("3b") { return "Llama 3.2 3B" }
+                return "Llama 3.2"
+            }
+            return "Llama 3"
         }
         if lower.contains("qwen3") || lower.contains("qwen-3") {
             if lower.contains("30b") { return "Qwen3-30B" }
             if lower.contains("4b") { return "Qwen3-4B" }
             return "Qwen3"
         }
+        if lower.contains("qwen2.5") || lower.contains("qwen2_5") || lower.contains("qwen-2.5") {
+            if lower.contains("7b") { return "Qwen 2.5 7B" }
+            return "Qwen 2.5"
+        }
+        if lower.contains("qwen") {
+            return "Qwen"
+        }
         return stem
+    }
+
+    /// Overlay Model chip label — shows Cloud when acceleration is on.
+    var inferenceChipLabel: String {
+        if modelSwitching { return "Loading…" }
+        if cloudEnabled && cloudApiKeySet {
+            let cloud = cloudModelName.trimmingCharacters(in: .whitespacesAndNewlines)
+            let short = cloud.isEmpty ? CloudProviderPreset.from(id: cloudProvider).label : cloud
+            return "\(modelDisplayName) + \(short)"
+        }
+        if cloudEnabled {
+            return "\(modelDisplayName) · Cloud (no key)"
+        }
+        return modelDisplayName
+    }
+
+    /// Which backend produced the latest answer: "local" or "cloud".
+    @Published var answerBackend = "local"
+
+    /// Answer footer attribution — only names cloud when it actually answered.
+    var answerAttribution: String {
+        if answerBackend == "cloud" && cloudApiKeySet {
+            let provider = CloudProviderPreset.from(id: cloudProvider).label
+            let cloud = cloudModelName.trimmingCharacters(in: .whitespacesAndNewlines)
+            let short = cloud.isEmpty ? provider : cloud
+            return "\(provider) · \(short)"
+        }
+        return modelDisplayName
+    }
+
+    var cloudProviderLabel: String {
+        CloudProviderPreset.from(id: cloudProvider).label
     }
 
     /// TTS (Kokoro) prefs from daemon settings.json
@@ -107,6 +249,18 @@ final class AgentModel: ObservableObject {
     @Published var ttsVolume: Double = 0.95
     @Published var ttsVoice = "af_heart"
     @Published var ttsMuted = false
+
+    /// Optional OpenAI-compatible cloud acceleration (knowledge answers only).
+    @Published var cloudEnabled = false
+    @Published var cloudProvider = "openai"
+    @Published var cloudBaseURL = "https://api.openai.com/v1"
+    @Published var cloudModelName = "gpt-4o-mini"
+    @Published var cloudRouteGeneral = true
+    @Published var cloudApiKeySet = false
+    /// Masked key from daemon (••••xxxx) for display; SecureField draft lives in the prefs pane.
+    @Published var cloudApiKeyMasked = ""
+    /// Catalog from daemon: [{id, label, base_url, model_name}, …]
+    @Published var cloudProviders: [[String: Any]] = CloudProviderPreset.fallbackCatalog
 
     var onNeedsAttention: (() -> Void)?
     /// Fired when the user interacts or a new answer arrives — resets auto-hide.
@@ -148,6 +302,7 @@ final class AgentModel: ObservableObject {
     }
 
     /// Overlay Search chip: auto | on | off (sent as `use_web` on /v1/ask).
+    /// When follow-up is on, prior Q&A turns are sent so the agent continues the thread.
     func ask(_ text: String, useWeb: String = "auto") async {
         let mode: String
         switch useWeb.lowercased() {
@@ -157,7 +312,8 @@ final class AgentModel: ObservableObject {
         busy = true
         statusLine = "Thinking…"
         lastQuestion = text
-        answer = ""
+        resetAnswerStream()
+        answerBackend = "local"
         sources = []
         pendingConfirm = nil
         traceSteps = [
@@ -171,9 +327,16 @@ final class AgentModel: ObservableObject {
             req.httpMethod = "POST"
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             req.timeoutInterval = 180
-            req.httpBody = try JSONSerialization.data(
-                withJSONObject: ["text": text, "use_web": mode]
-            )
+            var payload: [String: Any] = ["text": text, "use_web": mode]
+            if followUpEnabled && !conversationTurns.isEmpty {
+                payload["follow_up"] = true
+                payload["prior_turns"] = conversationTurns.suffix(8).map {
+                    ["user": $0.user, "assistant": $0.assistant]
+                }
+            } else {
+                payload["follow_up"] = false
+            }
+            req.httpBody = try JSONSerialization.data(withJSONObject: payload)
             let (_, resp) = try await URLSession.shared.data(for: req)
             guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
                 throw URLError(.badServerResponse)
@@ -182,8 +345,40 @@ final class AgentModel: ObservableObject {
             await refreshPrefs()
         } catch {
             lastError = error.localizedDescription
+            resetAnswerStream()
             answer = "Request failed: \(error.localizedDescription)"
             statusLine = ""
+        }
+    }
+
+    /// Start or continue follow-up mode after an answer is available.
+    func enableFollowUp() {
+        followUpEnabled = true
+        commitCurrentTurnIfNeeded()
+    }
+
+    /// Clear the thread and turn follow-up off (fresh ask).
+    func startNewConversation() {
+        followUpEnabled = false
+        conversationTurns = []
+    }
+
+    /// Append the visible Q&A into the follow-up thread once the answer is final.
+    func commitCurrentTurnIfNeeded() {
+        let q = lastQuestion.trimmingCharacters(in: .whitespacesAndNewlines)
+        let a = answer.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty, !a.isEmpty else { return }
+        if let last = conversationTurns.last, last.user == q, last.assistant == a {
+            return
+        }
+        // Replace if same user turn was already recorded with a shorter partial.
+        if let last = conversationTurns.last, last.user == q {
+            conversationTurns[conversationTurns.count - 1] = (user: q, assistant: a)
+        } else {
+            conversationTurns.append((user: q, assistant: a))
+        }
+        if conversationTurns.count > 8 {
+            conversationTurns = Array(conversationTurns.suffix(8))
         }
     }
 
@@ -224,6 +419,23 @@ final class AgentModel: ObservableObject {
         return name.contains("qwen3") && name.contains("4b") && !isModelTooHeavy(path)
     }
 
+    /// Light GGUFs that fit comfortably on ~8GB unified memory (manual pick).
+    func isGoodFor8GBModel(_ path: String) -> Bool {
+        guard !isModelTooHeavy(path), !isRecommendedModel(path) else { return false }
+        let name = URL(fileURLWithPath: path).lastPathComponent.lowercased()
+        if name.contains("llama-3.2") || name.contains("llama3.2") || name.contains("llama-3_2") {
+            return name.contains("1b") || name.contains("3b")
+        }
+        if name.contains("phi-3.5") || name.contains("phi3.5") { return true }
+        if name.contains("smollm") || name.contains("smol-lm") { return true }
+        if (name.contains("qwen2.5") || name.contains("qwen2_5") || name.contains("qwen-2.5"))
+            && name.contains("7b")
+        {
+            return true
+        }
+        return false
+    }
+
     /// Menu label for a GGUF path (name + size when known).
     func labelForModelPath(_ path: String) -> String {
         let item = availableModels.first { ($0["path"] as? String) == path }
@@ -235,11 +447,14 @@ final class AgentModel: ObservableObject {
         return name
     }
 
-    /// Picker label with a quiet Recommended tag for Qwen3-4B.
+    /// Picker label with Recommended / Good for 8GB tags.
     func menuLabelForModelPath(_ path: String) -> String {
         let base = labelForModelPath(path)
         if isRecommendedModel(path) {
             return "\(base) · Recommended"
+        }
+        if isGoodFor8GBModel(path) {
+            return "\(base) · Good for 8GB"
         }
         return base
     }
@@ -305,8 +520,23 @@ final class AgentModel: ObservableObject {
             else if let v = obj["tts_volume"] as? NSNumber { ttsVolume = v.doubleValue }
             if let v = obj["tts_voice"] as? String, !v.isEmpty { ttsVoice = v }
             if let v = obj["tts_muted"] as? Bool { ttsMuted = v }
+            applyCloudSettings(obj["cloud"] as? [String: Any])
         }
         await refreshModels()
+    }
+
+    private func applyCloudSettings(_ cloud: [String: Any]?) {
+        guard let cloud else { return }
+        if let v = cloud["enabled"] as? Bool { cloudEnabled = v }
+        if let v = cloud["provider"] as? String, !v.isEmpty { cloudProvider = v }
+        if let v = cloud["base_url"] as? String, !v.isEmpty { cloudBaseURL = v }
+        if let v = cloud["model_name"] as? String, !v.isEmpty { cloudModelName = v }
+        if let v = cloud["route_general_queries"] as? Bool { cloudRouteGeneral = v }
+        if let v = cloud["api_key_set"] as? Bool { cloudApiKeySet = v }
+        if let v = cloud["api_key"] as? String { cloudApiKeyMasked = v }
+        if let items = cloud["providers"] as? [[String: Any]], !items.isEmpty {
+            cloudProviders = items
+        }
     }
 
     func refreshModels() async {
@@ -381,8 +611,48 @@ final class AgentModel: ObservableObject {
         }
     }
 
+    /// Persist optional cloud acceleration settings.
+    /// Omit `apiKey` (or pass nil) to leave the stored key unchanged.
+    func saveCloudSettings(
+        enabled: Bool? = nil,
+        provider: String? = nil,
+        baseURL: String? = nil,
+        apiKey: String? = nil,
+        modelName: String? = nil,
+        routeGeneral: Bool? = nil
+    ) async {
+        var cloud: [String: Any] = [:]
+        if let enabled { cloud["enabled"] = enabled }
+        if let provider {
+            let trimmed = provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if !trimmed.isEmpty { cloud["provider"] = trimmed }
+        }
+        if let baseURL {
+            let trimmed = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { cloud["base_url"] = trimmed }
+        }
+        if let apiKey {
+            let trimmed = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty, !trimmed.hasPrefix("••••") {
+                cloud["api_key"] = trimmed
+            }
+        }
+        if let modelName {
+            let trimmed = modelName.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { cloud["model_name"] = trimmed }
+        }
+        if let routeGeneral { cloud["route_general_queries"] = routeGeneral }
+        guard !cloud.isEmpty else { return }
+        if let obj = await putJSON("v1/settings", body: ["cloud": cloud]) {
+            applyCloudSettings(obj["cloud"] as? [String: Any])
+        }
+    }
+
     func toggleMute() async {
-        await saveTTSSettings(muted: !ttsMuted)
+        // Optimistic UI so status speech after STT stops immediately.
+        let next = !ttsMuted
+        ttsMuted = next
+        await saveTTSSettings(muted: next)
     }
 
     func setDictating(_ active: Bool) async {
@@ -483,7 +753,7 @@ final class AgentModel: ObservableObject {
                 summary: summary.isEmpty ? "This action needs your permission." : summary,
                 command: command
             )
-            answer = ""
+            resetAnswerStream()
             statusLine = "Waiting for your approval…"
             busy = false
             appendTraceLine(title: "Needs permission", body: summary)
@@ -506,17 +776,35 @@ final class AgentModel: ObservableObject {
         }
 
         if kind == "answer" || (!text.isEmpty && detail != "pending") {
+            let isPartial = detail == "partial"
+            if let be = obj["backend"] as? String, !be.isEmpty {
+                answerBackend = be
+            }
             let (clean, extracted) = Self.stripSources(from: text)
             if !clean.isEmpty {
-                answer = clean
-                appendTraceLine(title: "Answer", body: clean)
+                if isPartial {
+                    enqueueAnswerStream(clean, finalize: false)
+                } else {
+                    enqueueAnswerStream(clean, finalize: true)
+                    appendTraceLine(title: "Answer", body: clean)
+                }
             }
             if !extracted.isEmpty {
                 sources = extracted
             }
+            if isPartial {
+                busy = true
+                if statusLine.isEmpty { statusLine = "Writing…" }
+                onUserActivity?()
+                return
+            }
             pendingConfirm = nil
             statusLine = ""
             busy = false
+            // Only append to the thread when follow-up is explicitly on.
+            if followUpEnabled {
+                commitCurrentTurnIfNeeded()
+            }
             onUserActivity?()
         }
 
@@ -539,6 +827,69 @@ final class AgentModel: ObservableObject {
         }
 
         Task { await refreshPrefs() }
+    }
+
+    /// Reset visible answer + typewriter state (new ask / errors / confirm).
+    private func resetAnswerStream() {
+        typewriterTask?.cancel()
+        typewriterTask = nil
+        streamTarget = ""
+        streamFinalizing = false
+        isStreamingAnswer = false
+        answer = ""
+    }
+
+    /// ChatGPT-style char-by-char reveal toward the latest streamed text.
+    private func enqueueAnswerStream(_ full: String, finalize: Bool) {
+        streamTarget = full
+        streamFinalizing = finalize
+        isStreamingAnswer = true
+        if finalize && answer.count >= full.count {
+            answer = full
+            typewriterTask?.cancel()
+            typewriterTask = nil
+            streamFinalizing = false
+            isStreamingAnswer = false
+            return
+        }
+        // If the model rewrote the whole string, restart from empty.
+        if !full.hasPrefix(answer) && !answer.isEmpty {
+            let common = full.commonPrefix(with: answer)
+            answer = common
+        }
+        guard typewriterTask == nil else { return }
+        typewriterTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                let target = self.streamTarget
+                if self.answer.count >= target.count {
+                    if self.streamFinalizing {
+                        self.answer = target
+                        self.streamFinalizing = false
+                        self.isStreamingAnswer = false
+                        break
+                    }
+                    try? await Task.sleep(nanoseconds: 12_000_000)
+                    continue
+                }
+                if !target.hasPrefix(self.answer) {
+                    self.answer = String(target.prefix(self.answer.count))
+                    if !target.hasPrefix(self.answer) {
+                        self.answer = ""
+                    }
+                    continue
+                }
+                let idx = target.index(target.startIndex, offsetBy: self.answer.count)
+                self.answer.append(target[idx])
+                let ns: UInt64 = self.streamFinalizing ? 2_000_000 : 7_000_000
+                try? await Task.sleep(nanoseconds: ns)
+            }
+            self.typewriterTask = nil
+            if self.streamFinalizing || self.answer.count >= self.streamTarget.count {
+                self.isStreamingAnswer = false
+                self.streamFinalizing = false
+            }
+        }
     }
 
     private func appendTrace(from obj: [String: Any], fallbackTitle: String) {
@@ -672,14 +1023,14 @@ final class AgentModel: ObservableObject {
         }
         return DebugTraceItem(
             id: id,
-            utterance: utterance,
+            utterance: clip(utterance, 500),
             status: status,
             source: source,
             timestamp: timestamp,
             finishedAt: finishedAt,
             resultSummary: resultSummary,
             steps: steps,
-            raw: item
+            raw: slimDebugRaw(item)
         )
     }
 
@@ -696,6 +1047,7 @@ final class AgentModel: ObservableObject {
         case "answer_from_search", "answer_from_search_error": title = "Search answer"
         case "answer_from_command": title = "Command answer"
         case "intent_heuristic", "intent_llm_error", "intent_error": title = "Intent"
+        case "generate_answer": title = "Answer"
         default:
             title = name
                 .replacingOccurrences(of: "_", with: " ")
@@ -707,6 +1059,7 @@ final class AgentModel: ObservableObject {
         if let useWeb = step["use_web"] as? String { summaryParts.append("search \(useWeb)") }
         if let tool = step["tool"] as? String { summaryParts.append(tool) }
         if let kind = step["kind"] as? String { summaryParts.append(kind) }
+        if let backend = step["backend"] as? String { summaryParts.append(backend) }
         if let detail = step["detail"] as? String, !detail.isEmpty {
             summaryParts.append(clip(detail, 80))
         }
@@ -714,7 +1067,7 @@ final class AgentModel: ObservableObject {
         if let text = step["text"] as? String, !text.isEmpty, name == "final" {
             summaryParts.append(clip(text, 100))
         }
-        if let raw = step["raw_output"] as? String, !raw.isEmpty, name.contains("plan") {
+        if let raw = step["raw_output"] as? String, !raw.isEmpty, name.contains("plan") || name.contains("answer") {
             summaryParts.append(clip(raw.replacingOccurrences(of: "\n", with: " "), 100))
         }
         if summaryParts.isEmpty {
@@ -726,15 +1079,16 @@ final class AgentModel: ObservableObject {
 
         var detailLines: [String] = []
         let preferred = [
-            "decision", "use_web", "tool", "args", "step", "kind", "detail",
-            "text", "error", "raw_output", "command", "user", "system_prompt", "user_prompt",
+            "decision", "use_web", "tool", "args", "step", "kind", "detail", "backend",
+            "max_tokens", "text", "error", "raw_output", "command", "user",
+            "system_chars", "user_prompt",
         ]
         var seen = Set<String>()
         for key in preferred where step[key] != nil {
             seen.insert(key)
             detailLines.append("\(key): \(stringifyDebugValue(step[key]))")
         }
-        for key in step.keys.sorted() where !seen.contains(key) && key != "name" && key != "ts" {
+        for key in step.keys.sorted() where !seen.contains(key) && key != "name" && key != "ts" && key != "system_prompt" {
             detailLines.append("\(key): \(stringifyDebugValue(step[key]))")
         }
 
@@ -743,7 +1097,7 @@ final class AgentModel: ObservableObject {
             name: name,
             title: title,
             summary: summaryParts.isEmpty ? name : summaryParts.joined(separator: " · "),
-            detail: detailLines.joined(separator: "\n\n"),
+            detail: clip(detailLines.joined(separator: "\n\n"), 6000),
             isError: isError
         )
     }
@@ -756,16 +1110,40 @@ final class AgentModel: ObservableObject {
 
     private static func stringifyDebugValue(_ value: Any?) -> String {
         guard let value else { return "null" }
-        if let s = value as? String { return s }
+        if let s = value as? String { return clip(s, 2500) }
         if JSONSerialization.isValidJSONObject(value),
            let data = try? JSONSerialization.data(
             withJSONObject: value,
             options: [.prettyPrinted, .sortedKeys]
            ),
            let text = String(data: data, encoding: .utf8) {
-            return text
+            return clip(text, 2500)
         }
-        return String(describing: value)
+        return clip(String(describing: value), 2500)
+    }
+
+    private static func slimDebugRaw(_ item: [String: Any]) -> [String: Any] {
+        var slim: [String: Any] = [:]
+        for key in ["id", "ts", "finished_ts", "status", "source"] {
+            if let value = item[key] { slim[key] = value }
+        }
+        slim["utterance"] = clip((item["utterance"] as? String) ?? "", 500)
+        slim["result"] = clip(stringifyDebugValue(item["result"]), 800)
+        if let steps = item["steps"] as? [[String: Any]] {
+            slim["steps"] = steps.prefix(40).map { step -> [String: Any] in
+                var row: [String: Any] = [:]
+                for (k, v) in step {
+                    if k == "system_prompt" { continue }
+                    if let s = v as? String {
+                        row[k] = clip(s, 600)
+                    } else {
+                        row[k] = v
+                    }
+                }
+                return row
+            }
+        }
+        return slim
     }
 
     private static func clip(_ text: String, _ max: Int) -> String {

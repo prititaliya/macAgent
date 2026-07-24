@@ -75,6 +75,12 @@ struct OverlayView: View {
                             .textSelection(.enabled)
                     }
 
+                    if model.followUpEnabled && model.conversationTurns.count > 1 {
+                        Text("Continuing · \(model.conversationTurns.count) turns in this thread")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(Theme.accentDeep.opacity(0.9))
+                    }
+
                     if let pending = model.pendingConfirm {
                         permissionCard(pending)
                     }
@@ -181,16 +187,23 @@ struct OverlayView: View {
                 Label("Answer", systemImage: "checkmark.seal.fill")
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(Theme.accentDeep)
-                Text("by \(model.modelDisplayName)")
+                Text("by \(model.answerAttribution)")
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(.secondary)
                 Spacer(minLength: 0)
             }
-            Text(model.answer)
-                .font(.system(size: 16, weight: .semibold))
-                .foregroundStyle(.primary)
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            if model.isStreamingAnswer {
+                // While streaming, show raw text so incomplete ``` fences don't break layout.
+                Text(model.answer)
+                    .font(.system(size: 15))
+                    .foregroundStyle(.primary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                MarkdownBody(model.answer)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -346,7 +359,11 @@ struct OverlayView: View {
             .accessibilityLabel(speech.isListening ? "Stop dictation" : "Start dictation")
 
             TextField(
-                speech.isListening ? "Listening… tap mic to send" : "Ask or tell MacAgent…",
+                speech.isListening
+                    ? "Listening… tap mic to send"
+                    : (model.followUpEnabled
+                        ? "Ask a follow-up…"
+                        : "Ask or tell MacAgent…"),
                 text: $draft
             )
             .textFieldStyle(.plain)
@@ -399,43 +416,78 @@ struct OverlayView: View {
     private var optionChips: some View {
         HStack(spacing: 8) {
             Menu {
-                if model.modelPaths.isEmpty {
-                    Text("No models in ~/Models")
-                } else {
-                    ForEach(model.usableModelPaths, id: \.self) { path in
+                Section("Local GGUF") {
+                    if model.modelPaths.isEmpty {
+                        Text("No models in ~/Models")
+                    } else {
+                        ForEach(model.usableModelPaths, id: \.self) { path in
+                            Button {
+                                onInteract()
+                                Task { await model.selectModel(path: path) }
+                            } label: {
+                                HStack {
+                                    Text(model.menuLabelForModelPath(path))
+                                    if path == model.modelPath {
+                                        Image(systemName: "checkmark")
+                                    }
+                                }
+                            }
+                            .disabled(model.modelSwitching || path == model.modelPath)
+                        }
+                        let heavy = model.heavyModelPaths
+                        if !heavy.isEmpty {
+                            Divider()
+                            Text("Too large for this Mac")
+                            ForEach(heavy, id: \.self) { path in
+                                Text(model.labelForModelPath(path))
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+                Section("Cloud") {
+                    if model.cloudApiKeySet {
                         Button {
                             onInteract()
-                            Task { await model.selectModel(path: path) }
+                            Task {
+                                await model.saveCloudSettings(enabled: true, routeGeneral: true)
+                            }
                         } label: {
                             HStack {
-                                Text(model.menuLabelForModelPath(path))
-                                if path == model.modelPath {
+                                Text(cloudMenuTitle)
+                                if model.cloudEnabled {
                                     Image(systemName: "checkmark")
                                 }
                             }
                         }
-                        .disabled(model.modelSwitching || path == model.modelPath)
-                    }
-                    let heavy = model.heavyModelPaths
-                    if !heavy.isEmpty {
-                        Divider()
-                        Text("Too large for this Mac")
-                        ForEach(heavy, id: \.self) { path in
-                            Text(model.labelForModelPath(path))
-                                .foregroundStyle(.secondary)
+                        .disabled(model.cloudEnabled)
+                        Button {
+                            onInteract()
+                            Task { await model.saveCloudSettings(enabled: false) }
+                        } label: {
+                            HStack {
+                                Text("Local only (cloud off)")
+                                if !model.cloudEnabled {
+                                    Image(systemName: "checkmark")
+                                }
+                            }
                         }
+                        .disabled(!model.cloudEnabled)
+                    } else {
+                        Text("Add API key in Preferences → Cloud")
+                            .foregroundStyle(.secondary)
                     }
                 }
             } label: {
                 OverlayChip(
-                    systemImage: "cpu",
+                    systemImage: model.cloudEnabled && model.cloudApiKeySet ? "cloud" : "cpu",
                     title: "Model",
-                    value: model.modelSwitching ? "Loading…" : model.modelDisplayName,
-                    active: model.modelSwitching
+                    value: model.inferenceChipLabel,
+                    active: model.modelSwitching || (model.cloudEnabled && model.cloudApiKeySet)
                 )
             }
             .disabled(model.modelSwitching || !model.daemonOnline)
-            .help("Switch local GGUF model")
+            .help("Local GGUF + optional cloud for general knowledge")
 
             Menu {
                 Button {
@@ -466,8 +518,49 @@ struct OverlayView: View {
             }
             .help("Web search: Auto (when needed), On, or Off")
 
+            Menu {
+                Button {
+                    onInteract()
+                    model.enableFollowUp()
+                } label: {
+                    searchMenuRow("On — continue this thread", selected: model.followUpEnabled)
+                }
+                Button {
+                    onInteract()
+                    model.startNewConversation()
+                } label: {
+                    searchMenuRow("Off — new ask", selected: !model.followUpEnabled)
+                }
+                if model.followUpEnabled && !model.conversationTurns.isEmpty {
+                    Divider()
+                    Button {
+                        onInteract()
+                        model.startNewConversation()
+                    } label: {
+                        Text("Clear \(model.conversationTurns.count) turn(s)")
+                    }
+                }
+            } label: {
+                OverlayChip(
+                    systemImage: "arrow.turn.down.right",
+                    title: "Follow-up",
+                    value: model.followUpEnabled
+                        ? (model.conversationTurns.isEmpty ? "On" : "\(model.conversationTurns.count)")
+                        : "Off",
+                    active: model.followUpEnabled
+                )
+            }
+            .help("Follow-up keeps prior answers as context for the next questions")
+
             Spacer(minLength: 0)
         }
+    }
+
+    private var cloudMenuTitle: String {
+        let provider = model.cloudProviderLabel
+        let name = model.cloudModelName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if name.isEmpty { return "\(provider) on" }
+        return "\(provider) · \(name)"
     }
 
     private var searchModeLabel: String {
@@ -552,6 +645,9 @@ struct OverlayView: View {
         draft = ""
         logsExpanded = true
         onInteract()
+        if model.followUpEnabled {
+            model.commitCurrentTurnIfNeeded()
+        }
         Task { await model.ask(q, useWeb: searchMode) }
     }
 

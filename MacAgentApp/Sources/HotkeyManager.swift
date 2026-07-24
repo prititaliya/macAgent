@@ -109,20 +109,20 @@ final class HotkeyManager {
     }
 
     private func promptAccessibilityIfNeeded() {
-        let trustedSilent = AXIsProcessTrusted()
-        if trustedSilent {
+        if AXIsProcessTrusted() {
             return
         }
-        let defaults = UserDefaults.standard
-        let promptedKey = "didPromptAccessibility"
-        // Only show the system dialog once (first launch / first need).
-        if defaults.bool(forKey: promptedKey) {
-            NSLog("MacAgent: Accessibility still off — enable in System Settings → Privacy & Security → Accessibility.")
-            return
-        }
+        // Always allow the system prompt again after rebuilds (adhoc signature changes).
         let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         _ = AXIsProcessTrustedWithOptions(opts)
-        defaults.set(true, forKey: promptedKey)
-        NSLog("MacAgent: Prompted for Accessibility (once). Grant it for ⌃⌥Space + UI control.")
+        if AXIsProcessTrusted() {
+            NSLog("MacAgent: Accessibility granted.")
+        } else {
+            NSLog(
+                "MacAgent: Accessibility still off for this binary. "
+                + "Toggle MacAgent OFF→ON in System Settings → Privacy & Security → Accessibility, "
+                + "then quit and reopen the app."
+            )
+        }
     }
 }

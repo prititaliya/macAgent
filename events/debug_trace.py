@@ -44,7 +44,7 @@ class DebugTraceStore:
         entry = {
             "ts": time.time(),
             "name": name,
-            **{k: _clip(v) for k, v in payload.items()},
+            **_clip_step_payload(payload),
         }
         with self._lock:
             trace = self._current.get(trace_id)
@@ -94,17 +94,44 @@ class DebugTraceStore:
         return None
 
 
-def _clip(value: Any, max_chars: int = 12000) -> Any:
+def _clip(value: Any, max_chars: int = 4000) -> Any:
     if value is None or isinstance(value, (bool, int, float)):
         return value
     if isinstance(value, dict):
-        return {str(k): _clip(v, max_chars=max(500, max_chars // 2)) for k, v in value.items()}
+        return {
+            str(k): _clip(v, max_chars=max(400, max_chars // 2))
+            for k, v in value.items()
+        }
     if isinstance(value, list):
-        return [_clip(v, max_chars=max(500, max_chars // 2)) for v in value[:40]]
+        return [_clip(v, max_chars=max(400, max_chars // 2)) for v in value[:40]]
     text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
     if len(text) > max_chars:
         return text[: max_chars - 1] + "…"
     return text
+
+
+# Keys that used to dump multi-KB prompts into every Debug row (SwiftUI crash).
+_PROMPT_KEYS = frozenset(
+    {
+        "system_prompt",
+        "user_prompt",
+        "raw_output",
+        "context",
+        "messages",
+    }
+)
+
+
+def _clip_step_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for k, v in payload.items():
+        if k in _PROMPT_KEYS and isinstance(v, str):
+            out[k] = _clip(v, 600)
+        elif k in _PROMPT_KEYS:
+            out[k] = _clip(v, 1200)
+        else:
+            out[k] = _clip(v)
+    return out
 
 
 # Thread-local active trace for nested LLM calls without plumbing ids everywhere.

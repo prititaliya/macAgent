@@ -1,18 +1,22 @@
 """DuckDuckGo search + page fetch — no API key.
 
-Search with `ddgs`, then read page text so the small local model answers from
-real content instead of hallucinating. Does not open a browser window.
+Search with `ddgs`, then read page text so answers are grounded in real
+content. Pages are scraped one at a time; callers can request the next
+unread URL only when the first page isn't enough.
 """
 
 from __future__ import annotations
 
 import logging
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
 _WS_RE = re.compile(r"\s+")
+
+# Cap how many full pages we ever scrape for one query session.
+_MAX_PAGES_TOTAL = 3
 
 
 def search_duckduckgo(query: str, max_results: int = 5) -> List[Dict[str, str]]:
@@ -80,27 +84,105 @@ def fetch_page_text(url: str, max_chars: int = 4000) -> str:
     return text
 
 
+def _scrape_one(
+    url: str, *, max_chars: int
+) -> Tuple[str, str]:
+    """Return (page_block, url) or ("", "") if too thin."""
+    href = (url or "").strip()
+    if not href:
+        return "", ""
+    page = fetch_page_text(href, max_chars=max_chars)
+    if len(page) < 80:
+        return "", ""
+    return f"Page content from {href}:\n{page}", href
+
+
+def fetch_next_pages(
+    urls: List[str],
+    *,
+    pages_to_read: int = 1,
+    max_chars_per_page: int = 2800,
+    already_read: int = 0,
+) -> Tuple[str, List[str], List[str], int]:
+    """Scrape the next N unread URLs.
+
+    Returns (context_block, fetched_urls, still_unread, pages_read_total).
+    """
+    remaining = [u for u in (urls or []) if isinstance(u, str) and u.strip()]
+    if pages_to_read < 1 or already_read >= _MAX_PAGES_TOTAL:
+        return "", [], remaining, already_read
+
+    budget = min(pages_to_read, _MAX_PAGES_TOTAL - already_read)
+    blocks: List[str] = []
+    fetched: List[str] = []
+    unread = list(remaining)
+    read = already_read
+
+    while unread and len(fetched) < budget:
+        href = unread.pop(0)
+        block, used = _scrape_one(href, max_chars=max_chars_per_page)
+        if not block:
+            continue
+        blocks.append(block)
+        fetched.append(used)
+        read += 1
+
+    return "\n\n".join(blocks), fetched, unread, read
+
+
 def build_grounded_context(
     query: str,
     *,
     max_results: int = 4,
-    pages_to_read: int = 2,
+    pages_to_read: int = 1,
     max_chars_per_page: int = 2800,
-) -> Tuple[str, List[str]]:
-    """Search, read top pages, return (context_for_llm, source_urls)."""
+    unread_urls: Optional[List[str]] = None,
+    pages_already_read: int = 0,
+) -> Dict[str, Any]:
+    """Search (or continue), scrape up to pages_to_read pages.
+
+    Returns dict with context, sources, unread_urls, pages_read, scraped.
+    Default scrapes **one** page; pass unread_urls to read the next one.
+    """
+    # Continue mode: only fetch the next unread page(s).
+    if unread_urls:
+        block, fetched, still, read = fetch_next_pages(
+            list(unread_urls),
+            pages_to_read=pages_to_read,
+            max_chars_per_page=max_chars_per_page,
+            already_read=max(0, int(pages_already_read or 0)),
+        )
+        return {
+            "context": block,
+            "sources": fetched,
+            "unread_urls": still,
+            "pages_read": read,
+            "scraped": bool(fetched),
+            "continued": True,
+        }
+
     results = search_duckduckgo(query, max_results=max_results)
     if not results:
-        return "", []
+        return {
+            "context": "",
+            "sources": [],
+            "unread_urls": [],
+            "pages_read": 0,
+            "scraped": False,
+            "continued": False,
+        }
 
     sources: List[str] = []
     blocks: List[str] = []
+    candidate_urls: List[str] = []
 
-    # Always include search snippets as a thin fallback layer.
     snippet_lines = []
     for i, r in enumerate(results[:max_results], start=1):
         href = r.get("href") or ""
         if href and href not in sources:
             sources.append(href)
+        if href and href not in candidate_urls:
+            candidate_urls.append(href)
         snippet_lines.append(
             f"{i}. {r.get('title') or '(no title)'}\n"
             f"   {r.get('body') or ''}\n"
@@ -108,24 +190,26 @@ def build_grounded_context(
         )
     blocks.append("Search hits:\n" + "\n".join(snippet_lines))
 
-    read = 0
-    for r in results:
-        if read >= pages_to_read:
-            break
-        href = r.get("href") or ""
-        if not href:
-            continue
-        page = fetch_page_text(href, max_chars=max_chars_per_page)
-        if len(page) < 80:
-            continue
-        read += 1
-        blocks.append(
-            f"Page content from {href}:\n{page}"
-        )
-        if href not in sources:
-            sources.append(href)
+    page_block, fetched, still, read = fetch_next_pages(
+        candidate_urls,
+        pages_to_read=max(1, int(pages_to_read or 1)),
+        max_chars_per_page=max_chars_per_page,
+        already_read=0,
+    )
+    if page_block:
+        blocks.append(page_block)
+        for href in fetched:
+            if href not in sources:
+                sources.append(href)
 
-    return "\n\n".join(blocks), sources
+    return {
+        "context": "\n\n".join(blocks),
+        "sources": sources,
+        "unread_urls": still,
+        "pages_read": read,
+        "scraped": bool(fetched),
+        "continued": False,
+    }
 
 
 def format_results_for_llm(results: List[Dict[str, str]], limit: int = 5) -> str:

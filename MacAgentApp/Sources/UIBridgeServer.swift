@@ -59,7 +59,15 @@ final class UIBridgeServer {
                 return
             }
             if isComplete || error != nil {
-                connection.cancel()
+                // Incomplete headers/body — never pretend it was a valid JSON request.
+                if !buf.isEmpty {
+                    self.sendHTTP(
+                        connection: connection,
+                        json: ["ok": false, "error": "incomplete HTTP request"]
+                    )
+                } else {
+                    connection.cancel()
+                }
                 return
             }
             self.readRequest(connection: connection, buffer: buf)
@@ -80,33 +88,63 @@ final class UIBridgeServer {
         })
     }
 
+    /// Return the body only when headers are complete AND Content-Length bytes have arrived.
     private static func extractHTTPBody(_ data: Data) -> Data? {
-        let needle: [UInt8] = [13, 10, 13, 10]
         guard data.count >= 4 else { return nil }
         let bytes = [UInt8](data)
-        if bytes.count >= 4 {
-            for i in 0...(bytes.count - 4) {
-                if bytes[i] == 13, bytes[i + 1] == 10, bytes[i + 2] == 13, bytes[i + 3] == 10 {
-                    return Data(bytes[(i + 4)...])
-                }
+        var headerEnd: Int?
+        for i in 0...(bytes.count - 4) {
+            if bytes[i] == 13, bytes[i + 1] == 10, bytes[i + 2] == 13, bytes[i + 3] == 10 {
+                headerEnd = i + 4
+                break
             }
         }
-        _ = needle
-        return nil
+        guard let start = headerEnd else { return nil }
+        let headerData = Data(bytes[0..<start])
+        let headerText = String(data: headerData, encoding: .utf8) ?? ""
+        var contentLength: Int?
+        for line in headerText.split(whereSeparator: \.isNewline) {
+            let lower = line.lowercased()
+            if lower.hasPrefix("content-length:") {
+                let raw = line.dropFirst("content-length:".count)
+                    .trimmingCharacters(in: .whitespaces)
+                contentLength = Int(raw)
+                break
+            }
+        }
+        let available = bytes.count - start
+        if let need = contentLength {
+            if available < need { return nil }
+            return Data(bytes[start..<(start + need)])
+        }
+        // No Content-Length: only accept if the connection already finished (caller
+        // passes complete buffers). Prefer waiting — return nil until isComplete path.
+        if available == 0 { return nil }
+        return Data(bytes[start...])
     }
 
     private func dispatch(_ data: Data) -> [String: Any] {
+        guard !data.isEmpty else {
+            return ["ok": false, "error": "empty request body"]
+        }
         guard
             let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
             let op = obj["op"] as? String
         else {
-            return ["ok": false, "error": "invalid request"]
+            let preview = String(data: data.prefix(200), encoding: .utf8) ?? ""
+            return [
+                "ok": false,
+                "error": "invalid request",
+                "preview": preview,
+            ]
         }
 
         return DispatchQueue.main.sync {
             switch op {
             case "ping":
                 return ["ok": true, "trusted": AXIsProcessTrusted()]
+            case "ensure_accessibility":
+                return Self.ensureAccessibility(prompt: true)
             case "snapshot":
                 return snapshot(limit: (obj["limit"] as? Int) ?? 40)
             case "click":
@@ -116,7 +154,10 @@ final class UIBridgeServer {
                     index: (obj["index"] as? Int) ?? 1
                 )
             case "type":
-                return typeText((obj["text"] as? String) ?? "")
+                return typeText(
+                    (obj["text"] as? String) ?? "",
+                    app: (obj["app"] as? String) ?? ""
+                )
             case "key":
                 return keyStroke(
                     key: (obj["key"] as? String) ?? "return",
@@ -131,6 +172,37 @@ final class UIBridgeServer {
                 return ["ok": false, "error": "unknown op"]
             }
         }
+    }
+
+    /// Prompt (or re-check) Accessibility. Ad-hoc rebuilds often need toggle off→on again.
+    static func ensureAccessibility(prompt: Bool) -> [String: Any] {
+        if AXIsProcessTrusted() {
+            return [
+                "ok": true,
+                "trusted": true,
+                "message": "Accessibility is granted for this MacAgent.app.",
+            ]
+        }
+        if prompt {
+            let opts = [
+                kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true,
+            ] as CFDictionary
+            _ = AXIsProcessTrustedWithOptions(opts)
+        }
+        let trusted = AXIsProcessTrusted()
+        return [
+            "ok": trusted,
+            "trusted": trusted,
+            "error": trusted
+                ? ""
+                : (
+                    "macOS still reports MacAgent as untrusted for Accessibility. "
+                    + "In System Settings → Privacy & Security → Accessibility: "
+                    + "turn MacAgent OFF, then ON again, then Quit and reopen MacAgent.app. "
+                    + "After each rebuild/DMG install the toggle often needs that reset "
+                    + "(ad-hoc signature changes)."
+                ),
+        ]
     }
 
     private func runAppleScript(_ source: String) -> (Bool, String, String) {
@@ -152,8 +224,13 @@ final class UIBridgeServer {
     }
 
     private func snapshot(limit: Int) -> [String: Any] {
-        guard AXIsProcessTrusted() else {
-            return ["ok": false, "error": "MacAgent needs Accessibility enabled for MacAgent.app."]
+        let ax = Self.ensureAccessibility(prompt: true)
+        guard ax["trusted"] as? Bool == true else {
+            return [
+                "ok": false,
+                "error": (ax["error"] as? String)
+                    ?? "MacAgent needs Accessibility enabled for MacAgent.app.",
+            ]
         }
         let front = runAppleScript(
             "tell application \"System Events\" to get name of first process whose frontmost is true"
@@ -195,8 +272,13 @@ final class UIBridgeServer {
     }
 
     private func click(name: String, role: String, index: Int) -> [String: Any] {
-        guard AXIsProcessTrusted() else {
-            return ["ok": false, "error": "MacAgent needs Accessibility enabled."]
+        let ax = Self.ensureAccessibility(prompt: true)
+        guard ax["trusted"] as? Bool == true else {
+            return [
+                "ok": false,
+                "error": (ax["error"] as? String)
+                    ?? "MacAgent needs Accessibility enabled.",
+            ]
         }
         let front = runAppleScript(
             "tell application \"System Events\" to get name of first process whose frontmost is true"
@@ -251,22 +333,49 @@ final class UIBridgeServer {
         return ["ok": true, "app": app, "result": r.1, "name": name, "role": role]
     }
 
-    private func typeText(_ text: String) -> [String: Any] {
-        guard AXIsProcessTrusted() else {
-            return ["ok": false, "error": "MacAgent needs Accessibility enabled."]
+    private func typeText(_ text: String, app: String = "") -> [String: Any] {
+        let ax = Self.ensureAccessibility(prompt: true)
+        guard ax["trusted"] as? Bool == true else {
+            return [
+                "ok": false,
+                "error": (ax["error"] as? String)
+                    ?? "MacAgent needs Accessibility enabled.",
+            ]
         }
+        if !app.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            _ = runAppleScript("tell application \"\(esc(app))\" to activate")
+        } else {
+            // Overlay often steals focus after open_app — bump current frontmost.
+            _ = runAppleScript("""
+            tell application "System Events"
+              set frontApp to first process whose frontmost is true
+              set frontmost of frontApp to true
+            end tell
+            """)
+        }
+        Thread.sleep(forTimeInterval: 0.2)
         let r = runAppleScript("""
         tell application "System Events"
           keystroke "\(esc(text))"
         end tell
         """)
         if !r.0 { return ["ok": false, "error": r.2] }
-        return ["ok": true, "typed_chars": text.count, "result": "typed"]
+        return [
+            "ok": true,
+            "typed_chars": text.count,
+            "app": app,
+            "result": "typed",
+        ]
     }
 
     private func keyStroke(key: String, modifiers: String) -> [String: Any] {
-        guard AXIsProcessTrusted() else {
-            return ["ok": false, "error": "MacAgent needs Accessibility enabled."]
+        let ax = Self.ensureAccessibility(prompt: true)
+        guard ax["trusted"] as? Bool == true else {
+            return [
+                "ok": false,
+                "error": (ax["error"] as? String)
+                    ?? "MacAgent needs Accessibility enabled.",
+            ]
         }
         let keyCodes: [String: Int] = [
             "return": 36, "enter": 76, "escape": 53, "esc": 53,
@@ -299,8 +408,13 @@ final class UIBridgeServer {
     }
 
     private func menu(app: String, path: String) -> [String: Any] {
-        guard AXIsProcessTrusted() else {
-            return ["ok": false, "error": "MacAgent needs Accessibility enabled."]
+        let ax = Self.ensureAccessibility(prompt: true)
+        guard ax["trusted"] as? Bool == true else {
+            return [
+                "ok": false,
+                "error": (ax["error"] as? String)
+                    ?? "MacAgent needs Accessibility enabled.",
+            ]
         }
         let parts = path.split(separator: ">").map {
             $0.trimmingCharacters(in: .whitespaces)

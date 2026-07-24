@@ -6,12 +6,24 @@
   "db_path": "",
   "default_browser": "chrome",
   "lazy_load_model": true,
+  "n_ctx": 32768,
+  "temperature": 0.2,
+  "min_p": 0.05,
+  "flash_attn": false,
   "tts_enabled": true,
   "tts_voice": "af_heart",
   "tts_lang": "a",
   "tts_speed": 1.0,
-  "tts_volume": 0.95,
+  "tts_volume": 0.85,
   "tts_speak_status": true,
   "tts_speak_answer": true,
-  "tts_muted": true
+  "tts_muted": true,
+  "cloud": {
+    "enabled": false,
+    "provider": "deepseek",
+    "base_url": "https://api.deepseek.com/v1",
+    "api_key": "",
+    "model_name": "deepseek-v4-flash",
+    "route_general_queries": true
+  }
 }

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import re
 import subprocess
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -11,13 +10,11 @@ from typing import Any, Callable, Optional
 from memory.sqlite import ContextMemory
 from memory.user_context import (
     context_payload,
-    load_user_notes,
     save_user_notes,
 )
 from tools.duckduckgo import build_grounded_context
 from tools.mac_alerts import trigger_native_notification_from_args
 from tools.mac_diagnostics import manage_system_resources_from_args
-from tools.mac_search import spotlight_file_search_from_args
 from tools.mac_system import (
     control_mac_from_args,
     control_power_management_from_args,
@@ -30,7 +27,6 @@ from automation import ui_control
 logger = logging.getLogger(__name__)
 
 _HOME = Path.home()
-_MAX_FIND = 15
 
 # Whitelisted System Settings / Preferences panes (open only — no toggles).
 _SYSTEM_SETTINGS_PANES: dict[str, str] = {
@@ -57,32 +53,27 @@ _SYSTEM_SETTINGS_PANES: dict[str, str] = {
 
 
 TOOL_CATALOG = """
-Available tools (reply with ONE JSON object: {"tool":"...","args":{...}}):
-- respond: {"text":"…"} — greetings, Q&A, or ONLY when the user goal is fully done
-- web_search: {"query":"…"} — factual / live questions; if prior search lacked prices/facts, search again with a sharper query
-- open_app: {"name":"Safari"} — only if user asked to open an app
-- open_url: {"url":"https://…"} — only if user asked to open a site (Chrome)
-- open_folder: {"query":"comp3370"} — find and open a folder in Finder (prefer over bash find)
-- open_system_settings: {"pane":"wifi|bluetooth|…"} — only if user asked to OPEN Settings GUI
-- control_mac: {"feature":"wifi|bluetooth|volume|appearance","state":"on|off|toggle|mute|unmute|dark|light"} — turn Wi‑Fi/Bluetooth on/off, mute volume, dark/light mode
-- manage_system_resources: {"action":"kill","target_process":"Google Chrome"} — CLOSE/QUIT/KILL an app or process; {"action":"list"} for top CPU/memory
-- modify_system_setting: {"domain":"NSGlobalDomain","key":"AppleInterfaceStyle","value":"Dark","value_type":"string"} — ONLY for prefs/defaults (Dock etc.); prefer control_mac for dark mode / wifi
-- control_power_management: {"setting":"sleep","value":10} — ONLY for pmset power/sleep timeouts when user asked about sleep/display timeout/battery; NEVER for closing apps or wifi
-- spotlight_file_search: {"query":"invoice.pdf"} — fast system-wide Spotlight (mdfind); returns top 15 absolute paths
-- trigger_native_notification: {"title":"Done","subtitle":"MacAgent","message":"Task finished","play_sound":true} — Notification Center alert
-- run_bash: {"command":"…"} — file/shell tasks; multi-step OK (list then delete/open)
-- run_python: {"code":"print(2+4)"} — ONLY when the user wants a calculation/result computed; print the answer
-- ui_snapshot / ui_click / ui_type / ui_key / ui_menu — only for explicit on-screen control
-- get_user_context / update_user_context — notes
-- search_past_interactions: {"query":"…","limit":5} — search prior asks/answers
-To turn Wi‑Fi / Bluetooth / mute / dark mode on or off → control_mac (NOT control_power_management, NOT manage_system_resources kill).
-To close/quit an app or browser → manage_system_resources kill (NOT control_power_management, NOT modify_system_setting).
-If the user asks you to calculate/compute a number → run_python (e.g. print(20/40)). Numbers inside notes/examples to explain are NOT calculator requests — respond/explain instead.
-If the user asks for TWO things (open X and Y), use one tool per step — never combine into one open_app name.
-After ls/find_files, if they asked to move/delete/open the result, call run_bash — do NOT respond with only the listing.
-If a tool failed (ok:false), do NOT repeat the same call — try a different tool or respond with the error.
-Prefer spotlight_file_search over slow find/os.walk bash for locating files.
-NEVER invent shut down / restart / empty trash / rm unless the user clearly asked for that (delete/remove/rm).
+Tools (ONE JSON: {"tool":"...","args":{...}}):
+- respond {"text"} — Q&A / done
+- web_search {"query"} — facts / live data; scrapes one page first, more only if thin
+- open_app {"name"} / open_url {"url"} / open_folder {"query"} / open_system_settings {"pane"} — only when user asked to open
+- control_mac {"feature":"wifi|bluetooth|volume|appearance","state":"on|off|toggle|mute|unmute|dark|light"}
+- manage_system_resources {"action":"kill","target_process"} or {"action":"list"}
+- modify_system_setting — defaults prefs only (prefer control_mac for wifi/dark)
+- control_power_management — pmset sleep/display/battery ONLY (never quit apps / wifi)
+- trigger_native_notification {"title","message"}
+- run_bash {"command"} — ls/find(-maxdepth)/mv/rm/open; no mdfind
+- run_python {"code"} — print(...) for calculations only
+- ui_snapshot {"limit":40} — read on-screen UI (Accessibility)
+- ui_click {"name":"5","role":"button"} — click a control by name
+- ui_type {"text":"154*8"} — type into the focused app
+- ui_key {"key":"return"} — press a key (return, escape, …)
+- ui_menu {"app":"…","menu_path":"…"} — choose a menu item
+- get_user_context / update_user_context / search_past_interactions
+Wifi/bt/mute/dark → control_mac. Quit app → manage_system_resources kill.
+Open+type/click/read screen → open_app then ui_type/ui_click/ui_key then ui_snapshot; do not stop after launch.
+Compound asks → one tool per step. After find/ls, act if they asked open/delete/move.
+Never invent shut down / restart / empty trash / rm unless clearly asked.
 """.strip()
 
 
@@ -91,21 +82,17 @@ class ToolRegistry:
         self.memory = memory or ContextMemory()
         self.router = router
         self._handlers: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
-            "find_files": self._find_files,
             "open_folder": self._open_folder,
             "get_user_context": self._get_user_context,
             "update_user_context": self._update_user_context,
             "search_past_interactions": self._search_past_interactions,
-            "list_apps": self._list_apps,
             "open_app": self._open_app,
-            "list_sites": self._list_sites,
             "open_url": self._open_url,
             "web_search": self._web_search,
             "open_system_settings": self._open_system_settings,
             "control_mac": self._control_mac,
             "modify_system_setting": self._modify_system_setting,
             "control_power_management": self._control_power_management,
-            "spotlight_file_search": self._spotlight_file_search,
             "manage_system_resources": self._manage_system_resources,
             "trigger_native_notification": self._trigger_native_notification,
             "run_python": self._run_python,
@@ -117,9 +104,6 @@ class ToolRegistry:
             "ui_menu": self._ui_menu,
             "respond": self._respond,
         }
-
-    def names(self) -> list[str]:
-        return sorted(self._handlers.keys())
 
     def run(self, tool: str, args: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         name = (tool or "").strip()
@@ -138,73 +122,6 @@ class ToolRegistry:
             logger.exception("Tool %s failed", name)
             return {"ok": False, "error": str(exc)}
 
-    def _find_files(self, args: dict[str, Any]) -> dict[str, Any]:
-        query = str(args.get("query") or "").strip()
-        if not query:
-            return {"ok": False, "error": "query required"}
-        limit = min(int(args.get("limit") or 10), _MAX_FIND)
-
-        # "recently downloaded" / Downloads folder — sort by newest first.
-        if self._is_recent_downloads_query(query):
-            items = self._list_recent_downloads(limit=limit)
-            return {
-                "ok": True,
-                "count": len(items),
-                "paths": [i["path"] for i in items],
-                "items": items,
-                "scope": "Downloads",
-            }
-
-        paths = self._mdfind(query, limit=limit)
-        if not paths:
-            paths = self._fallback_find(query, limit=limit)
-        return {"ok": True, "count": len(paths), "paths": paths}
-
-    @staticmethod
-    def _is_recent_downloads_query(query: str) -> bool:
-        q = (query or "").lower()
-        return bool(
-            re.search(
-                r"(recent(ly)?\s+download|download(ed|s)?\s+(item|file|folder)?|"
-                r"last\s+download|newest\s+download|in\s+downloads|"
-                r"^downloads?\b)",
-                q,
-            )
-        )
-
-    def _list_recent_downloads(self, limit: int = 10) -> list[dict[str, Any]]:
-        downloads = _HOME / "Downloads"
-        if not downloads.is_dir():
-            return []
-        entries: list[tuple[float, Path]] = []
-        try:
-            for p in downloads.iterdir():
-                name = p.name
-                if name.startswith("."):
-                    continue
-                try:
-                    st = p.stat()
-                except OSError:
-                    continue
-                # Prefer birth/creation time when available, else mtime.
-                ts = getattr(st, "st_birthtime", None) or st.st_mtime
-                entries.append((float(ts), p))
-        except OSError:
-            return []
-        entries.sort(key=lambda t: t[0], reverse=True)
-        out: list[dict[str, Any]] = []
-        for ts, p in entries[:limit]:
-            kind = "folder" if p.is_dir() else "file"
-            out.append(
-                {
-                    "path": str(p),
-                    "name": p.name,
-                    "kind": kind,
-                    "modified": ts,
-                }
-            )
-        return out
-
     def _open_folder(self, args: dict[str, Any]) -> dict[str, Any]:
         query = str(
             args.get("query") or args.get("name") or args.get("path") or ""
@@ -221,9 +138,7 @@ class ToolRegistry:
                 "message": f"Opened folder {direct}",
             }
 
-        folders = self._mdfind_folders(query, limit=8)
-        if not folders:
-            folders = self._fallback_find_dirs(query, limit=8)
+        folders = self._fallback_find_dirs(query, limit=8)
         if not folders:
             return {"ok": False, "error": f"no folder matching {query!r}", "paths": []}
 
@@ -236,30 +151,6 @@ class ToolRegistry:
             "message": f"Opened folder {chosen}",
             "candidates": folders[:5],
         }
-
-    def _mdfind_folders(self, query: str, limit: int) -> list[str]:
-        safe = query.replace('"', "")
-        spotlight = f"kind:folder {safe}"
-        cmd = ["mdfind", "-onlyin", str(_HOME), spotlight]
-        try:
-            proc = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=12, check=False
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            logger.warning("mdfind folders failed: %s", exc)
-            return []
-        out: list[str] = []
-        for ln in (proc.stdout or "").splitlines():
-            p = ln.strip()
-            if not p or not Path(p).is_dir():
-                continue
-            lower = p.lower()
-            if "/library/caches/" in lower or "/.trash/" in lower:
-                continue
-            out.append(p)
-            if len(out) >= limit:
-                break
-        return out
 
     def _fallback_find_dirs(self, query: str, limit: int) -> list[str]:
         safe = "".join(c for c in query if c.isalnum() or c in " ._-+")[:80].strip()
@@ -307,75 +198,6 @@ class ToolRegistry:
                     return out
         return out
 
-    def _mdfind(self, query: str, limit: int) -> list[str]:
-        # Prefer Spotlight scoped to home.
-        cmd = [
-            "mdfind",
-            "-onlyin",
-            str(_HOME),
-            query,
-        ]
-        try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=12,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            logger.warning("mdfind failed: %s", exc)
-            return []
-        lines = [ln.strip() for ln in (proc.stdout or "").splitlines() if ln.strip()]
-        # Filter out Library caches / junk lightly
-        cleaned = []
-        for p in lines:
-            lower = p.lower()
-            if "/library/caches/" in lower or "/.trash/" in lower:
-                continue
-            cleaned.append(p)
-            if len(cleaned) >= limit:
-                break
-        return cleaned
-
-    def _fallback_find(self, query: str, limit: int) -> list[str]:
-        # Limited find under home for name fragments (no System).
-        safe = "".join(c for c in query if c.isalnum() or c in " ._-+")[:80].strip()
-        if not safe:
-            return []
-        cmd = [
-            "find",
-            str(_HOME),
-            "-maxdepth",
-            "5",
-            "-iname",
-            f"*{safe}*",
-            "-type",
-            "f",
-        ]
-        try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return []
-        paths = []
-        for ln in (proc.stdout or "").splitlines():
-            p = ln.strip()
-            if not p:
-                continue
-            lower = p.lower()
-            if "/library/" in lower or "/.git/" in lower:
-                continue
-            paths.append(p)
-            if len(paths) >= limit:
-                break
-        return paths
-
     def _get_user_context(self, _args: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, **context_payload()}
 
@@ -394,10 +216,6 @@ class ToolRegistry:
         else:
             items = self.memory.recent_interactions(limit=limit)
         return {"ok": True, "items": items, "count": len(items)}
-
-    def _list_apps(self, _args: dict[str, Any]) -> dict[str, Any]:
-        apps = self.memory.list_app_aliases()
-        return {"ok": True, "apps": apps[:40]}
 
     def _open_app(self, args: dict[str, Any]) -> dict[str, Any]:
         name = str(args.get("name") or args.get("app") or args.get("target") or "").strip()
@@ -436,10 +254,6 @@ class ToolRegistry:
             }
         return {"ok": True, "message": f"Launched {name}"}
 
-    def _list_sites(self, _args: dict[str, Any]) -> dict[str, Any]:
-        sites = self.memory.list_purpose_sites()
-        return {"ok": True, "sites": sites[:40]}
-
     def _open_url(self, args: dict[str, Any]) -> dict[str, Any]:
         url = str(args.get("url") or args.get("target") or "").strip()
         if not url:
@@ -473,16 +287,37 @@ class ToolRegistry:
 
     def _web_search(self, args: dict[str, Any]) -> dict[str, Any]:
         query = str(args.get("query") or "").strip()
-        if not query:
+        unread_raw = args.get("unread_urls")
+        unread_urls: list[str] = []
+        if isinstance(unread_raw, list):
+            unread_urls = [str(u).strip() for u in unread_raw if str(u).strip()]
+        pages_already = int(args.get("pages_already_read") or 0)
+        # Always scrape one page at a time; more pages only on explicit continue.
+        pages_to_read = 1
+        if not query and not unread_urls:
             return {"ok": False, "error": "query required"}
-        context, sources = build_grounded_context(
-            query, max_results=5, pages_to_read=3, max_chars_per_page=2400
+        packed = build_grounded_context(
+            query or "(continue)",
+            max_results=5,
+            pages_to_read=pages_to_read,
+            max_chars_per_page=2400,
+            unread_urls=unread_urls or None,
+            pages_already_read=pages_already,
         )
+        context = str(packed.get("context") or "")
+        sources = list(packed.get("sources") or [])
+        still_unread = list(packed.get("unread_urls") or [])
+        pages_read = int(packed.get("pages_read") or 0)
+        scraped = bool(packed.get("scraped"))
         return {
             "ok": bool(context.strip()),
             "query": query,
-            "context": (context or "")[:6000],
+            "context": context[:6000],
             "sources": sources[:5],
+            "unread_urls": still_unread[:8],
+            "pages_read": pages_read,
+            "scraped": scraped,
+            "continued": bool(packed.get("continued")),
         }
 
     def _open_system_settings(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -528,9 +363,6 @@ class ToolRegistry:
     def _control_power_management(self, args: dict[str, Any]) -> dict[str, Any]:
         return control_power_management_from_args(args)
 
-    def _spotlight_file_search(self, args: dict[str, Any]) -> dict[str, Any]:
-        return spotlight_file_search_from_args(args)
-
     def _manage_system_resources(self, args: dict[str, Any]) -> dict[str, Any]:
         return manage_system_resources_from_args(args)
 
@@ -557,7 +389,10 @@ class ToolRegistry:
         )
 
     def _ui_type(self, args: dict[str, Any]) -> dict[str, Any]:
-        return ui_control.ui_type(str(args.get("text") or args.get("string") or ""))
+        return ui_control.ui_type(
+            str(args.get("text") or args.get("string") or ""),
+            app=str(args.get("app") or args.get("application") or ""),
+        )
 
     def _ui_key(self, args: dict[str, Any]) -> dict[str, Any]:
         return ui_control.ui_key(

@@ -276,3 +276,158 @@ struct PrefsSectionLabel: View {
             .foregroundStyle(.secondary)
     }
 }
+
+// MARK: - Markdown body
+
+/// Renders model answers with Markdown (bold, italic, code, links).
+/// Falls back to a lightweight inline converter if Foundation's parser fails —
+/// so `**value**` never shows raw asterisks in the overlay.
+struct MarkdownBody: View {
+    let text: String
+    var fontSize: CGFloat = 15
+
+    init(_ text: String, fontSize: CGFloat = 15) {
+        self.text = text
+        self.fontSize = fontSize
+    }
+
+    var body: some View {
+        // Do not apply `.font()` here — it flattens Markdown bold/italic runs.
+        Text(attributed)
+            .textSelection(.enabled)
+            .tint(Theme.accentDeep)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var attributed: AttributedString {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return AttributedString("") }
+
+        if let parsed = Self.parseMarkdown(trimmed, fontSize: fontSize) {
+            return parsed
+        }
+        return Self.inlineFallback(trimmed, fontSize: fontSize)
+    }
+
+    private static func parseMarkdown(_ raw: String, fontSize: CGFloat) -> AttributedString? {
+        var options = AttributedString.MarkdownParsingOptions()
+        options.interpretedSyntax = .inlineOnlyPreservingWhitespace
+        if let parsed = try? AttributedString(markdown: raw, options: options) {
+            return withBaseFont(parsed, fontSize: fontSize)
+        }
+        options.interpretedSyntax = .full
+        if let parsed = try? AttributedString(markdown: raw, options: options) {
+            return withBaseFont(parsed, fontSize: fontSize)
+        }
+        return nil
+    }
+
+    private static func withBaseFont(_ input: AttributedString, fontSize: CGFloat) -> AttributedString {
+        var result = input
+        let base = Font.system(size: fontSize, weight: .regular)
+        for run in result.runs {
+            guard run.font == nil else { continue }
+            var attrs = AttributeContainer()
+            attrs.font = base
+            result[run.range].mergeAttributes(attrs, mergePolicy: .keepCurrent)
+        }
+        if result.runs.allSatisfy({ $0.font == nil }) {
+            result.font = base
+        }
+        return result
+    }
+
+    /// Manual `**bold**` / `*italic*` / `` `code` `` so asterisks never leak.
+    private static func inlineFallback(_ raw: String, fontSize: CGFloat) -> AttributedString {
+        let baseFont = Font.system(size: fontSize, weight: .regular)
+        let boldFont = Font.system(size: fontSize, weight: .semibold)
+        let italicFont = Font.system(size: fontSize, weight: .regular).italic()
+        let monoFont = Font.system(size: fontSize - 1, weight: .regular, design: .monospaced)
+
+        var output = AttributedString()
+        var i = raw.startIndex
+
+        while i < raw.endIndex {
+            if raw[i] == "`",
+               let close = raw[raw.index(after: i)...].firstIndex(of: "`"),
+               close > raw.index(after: i)
+            {
+                let inner = raw[raw.index(after: i)..<close]
+                var chunk = AttributedString(String(inner))
+                chunk.font = monoFont
+                chunk.backgroundColor = Color.primary.opacity(0.08)
+                output.append(chunk)
+                i = raw.index(after: close)
+                continue
+            }
+
+            if matchesDelimiter(raw, at: i, delimiter: "**")
+                || matchesDelimiter(raw, at: i, delimiter: "__")
+            {
+                let delim = raw[i] == "*" ? "**" : "__"
+                if let (inner, end) = enclosed(raw, at: i, delimiter: delim) {
+                    var chunk = AttributedString(inner)
+                    chunk.font = boldFont
+                    output.append(chunk)
+                    i = end
+                    continue
+                }
+            }
+
+            if (raw[i] == "*" || raw[i] == "_"),
+               !matchesDelimiter(raw, at: i, delimiter: "**"),
+               !matchesDelimiter(raw, at: i, delimiter: "__")
+            {
+                let delim = String(raw[i])
+                if let (inner, end) = enclosed(raw, at: i, delimiter: delim) {
+                    var chunk = AttributedString(inner)
+                    chunk.font = italicFont
+                    output.append(chunk)
+                    i = end
+                    continue
+                }
+            }
+
+            var plain = AttributedString(String(raw[i]))
+            plain.font = baseFont
+            output.append(plain)
+            i = raw.index(after: i)
+        }
+
+        if output.characters.isEmpty {
+            var plain = AttributedString(raw)
+            plain.font = baseFont
+            return plain
+        }
+        return output
+    }
+
+    private static func matchesDelimiter(_ s: String, at i: String.Index, delimiter: String) -> Bool {
+        guard let end = s.index(i, offsetBy: delimiter.count, limitedBy: s.endIndex) else {
+            return false
+        }
+        return s[i..<end] == delimiter
+    }
+
+    private static func enclosed(
+        _ s: String,
+        at start: String.Index,
+        delimiter: String
+    ) -> (String, String.Index)? {
+        guard matchesDelimiter(s, at: start, delimiter: delimiter) else { return nil }
+        let contentStart = s.index(start, offsetBy: delimiter.count)
+        guard contentStart < s.endIndex else { return nil }
+        var search = contentStart
+        while let found = s[search...].range(of: delimiter)?.lowerBound {
+            if found > contentStart {
+                let inner = String(s[contentStart..<found])
+                if !inner.isEmpty, !inner.contains("\n") {
+                    let end = s.index(found, offsetBy: delimiter.count)
+                    return (inner, end)
+                }
+            }
+            search = s.index(after: found)
+        }
+        return nil
+    }
+}

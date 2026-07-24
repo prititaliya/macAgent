@@ -26,6 +26,9 @@ _play_thread: Optional[threading.Thread] = None
 _afplay_proc: Optional[subprocess.Popen] = None
 _cancel = threading.Event()
 _dictating = False
+# In-memory mute — updated immediately on PUT /v1/settings so status phrases
+# after STT never synthesize while the overlay mute icon is on.
+_runtime_muted: Optional[bool] = None
 
 
 def set_dictating(active: bool) -> None:
@@ -38,6 +41,20 @@ def set_dictating(active: bool) -> None:
 
 def is_dictating() -> bool:
     return _dictating
+
+
+def set_muted(muted: bool) -> None:
+    """Apply mute immediately (and stop any in-flight playback when muting)."""
+    global _runtime_muted
+    _runtime_muted = bool(muted)
+    if _runtime_muted:
+        interrupt()
+
+
+def is_muted() -> bool:
+    if _runtime_muted is not None:
+        return bool(_runtime_muted)
+    return bool(tts_config().get("muted"))
 
 
 def _load_settings() -> dict[str, Any]:
@@ -66,6 +83,8 @@ def tts_config() -> dict[str, Any]:
     except (TypeError, ValueError):
         speed = 1.0
     speed = max(0.5, min(2.0, speed))
+    file_muted = bool(s.get("tts_muted", False))
+    muted = file_muted if _runtime_muted is None else bool(_runtime_muted)
     return {
         "enabled": bool(s.get("tts_enabled", True)),
         "voice": str(s.get("tts_voice") or "af_heart"),
@@ -74,7 +93,7 @@ def tts_config() -> dict[str, Any]:
         "volume": vol,
         "speak_status": bool(s.get("tts_speak_status", True)),
         "speak_answer": bool(s.get("tts_speak_answer", True)),
-        "muted": bool(s.get("tts_muted", False)),
+        "muted": muted,
     }
 
 
@@ -215,6 +234,8 @@ def _synthesize(text: str, cfg: dict[str, Any]) -> list[np.ndarray]:
 
 
 def _speak_sync(text: str, cfg: dict[str, Any]) -> None:
+    if _cancel.is_set() or is_muted() or _dictating:
+        return
     cleaned = (text or "").strip()
     if not cleaned:
         return
@@ -222,12 +243,14 @@ def _speak_sync(text: str, cfg: dict[str, Any]) -> None:
     if len(cleaned) > 2500:
         cleaned = cleaned[:2500].rsplit(" ", 1)[0] + "…"
     try:
+        if is_muted() or _dictating:
+            return
         logger.info("TTS synthesizing %d chars", len(cleaned))
         chunks = _synthesize(cleaned, cfg)
         if not chunks:
             logger.warning("TTS produced no audio for %r", cleaned[:80])
             return
-        if _cancel.is_set():
+        if _cancel.is_set() or is_muted() or _dictating:
             return
         audio = _concat_chunks(chunks, cfg["volume"])
         _play_audio(audio)
@@ -239,7 +262,7 @@ def _speak_sync(text: str, cfg: dict[str, Any]) -> None:
 def speak(text: str, *, interrupt_current: bool = True) -> None:
     """Synthesize and play `text` on a background thread."""
     cfg = tts_config()
-    if not cfg["enabled"] or cfg.get("muted"):
+    if not cfg["enabled"] or cfg.get("muted") or is_muted():
         logger.debug("TTS skipped — disabled or muted")
         return
     if _dictating:
@@ -256,9 +279,16 @@ def speak(text: str, *, interrupt_current: bool = True) -> None:
         if prev is not None and prev.is_alive() and prev is not threading.current_thread():
             prev.join(timeout=0.4)
 
+    # Re-check after interrupt wait — mute may have flipped mid-call.
+    if is_muted() or _dictating:
+        logger.debug("TTS skipped after wait — muted or dictating")
+        return
+
     _cancel.clear()
 
     def _run() -> None:
+        if is_muted() or _dictating:
+            return
         _speak_sync(cleaned, cfg)
 
     t = threading.Thread(target=_run, name="kokoro-tts", daemon=True)
@@ -267,14 +297,20 @@ def speak(text: str, *, interrupt_current: bool = True) -> None:
 
 
 def speak_status(text: str) -> None:
+    """Spoken agent phase lines (thinking / researching / …). Honors mute."""
     cfg = tts_config()
-    if not cfg["enabled"] or not cfg["speak_status"]:
+    if not cfg["enabled"] or cfg.get("muted") or is_muted():
+        return
+    if not cfg["speak_status"]:
         return
     speak(text, interrupt_current=True)
 
 
 def speak_answer(text: str) -> None:
+    """Spoken final answer. Honors mute."""
     cfg = tts_config()
-    if not cfg["enabled"] or not cfg["speak_answer"]:
+    if not cfg["enabled"] or cfg.get("muted") or is_muted():
+        return
+    if not cfg["speak_answer"]:
         return
     speak(text, interrupt_current=True)

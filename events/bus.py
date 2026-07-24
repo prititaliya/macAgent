@@ -28,6 +28,7 @@ class EventBus:
         tool: Optional[str] = None,
         tool_input: Any = None,
         tool_output: Any = None,
+        backend: Optional[str] = None,
     ) -> Dict[str, Any]:
         event: Dict[str, Any] = {
             "id": next(self._ids),
@@ -47,6 +48,8 @@ class EventBus:
             event["tool_input"] = tool_input
         if tool_output is not None:
             event["tool_output"] = tool_output
+        if backend:
+            event["backend"] = backend
         self._buffer.append(event)
         dead: List[asyncio.Queue] = []
         for queue in self._subscribers:

@@ -13,17 +13,24 @@ from pydantic import BaseModel, Field
 
 from events.bus import event_bus
 from events.debug_trace import debug_traces, set_current_trace_id, trace_step
+from llm.cloud import list_cloud_providers, mask_api_key, normalize_cloud_settings
 from llm.inference import LocalIntentParser, needs_browser
 from memory.history_harvest import harvest_chrome_history
 from memory.sqlite import ContextMemory
-from memory.user_context import context_payload, save_user_notes
+from memory.user_context import (
+    clear_cloud_handoff,
+    clear_prior_turns,
+    context_payload,
+    save_user_notes,
+    set_prior_turns,
+)
 from planner.router import CoreRouter
-from tools.agent_loop import AgentLoop
+from tools.agent_loop import AgentLoop, _publish_answer_partial
 from tools.duckduckgo import build_grounded_context
 from tools.pending_actions import take_pending
 from tools.registry import ToolRegistry
 from tools.run_bash import run_bash
-from tools.tts_kokoro import set_dictating, tts_config
+from tools.tts_kokoro import set_dictating, set_muted, tts_config
 from tools.tts_narrator import narrate, narrate_answer
 
 logging.basicConfig(
@@ -131,7 +138,7 @@ def _models_payload() -> dict[str, Any]:
 
 
 settings = _load_settings()
-app = FastAPI(title="MacAgent", version="1.0.1")
+app = FastAPI(title="MacAgent", version="1.5.0")
 
 _parser: Optional[LocalIntentParser] = None
 _router: Optional[CoreRouter] = None
@@ -214,6 +221,17 @@ async def list_models() -> dict[str, Any]:
     return _models_payload()
 
 
+class CloudSettingsBody(BaseModel):
+    model_config = {"protected_namespaces": ()}
+
+    enabled: Optional[bool] = None
+    provider: Optional[str] = None
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None
+    model_name: Optional[str] = None
+    route_general_queries: Optional[bool] = None
+
+
 class SettingsBody(BaseModel):
     tts_enabled: Optional[bool] = None
     tts_voice: Optional[str] = None
@@ -223,10 +241,25 @@ class SettingsBody(BaseModel):
     tts_speak_status: Optional[bool] = None
     tts_speak_answer: Optional[bool] = None
     tts_muted: Optional[bool] = None
+    cloud: Optional[CloudSettingsBody] = None
 
 
 class DictationBody(BaseModel):
     active: bool = False
+
+
+def _cloud_payload() -> dict[str, Any]:
+    cfg = normalize_cloud_settings(settings.get("cloud"))
+    return {
+        "enabled": bool(cfg.get("enabled")),
+        "provider": cfg.get("provider") or "openai",
+        "base_url": cfg.get("base_url") or "https://api.openai.com/v1",
+        "api_key": mask_api_key(str(cfg.get("api_key") or "")),
+        "api_key_set": bool(str(cfg.get("api_key") or "").strip()),
+        "model_name": cfg.get("model_name") or "gpt-4o-mini",
+        "route_general_queries": bool(cfg.get("route_general_queries", True)),
+        "providers": list_cloud_providers(),
+    }
 
 
 def _settings_payload() -> dict[str, Any]:
@@ -243,6 +276,7 @@ def _settings_payload() -> dict[str, Any]:
         "tts_speak_status": cfg["speak_status"],
         "tts_speak_answer": cfg["speak_answer"],
         "tts_muted": cfg["muted"],
+        "cloud": _cloud_payload(),
     }
 
 
@@ -253,10 +287,11 @@ async def get_settings() -> dict[str, Any]:
 
 @app.put("/v1/settings")
 async def put_settings(body: SettingsBody) -> dict[str, Any]:
-    """Persist TTS / agent settings to settings.json."""
+    """Persist TTS / cloud / agent settings to settings.json."""
     global settings
     settings = _load_settings()
     data = body.model_dump(exclude_none=True)
+    cloud_patch = data.pop("cloud", None)
     if "tts_volume" in data:
         data["tts_volume"] = max(0.0, min(1.5, float(data["tts_volume"])))
     if "tts_speed" in data:
@@ -266,11 +301,23 @@ async def put_settings(body: SettingsBody) -> dict[str, Any]:
     if "tts_lang" in data and data["tts_lang"]:
         data["tts_lang"] = str(data["tts_lang"]).strip()[:8]
     settings.update(data)
+    if cloud_patch is not None:
+        current = normalize_cloud_settings(settings.get("cloud"))
+        # Empty api_key in the body means leave the stored key unchanged.
+        if "api_key" in cloud_patch:
+            key = str(cloud_patch.get("api_key") or "").strip()
+            if not key or key.startswith("••••"):
+                cloud_patch = {k: v for k, v in cloud_patch.items() if k != "api_key"}
+        current.update(cloud_patch)
+        settings["cloud"] = normalize_cloud_settings(current)
     _save_settings(settings)
-    if data.get("tts_muted") is True:
-        from tools.tts_kokoro import interrupt
-
-        interrupt()
+    if "tts_muted" in data:
+        set_muted(bool(data["tts_muted"]))
+    if cloud_patch is not None and _parser is not None:
+        try:
+            get_parser().reload_cloud_settings()
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to reload cloud settings on parser")
     return _settings_payload()
 
 
@@ -452,9 +499,16 @@ async def hud_show() -> dict[str, Any]:
     return {"ok": True}
 
 
+class PriorTurn(BaseModel):
+    user: str = ""
+    assistant: str = ""
+
+
 class AskBody(BaseModel):
     text: str = Field(..., min_length=1)
     use_web: Literal["auto", "on", "off"] = "auto"
+    follow_up: bool = False
+    prior_turns: list[PriorTurn] = Field(default_factory=list)
 
 
 class ConfirmBody(BaseModel):
@@ -484,13 +538,38 @@ async def ask_typed(body: AskBody) -> dict[str, Any]:
     if not spoken:
         raise HTTPException(status_code=400, detail="empty text")
     use_web = body.use_web if body.use_web in ("auto", "on", "off") else "auto"
-    accepted = await _dispatch_spoken(spoken, use_web=use_web)
-    return {"ok": accepted, "utterance": spoken, "use_web": use_web}
+    prior: list[dict[str, str]] = []
+    if body.follow_up and body.prior_turns:
+        for t in body.prior_turns:
+            u = (t.user or "").strip()
+            a = (t.assistant or "").strip()
+            if u or a:
+                prior.append({"user": u, "assistant": a})
+    accepted = await _dispatch_spoken(
+        spoken, use_web=use_web, prior_turns=prior or None
+    )
+    return {
+        "ok": accepted,
+        "utterance": spoken,
+        "use_web": use_web,
+        "follow_up": bool(prior),
+        "prior_turns": len(prior),
+    }
+
+
+@app.post("/v1/chat")
+async def chat_typed(body: AskBody) -> dict[str, Any]:
+    """Alias of /v1/ask — ChatML agent loop entry (architecture diagram)."""
+    return await ask_typed(body)
 
 
 @app.post("/v1/confirm")
 async def confirm_action(body: ConfirmBody) -> dict[str, Any]:
-    """Approve or deny a destructive action (empty Trash, rm, etc.)."""
+    """Approve or deny a destructive action (empty Trash, rm, etc.).
+
+    When the agent stored a resume snapshot, Approve/Deny continues the tool loop
+    (append result → Qwen) instead of exiting after a one-shot bash run.
+    """
     pending = take_pending(body.id)
     if not pending:
         raise HTTPException(status_code=404, detail="pending action not found or expired")
@@ -498,8 +577,33 @@ async def confirm_action(body: ConfirmBody) -> dict[str, Any]:
     utterance = str(pending.get("utterance") or "")
     summary = str(pending.get("summary") or "")
     command = str(pending.get("command") or "")
+    resume = pending.get("resume") if isinstance(pending.get("resume"), dict) else {}
 
     if not body.approve:
+        tool_result = {
+            "ok": False,
+            "error": "User denied action",
+            "denied": True,
+            "command": command,
+        }
+        if resume:
+            result = await asyncio.to_thread(
+                get_agent().continue_after_confirm,
+                utterance=utterance,
+                command=command,
+                approved=False,
+                tool_result=tool_result,
+                resume=resume,
+            )
+            get_memory().log_activity(utterance, "confirm", "denied", summary[:300])
+            return {
+                "ok": True,
+                "approved": False,
+                "id": body.id,
+                "continued": True,
+                "result": result,
+            }
+
         event_bus.publish(
             utterance=utterance,
             kind="answer",
@@ -522,9 +626,36 @@ async def confirm_action(body: ConfirmBody) -> dict[str, Any]:
         detail="pending",
         step="confirm",
     )
-    result = run_bash(command, confirmed=True)
-    if result.get("ok"):
-        msg = (result.get("stdout") or "").strip() or "Done."
+    bash_result = run_bash(command, confirmed=True)
+
+    if resume:
+        # Architecture: execute tool → append to ChatML → loop back to Qwen3.
+        result = await asyncio.to_thread(
+            get_agent().continue_after_confirm,
+            utterance=utterance,
+            command=command,
+            approved=True,
+            tool_result=bash_result,
+            resume=resume,
+        )
+        get_memory().log_activity(
+            utterance,
+            "confirm",
+            "approved",
+            str(result.get("answer") or "")[:300],
+        )
+        return {
+            "ok": bool(bash_result.get("ok")),
+            "approved": True,
+            "id": body.id,
+            "continued": True,
+            "bash": bash_result,
+            "result": result,
+        }
+
+    # Legacy one-shot path (no resume snapshot).
+    if bash_result.get("ok"):
+        msg = (bash_result.get("stdout") or "").strip() or "Done."
         cmd_l = command.lower()
         if "empty the trash" in cmd_l:
             msg = "Trash emptied."
@@ -542,16 +673,16 @@ async def confirm_action(body: ConfirmBody) -> dict[str, Any]:
             step="confirm",
             tool="run_bash",
             tool_input={"id": body.id, "command": command},
-            tool_output=result,
+            tool_output=bash_result,
         )
         try:
             narrate_answer(msg)
         except Exception as exc:  # noqa: BLE001
             logger.debug("tts answer skipped: %s", exc)
         get_memory().log_activity(utterance, "confirm", "approved", msg[:300])
-        return {"ok": True, "approved": True, "id": body.id, "result": result}
+        return {"ok": True, "approved": True, "id": body.id, "result": bash_result}
 
-    err = result.get("error") or result.get("stderr") or "command failed"
+    err = bash_result.get("error") or bash_result.get("stderr") or "command failed"
     fail_msg = f"Could not complete that: {err}"
     event_bus.publish(
         utterance=utterance,
@@ -559,7 +690,7 @@ async def confirm_action(body: ConfirmBody) -> dict[str, Any]:
         text=fail_msg,
         detail="confirm_failed",
         step="confirm",
-        tool_output=result,
+        tool_output=bash_result,
     )
     try:
         narrate_answer(fail_msg)
@@ -745,13 +876,19 @@ def _prefer_web_context(spoken: str) -> bool:
 
 
 def _handle_spoken(
-    spoken: str, trace_id: Optional[int] = None, use_web: str = "auto"
+    spoken: str,
+    trace_id: Optional[int] = None,
+    use_web: str = "auto",
+    prior_turns: Optional[list[dict[str, str]]] = None,
 ) -> None:
     """Agent tool loop (with a tiny local-only fast path)."""
     set_current_trace_id(trace_id)
+    set_prior_turns(prior_turns)
     try:
         _handle_spoken_inner(spoken, use_web=use_web)
     finally:
+        clear_cloud_handoff()
+        clear_prior_turns()
         set_current_trace_id(None)
 
 
@@ -765,18 +902,32 @@ def _handle_spoken_inner(spoken: str, use_web: str = "auto") -> None:
         # Skip the GGUF for pure greetings — avoids Metal decode failures under RAM pressure.
         lower = text.lower().rstrip("!.? ")
         if lower in {"who are you", "what can you do"}:
-            reply = get_parser().generate_answer(text)
+            reply = get_parser().generate_answer(
+                text,
+                on_token=lambda t: _publish_answer_partial(
+                    text,
+                    t,
+                    backend=(
+                        "cloud"
+                        if get_parser()._cloud.should_use_cloud(text)
+                        else "local"
+                    ),
+                ),
+            )
+            backend = getattr(get_parser(), "last_answer_backend", "local") or "local"
         else:
             reply = (
                 "Hey — I'm MacAgent. Ask me anything, or say “what can you do?” "
                 "for a quick list."
             )
+            backend = "local"
         get_memory().log_activity(text, "answer", "local_fast", reply)
         event_bus.publish(
             utterance=text,
             kind="answer",
             text=reply,
             detail="local_fast",
+            backend=backend,
         )
         try:
             narrate_answer(reply)
@@ -811,12 +962,17 @@ def _answer_with_web_context(spoken: str) -> bool:
         text="Searching & reading sources…",
         detail="pending",
     )
-    context, sources = build_grounded_context(
-        spoken, max_results=4, pages_to_read=2, max_chars_per_page=2800
+    context_pack = build_grounded_context(
+        spoken, max_results=4, pages_to_read=1, max_chars_per_page=2800
     )
+    context = str(context_pack.get("context") or "")
+    sources = list(context_pack.get("sources") or [])
+    unread = list(context_pack.get("unread_urls") or [])
     trace_step(
         "web_grounded",
         sources=sources,
+        unread_urls=unread[:5],
+        pages_read=context_pack.get("pages_read"),
         context_chars=len(context or ""),
         context_preview=(context or "")[:2000],
     )
@@ -825,18 +981,73 @@ def _answer_with_web_context(spoken: str) -> bool:
         trace_step("web_grounded", ok=False)
         return False
 
-    reply = get_parser().answer_from_search(spoken, context)
+    reply = get_parser().answer_from_search(
+        spoken,
+        context,
+        on_token=lambda t: _publish_answer_partial(
+            spoken,
+            t,
+            backend=(
+                "cloud"
+                if get_parser()._cloud.cloud_ready()
+                and (
+                    bool(context_pack.get("scraped"))
+                    or get_parser()._cloud.should_use_cloud(spoken)
+                )
+                else "local"
+            ),
+        ),
+    )
+    # If the first page wasn't enough, scrape the next unread URL once.
+    from llm.inference import _is_empty_refusal
+
+    if (
+        unread
+        and (
+            _is_empty_refusal(reply)
+            or not (reply or "").strip()
+        )
+    ):
+        event_bus.publish(
+            utterance=spoken,
+            kind="action",
+            text="Reading another source…",
+            detail="pending",
+        )
+        more = build_grounded_context(
+            spoken,
+            pages_to_read=1,
+            max_chars_per_page=2800,
+            unread_urls=unread,
+            pages_already_read=int(context_pack.get("pages_read") or 0),
+        )
+        extra = str(more.get("context") or "")
+        if extra.strip():
+            context = f"{context}\n\n{extra}"
+            for u in more.get("sources") or []:
+                if u not in sources:
+                    sources.append(u)
+            reply = get_parser().answer_from_search(
+                spoken,
+                context,
+                on_token=lambda t: _publish_answer_partial(
+                    spoken, t, backend="cloud"
+                ),
+            )
+
     if sources:
         shown = sources[:3]
         src_lines = "\n".join(f"- {u}" for u in shown)
         reply = f"{reply}\n\nSources:\n{src_lines}"
 
+    backend = getattr(get_parser(), "last_answer_backend", "local") or "local"
     get_memory().log_activity(spoken, "answer", "duckduckgo_grounded", reply[:500])
     event_bus.publish(
         utterance=spoken,
         kind="answer",
         text=reply,
         detail="duckduckgo_grounded",
+        backend=backend,
     )
     try:
         narrate_answer(reply)
@@ -918,7 +1129,11 @@ async def intercept_freeflow_stream(request: Request) -> JSONResponse:
     return _completion("EMPTY")
 
 
-async def _dispatch_spoken(spoken: str, use_web: str = "auto") -> bool:
+async def _dispatch_spoken(
+    spoken: str,
+    use_web: str = "auto",
+    prior_turns: Optional[list[dict[str, str]]] = None,
+) -> bool:
     """Run answer-or-act for one utterance. Returns False if skipped as duplicate."""
     key = spoken.strip().lower()
     if key in _in_flight or _should_skip_duplicate(spoken):
@@ -938,7 +1153,7 @@ async def _dispatch_spoken(spoken: str, use_web: str = "auto") -> bool:
     except Exception as exc:  # noqa: BLE001
         logger.debug("tts narrate thinking skipped: %s", exc)
     try:
-        await asyncio.to_thread(_handle_spoken, spoken, tid, mode)
+        await asyncio.to_thread(_handle_spoken, spoken, tid, mode, prior_turns)
         debug_traces.finish(tid, status="ok")
     except Exception as exc:  # noqa: BLE001
         debug_traces.finish(tid, status="error", result=str(exc))

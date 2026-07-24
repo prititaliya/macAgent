@@ -5,12 +5,15 @@ from __future__ import annotations
 import json
 import logging
 import re
-from pathlib import Path
 from typing import Any, Optional
 
 from events.bus import event_bus
 from events.debug_trace import trace_step
-from tools.pending_actions import create_pending, clear_all as clear_pending_actions
+from tools.pending_actions import (
+    create_pending,
+    clear_all as clear_pending_actions,
+    update_pending_resume,
+)
 from tools.registry import TOOL_CATALOG, ToolRegistry
 from tools.run_bash import (
     empty_trash_command,
@@ -27,13 +30,34 @@ _MAX_WEB_SEARCHES = 3
 _MAX_IDENTICAL_FAILURES = 2
 _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 
+
+def _publish_answer_partial(
+    utterance: str, text: str, *, backend: str = "local"
+) -> None:
+    """Stream accumulated answer text to the overlay via SSE (detail=partial)."""
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return
+    try:
+        event_bus.publish(
+            utterance=utterance or "",
+            kind="answer",
+            text=cleaned,
+            detail="partial",
+            backend=backend,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
 _ACTION_RE = re.compile(
     r"(?i)\b("
     r"shut\s*down|turn\s+off|power\s+off|restart|reboot|sleep|log\s*out|"
     r"empty\s+(the\s+)?(bin|trash)|delete|remove|install|quit|close|"
     # bare "open" is handled via _is_open_action (avoids open-source / open to …)
     r"click|press|type|launch|start|enable|disable|toggle|"
-    r"set|change|move|copy|create|make|do\s+it|perform|run\s+this"
+    r"set|change|move|copy|create|make|do\s+it|perform|run\s+this|"
+    r"check\s+(what|which|my|the|if)|"
+    r"compare|verify|inspect"
     r")\b"
 )
 
@@ -135,7 +159,10 @@ _DISCOVERY_BASH_RE = re.compile(
 
 _DELETE_RE = re.compile(r"(?i)\b(delete|remove|rm|trash)\b")
 _MOVE_RE = re.compile(r"(?i)\b(move|relocate|transfer)\b")
-_COPY_RE = re.compile(r"(?i)\b(copy|duplicate)\b")
+# "duplicate files" means find copies — not "duplicate/copy this file".
+_COPY_RE = re.compile(
+    r"(?i)\b(copy)\b|\bduplicate\s+(this|that|it|the\s+file|the\s+folder)\b"
+)
 _PAST_QUERY_RE = re.compile(
     r"(?i)\b("
     r"what\s+did\s+i\s+(ask|say|tell\s+you)|"
@@ -177,12 +204,49 @@ _EMPTY_TRASH_RE = re.compile(
     r"(?i)\b(empty\s+(the\s+)?(bin|trash)|clear\s+(the\s+)?(bin|trash))\b"
 )
 
+# Open alone is not enough when the user also wants on-screen control / readout.
+_GUI_FOLLOWUP_RE = re.compile(
+    r"(?i)\b("
+    r"type|click|press|keystroke|keystrokes|"
+    r"enter\s+(this|that|the|it)|"
+    r"on[\s-]?screen|read\s+(the\s+)?(screen|result|display|calculator)|"
+    r"tell\s+me\s+(the\s+)?(result|answer|number)|"
+    r"what('?s|\s+is)\s+(on\s+)?(the\s+)?(screen|display|result)|"
+    r"ui_(snapshot|click|type|key|menu)"
+    r")\b"
+)
+
+# Hybrid asks: research online AND inspect this Mac (must not stop at advice).
+_LOCAL_MACHINE_CHECK_RE = re.compile(
+    r"(?i)\b("
+    r"(installed|running|present)\s+on\s+(my\s+)?(mac|computer|machine|laptop)|"
+    r"on\s+(my\s+)?(mac|computer|machine|laptop)\b|"
+    r"in\s+(the\s+)?terminal|"
+    r"what\s+version\s+(do\s+i|is\s+installed|am\s+i\s+running)|"
+    r"my\s+(installed|local|current)\s+(version|python|node|ruby|java)|"
+    r"am\s+i\s+(out\s+of\s+date|up\s+to\s+date)|"
+    r"check\s+(what|which|my|the).{0,40}(installed|version|running)|"
+    r"how\s+much\s+(disk|space|storage|ram|memory)\s+(do\s+i|have)|"
+    r"what('?s|\s+is)\s+on\s+(my\s+)?(mac|computer|machine)"
+    r")\b"
+)
+
+_SHELL_ADVICE_RE = re.compile(
+    r"(?i)("
+    r"you\s+can\s+run|"
+    r"run\s+(this|the\s+following|`)|"
+    r"in\s+(the\s+)?terminal[,:]?\s*(run|type|execute)|"
+    r"execute\s+`|"
+    r"try\s+running"
+    r")"
+)
+
 _CAPABILITIES_TEXT = """Here's what I can do on your Mac:
 
 • Answer questions (local model + web search when needed)
 • Open apps and Chrome URLs
 • Turn Wi‑Fi / Bluetooth on or off, mute volume, switch dark/light mode
-• Find files via Spotlight (fast) or shell
+• Find files with shell (find/ls)
 • Change system prefs (defaults) and power settings (pmset) without opening GUI
 • List / kill top CPU & memory processes
 • Send Notification Center alerts (even when the overlay is hidden)
@@ -240,39 +304,226 @@ class AgentLoop:
         self.parser = parser
         self.registry = registry or ToolRegistry()
 
-    def run(self, utterance: str, use_web: str = "auto") -> dict[str, Any]:
-        """Execute tool loop; returns final payload for SSE / activity."""
-        history: list[dict[str, Any]] = []
-        sources: list[Any] = []
-        last_text = ""
-        mode = use_web if use_web in ("auto", "on", "off") else "auto"
-        self._use_web = mode
-        subtasks = _decompose_compound_request(utterance)
-        compound_state = {
-            "subtasks": subtasks,
-            "idx": 0,
-            "results": [],
-            "full_utterance": utterance,
-        }
-        self._compound_state = compound_state
-        # Drop stale Approve cards from a previous (possibly hallucinated) action.
-        clear_pending_actions()
+    def run(
+        self,
+        utterance: str,
+        use_web: str = "auto",
+        *,
+        resume: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Execute tool loop; returns final payload for SSE / activity.
 
-        event_bus.publish(
-            utterance=utterance,
-            kind="trace",
-            text="Received input",
-            detail="input",
-            step="input",
-            tool_input={"utterance": utterance, "use_web": mode},
-        )
-        event_bus.publish(
-            utterance=utterance,
-            kind="action",
-            text="Planning…",
-            detail="pending",
-        )
-        narrate("planning")
+        Pass ``resume`` after Approve/Deny to continue the ChatML tool loop with
+        prior history instead of starting a fresh ask.
+        """
+        if resume:
+            history: list[dict[str, Any]] = list(resume.get("history") or [])
+            sources: list[Any] = list(resume.get("sources") or [])
+            last_text = str(resume.get("last_text") or "")
+            mode = str(resume.get("use_web") or use_web)
+            mode = mode if mode in ("auto", "on", "off") else "auto"
+            compound_state = resume.get("compound_state") or {
+                "subtasks": _decompose_compound_request(utterance),
+                "idx": 0,
+                "results": [],
+                "full_utterance": utterance,
+            }
+            self._use_web = mode
+            self._compound_state = compound_state
+            event_bus.publish(
+                utterance=utterance,
+                kind="action",
+                text="Continuing after approval…" if history else "Planning…",
+                detail="pending",
+            )
+        else:
+            history = []
+            sources = []
+            last_text = ""
+            mode = use_web if use_web in ("auto", "on", "off") else "auto"
+            self._use_web = mode
+            subtasks = _decompose_compound_request(utterance)
+            compound_state = {
+                "subtasks": subtasks,
+                "idx": 0,
+                "results": [],
+                "full_utterance": utterance,
+            }
+            self._compound_state = compound_state
+            # Drop stale Approve cards from a previous (possibly hallucinated) action.
+            clear_pending_actions()
+
+            event_bus.publish(
+                utterance=utterance,
+                kind="trace",
+                text="Received input",
+                detail="input",
+                step="input",
+                tool_input={"utterance": utterance, "use_web": mode},
+            )
+
+            # Knowledge / coding Q&A: skip the heavy tool-loop planner.
+            # Cloud → structured envelope; local-only → generate_answer with a larger token budget.
+            if self._should_direct_answer(utterance, mode):
+                if self.parser._cloud.should_use_cloud(utterance):
+                    event_bus.publish(
+                        utterance=utterance,
+                        kind="action",
+                        text="Asking cloud…",
+                        detail="pending",
+                    )
+                    narrate("thinking")
+                    try:
+                        from memory.user_context import (
+                            clear_cloud_handoff,
+                            set_cloud_handoff,
+                        )
+
+                        env = self.parser.generate_cloud_envelope(utterance)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("cloud envelope failed: %s", exc)
+                        env = {
+                            "final": True,
+                            "answer": "",
+                            "guidance": "",
+                            "commands": [],
+                        }
+
+                    if env.get("final"):
+                        reply = (env.get("answer") or "").strip()
+                        if not reply:
+                            reply = self._local_answer(utterance)
+                        return self._finish(utterance, reply, sources, history)
+
+                    # Not final — cloud wants MacAgent to act locally.
+                    set_cloud_handoff(env)
+                    event_bus.publish(
+                        utterance=utterance,
+                        kind="action",
+                        text="Acting on cloud plan…",
+                        detail="pending",
+                    )
+                    narrate("acting")
+                    guidance = str(env.get("guidance") or "").strip()
+                    commands = [
+                        str(c).strip()
+                        for c in (env.get("commands") or [])
+                        if str(c).strip()
+                    ][:5]
+
+                    for cmd in commands:
+                        if _command_is_destructive(
+                            cmd
+                        ) and not _DESTRUCTIVE_UTTERANCE_RE.search(utterance or ""):
+                            clear_cloud_handoff()
+                            return self._finish(
+                                utterance,
+                                "Cloud suggested a destructive command I won't run "
+                                "unless you explicitly ask (e.g. delete / empty trash). "
+                                f"Guidance was: {guidance or cmd}",
+                                sources,
+                                history,
+                            )
+                        call = {"tool": "run_bash", "args": {"command": cmd}}
+                        event_bus.publish(
+                            utterance=utterance,
+                            kind="trace",
+                            text="Calling run_bash",
+                            detail="tool_call",
+                            step="tool_call",
+                            tool="run_bash",
+                            tool_input={"command": cmd},
+                        )
+                        event_bus.publish(
+                            utterance=utterance,
+                            kind="action",
+                            text="Tool: run_bash",
+                            detail="pending",
+                        )
+                        result = self.registry.run("run_bash", {"command": cmd})
+                        history.append({"call": call, "result": result})
+                        trace_step(
+                            "agent_tool_result",
+                            step=len(history) - 1,
+                            tool="run_bash",
+                            result=_trim(result),
+                            cloud_handoff=True,
+                        )
+                        event_bus.publish(
+                            utterance=utterance,
+                            kind="trace",
+                            text="run_bash → output",
+                            detail="tool_result",
+                            step="tool_result",
+                            tool="run_bash",
+                            tool_input={"command": cmd},
+                            tool_output=_trim(result),
+                        )
+                        if result.get("needs_confirm"):
+                            return self._request_confirm(
+                                utterance,
+                                command=str(result.get("command") or cmd),
+                                summary=str(
+                                    result.get("summary") or guidance or cmd
+                                ),
+                                sources=sources,
+                                history=history,
+                            )
+
+                    # If commands produced useful stdout, answer from that and stop.
+                    bash_outs: list[tuple[str, str]] = []
+                    for item in history:
+                        call = item.get("call") or {}
+                        result = item.get("result") or {}
+                        if call.get("tool") != "run_bash":
+                            continue
+                        out = (result.get("stdout") or "").strip()
+                        if result.get("ok") and out:
+                            bash_outs.append(
+                                (
+                                    str(
+                                        (call.get("args") or {}).get("command") or ""
+                                    ),
+                                    out,
+                                )
+                            )
+                    if bash_outs:
+                        cmd, out = bash_outs[-1]
+                        text = self._format_command_answer(utterance, cmd, out)
+                        if guidance and text and len(out) < 80:
+                            text = f"{text}\n\n({guidance[:240]})"
+                        clear_cloud_handoff()
+                        return self._finish(
+                            utterance, text or out, sources, history
+                        )
+
+                    # No usable command output — continue into the local planner.
+                    event_bus.publish(
+                        utterance=utterance,
+                        kind="action",
+                        text="Planning with cloud guidance…",
+                        detail="pending",
+                    )
+                    narrate("planning")
+                else:
+                    # Local-only knowledge path — no planner/catalog burn.
+                    event_bus.publish(
+                        utterance=utterance,
+                        kind="action",
+                        text="Thinking…",
+                        detail="pending",
+                    )
+                    narrate("thinking")
+                    reply = self._local_answer(utterance)
+                    return self._finish(utterance, reply, sources, history)
+            else:
+                event_bus.publish(
+                    utterance=utterance,
+                    kind="action",
+                    text="Planning…",
+                    detail="pending",
+                )
+                narrate("planning")
 
         for step in range(_MAX_ITERS):
             active = _active_subtask_utterance(compound_state)
@@ -465,6 +716,12 @@ class AgentLoop:
 
             if tool == "web_search" and result.get("ok") and result.get("context"):
                 if _is_action_request(utterance):
+                    # Hybrid version check: local already ran → compare and finish.
+                    hybrid = self._try_hybrid_version_finish(
+                        utterance, sources, history
+                    )
+                    if hybrid is not None:
+                        return hybrid
                     # Research informs the next tool call — do NOT answer-only.
                     event_bus.publish(
                         utterance=utterance,
@@ -476,37 +733,106 @@ class AgentLoop:
                     continue
                 # Merge contexts from earlier searches so retries compound evidence.
                 combined = _combined_search_context(history)
-                reply = self.parser.answer_from_search(utterance, combined)
+                scraped = bool(
+                    re.search(r"(?i)Page content from\s+https?://", combined)
+                )
+                reply = self.parser.answer_from_search(
+                    utterance,
+                    combined,
+                    force_cloud=True if scraped else None,
+                    on_token=lambda t: _publish_answer_partial(
+                        utterance,
+                        t,
+                        backend=(
+                            "cloud"
+                            if (
+                                scraped and self.parser._cloud.cloud_ready()
+                            )
+                            or self.parser._cloud.should_use_cloud(utterance)
+                            else "local"
+                        ),
+                    ),
+                )
                 searches_done = _web_search_count(history)
-                if _answer_needs_more_search(reply) and searches_done < _MAX_WEB_SEARCHES:
-                    history.append(
-                        {
-                            "call": {"tool": "_search_retry", "args": {}},
-                            "result": {
-                                "ok": False,
-                                "incomplete": True,
-                                "needs_more_search": True,
-                                "reason": "web answer lacked enough evidence",
-                                "candidate": (reply or "")[:400],
+                if _answer_needs_more_search(reply):
+                    # Prefer scraping the next unread page over a whole new search.
+                    unread, pages_read, last_q = _last_search_unread(history)
+                    if unread and pages_read < 3:
+                        event_bus.publish(
+                            utterance=utterance,
+                            kind="action",
+                            text=f"Reading another source ({pages_read + 1}/3)…",
+                            detail="pending",
+                        )
+                        narrate("researching")
+                        call = {
+                            "tool": "web_search",
+                            "args": {
+                                "query": last_q or utterance,
+                                "unread_urls": unread,
+                                "pages_already_read": pages_read,
                             },
                         }
-                    )
-                    event_bus.publish(
-                        utterance=utterance,
-                        kind="action",
-                        text=f"Need better sources — searching again ({searches_done}/{_MAX_WEB_SEARCHES})…",
-                        detail="pending",
-                    )
-                    narrate("researching")
-                    event_bus.publish(
-                        utterance=utterance,
-                        kind="trace",
-                        text="Search answer insufficient — retrying",
-                        detail="search_retry",
-                        step="search_retry",
-                        tool_output={"reason": "insufficient", "attempt": searches_done},
-                    )
-                    continue
+                        event_bus.publish(
+                            utterance=utterance,
+                            kind="trace",
+                            text="Prior page insufficient — scraping next URL",
+                            detail="page_retry",
+                            step="page_retry",
+                            tool_output={
+                                "next_url": unread[0],
+                                "pages_read": pages_read,
+                            },
+                        )
+                        more = self.registry.run("web_search", call["args"])
+                        history.append({"call": call, "result": more})
+                        trace_step(
+                            "agent_tool_result",
+                            step=step,
+                            tool="web_search",
+                            result=_trim(more),
+                            page_retry=True,
+                        )
+                        if isinstance(more.get("sources"), list):
+                            for s in more["sources"]:
+                                if s not in sources:
+                                    sources.append(s)
+                        continue
+                    if searches_done < _MAX_WEB_SEARCHES:
+                        history.append(
+                            {
+                                "call": {"tool": "_search_retry", "args": {}},
+                                "result": {
+                                    "ok": False,
+                                    "incomplete": True,
+                                    "needs_more_search": True,
+                                    "reason": "web answer lacked enough evidence",
+                                    "candidate": (reply or "")[:400],
+                                },
+                            }
+                        )
+                        event_bus.publish(
+                            utterance=utterance,
+                            kind="action",
+                            text=(
+                                f"Need better sources — searching again "
+                                f"({searches_done}/{_MAX_WEB_SEARCHES})…"
+                            ),
+                            detail="pending",
+                        )
+                        narrate("researching")
+                        event_bus.publish(
+                            utterance=utterance,
+                            kind="trace",
+                            text="Search answer insufficient — retrying",
+                            detail="search_retry",
+                            step="search_retry",
+                            tool_output={
+                                "reason": "insufficient",
+                                "attempt": searches_done,
+                            },
+                        )
+                        continue
                 finished = self._attempt_finish(utterance, reply, sources, history)
                 if finished is not None:
                     return finished
@@ -565,8 +891,109 @@ class AgentLoop:
                 out = (result.get("stdout") or "").strip()
                 err = (result.get("error") or result.get("stderr") or "").strip()
                 cmd = (result.get("command") or args.get("command") or "").strip()
-                if result.get("ok") and out:
+                # Soft-ok: useful stdout despite later `&&` failure
+                # (e.g. python3 --version worked; bare `python` → 127).
+                bash_ok = bool(result.get("ok")) or (
+                    bool(out)
+                    and not _bash_stdout_is_useless(out)
+                    and bool(
+                        re.search(
+                            r"(?i)command not found|not found|"
+                            r"No such file|permission denied",
+                            err,
+                        )
+                        or re.search(
+                            r"(?i)^(Python|Node|v?\d|ruby|java|go |ProductName|"
+                            r"System Version)",
+                            out,
+                            re.M,
+                        )
+                    )
+                )
+                if bash_ok and out:
+                    # Useless curl/error stdout is not a completed local check.
+                    if _bash_stdout_is_useless(out) and _needs_local_machine_check(
+                        utterance
+                    ):
+                        local_cmd = _preferred_local_check_command(utterance)
+                        if local_cmd and local_cmd not in cmd:
+                            event_bus.publish(
+                                utterance=utterance,
+                                kind="action",
+                                text="Checking this Mac…",
+                                detail="pending",
+                            )
+                            call = {
+                                "tool": "run_bash",
+                                "args": {"command": local_cmd},
+                            }
+                            result = self.registry.run(
+                                "run_bash", {"command": local_cmd}
+                            )
+                            history.append({"call": call, "result": result})
+                            trace_step(
+                                "agent_tool_result",
+                                step=step,
+                                tool="run_bash",
+                                result=_trim(result),
+                                repaired=True,
+                            )
+                            out2 = (result.get("stdout") or "").strip()
+                            if result.get("ok") and out2 and not _bash_stdout_is_useless(
+                                out2
+                            ):
+                                text = self._format_command_answer(
+                                    utterance, local_cmd, out2
+                                )
+                                finished = self._attempt_finish(
+                                    active, text, sources, history
+                                )
+                                if finished is not None:
+                                    return finished
+                            continue
                     text = self._format_command_answer(utterance, cmd, out)
+                    # Never finish with "please run this yourself" on a Mac check ask.
+                    if _candidate_is_shell_advice(text) and _needs_local_machine_check(
+                        utterance
+                    ):
+                        local_cmd = _preferred_local_check_command(utterance)
+                        if local_cmd and not _history_has_command_containing(
+                            history, local_cmd
+                        ):
+                            event_bus.publish(
+                                utterance=utterance,
+                                kind="action",
+                                text="Running local check…",
+                                detail="pending",
+                            )
+                            call = {
+                                "tool": "run_bash",
+                                "args": {"command": local_cmd},
+                            }
+                            result = self.registry.run(
+                                "run_bash", {"command": local_cmd}
+                            )
+                            history.append({"call": call, "result": result})
+                            trace_step(
+                                "agent_tool_result",
+                                step=step,
+                                tool="run_bash",
+                                result=_trim(result),
+                                repaired=True,
+                            )
+                            out2 = (result.get("stdout") or "").strip()
+                            if result.get("ok") and out2 and not _bash_stdout_is_useless(
+                                out2
+                            ):
+                                text = self._format_command_answer(
+                                    utterance, local_cmd, out2
+                                )
+                                finished = self._attempt_finish(
+                                    active, text, sources, history
+                                )
+                                if finished is not None:
+                                    return finished
+                            continue
                     # Discovery-only bash on an action ask → keep looping.
                     if _is_discovery_bash(cmd) and _goal_status(
                         active, history, text
@@ -578,13 +1005,143 @@ class AgentLoop:
                             detail="pending",
                         )
                         continue
+                    # Hybrid "latest online + what's on my Mac" → compare once both exist.
+                    hybrid = self._try_hybrid_version_finish(
+                        active, sources, history
+                    )
+                    if hybrid is not None:
+                        return hybrid
                     finished = self._attempt_finish(
                         active, text, sources, history
                     )
                     if finished is not None:
                         return finished
                     continue
+                # Empty stdout + stderr (e.g. GNU -printf on macOS) is a failure, not "Done".
+                if err and not out:
+                    repaired = _repair_bash_command(cmd, utterance)
+                    already = any(
+                        str(((h.get("call") or {}).get("args") or {}).get("command") or "")
+                        == repaired
+                        for h in history
+                    )
+                    if repaired and repaired != cmd and not already:
+                        event_bus.publish(
+                            utterance=utterance,
+                            kind="action",
+                            text="Retrying shell…",
+                            detail="pending",
+                        )
+                        call = {"tool": "run_bash", "args": {"command": repaired}}
+                        result = self.registry.run("run_bash", {"command": repaired})
+                        history.append({"call": call, "result": result})
+                        trace_step(
+                            "agent_tool_result",
+                            step=step,
+                            tool="run_bash",
+                            result=_trim(result),
+                            repaired=True,
+                        )
+                        out2 = (result.get("stdout") or "").strip()
+                        err2 = (
+                            result.get("error") or result.get("stderr") or ""
+                        ).strip()
+                        if result.get("ok") and out2:
+                            text = self._format_command_answer(
+                                utterance, repaired, out2
+                            )
+                            finished = self._attempt_finish(
+                                active, text, sources, history
+                            )
+                            if finished is not None:
+                                return finished
+                            continue
+                        finished = self._attempt_finish(
+                            active,
+                            f"Shell error: {err2 or err}",
+                            sources,
+                            history,
+                            force=True,
+                        )
+                        if finished is not None:
+                            return finished
+                        continue
+                    finished = self._attempt_finish(
+                        active,
+                        f"Shell error: {err}",
+                        sources,
+                        history,
+                        force=True,
+                    )
+                    if finished is not None:
+                        return finished
+                    continue
                 if result.get("ok") and not out:
+                    # Side-effect cmds (mkdir/touch) may have empty stdout; discovery
+                    # must never report "Done (`find…`)" with no results.
+                    is_discovery = bool(
+                        re.search(
+                            r"(?i)\b(find|du|ls|stat|mdfind|locate|wc|head|tail|"
+                            r"cat|grep|awk|sort)\b",
+                            cmd,
+                        )
+                    )
+                    if is_discovery:
+                        repaired = _repair_bash_command(cmd, utterance)
+                        already = any(
+                            str(
+                                ((h.get("call") or {}).get("args") or {}).get(
+                                    "command"
+                                )
+                                or ""
+                            )
+                            == repaired
+                            for h in history
+                        )
+                        if repaired and repaired != cmd and not already:
+                            event_bus.publish(
+                                utterance=utterance,
+                                kind="action",
+                                text="Retrying shell…",
+                                detail="pending",
+                            )
+                            call = {
+                                "tool": "run_bash",
+                                "args": {"command": repaired},
+                            }
+                            result = self.registry.run(
+                                "run_bash", {"command": repaired}
+                            )
+                            history.append({"call": call, "result": result})
+                            trace_step(
+                                "agent_tool_result",
+                                step=step,
+                                tool="run_bash",
+                                result=_trim(result),
+                                repaired=True,
+                            )
+                            out2 = (result.get("stdout") or "").strip()
+                            if result.get("ok") and out2:
+                                text = self._format_command_answer(
+                                    utterance, repaired, out2
+                                )
+                                finished = self._attempt_finish(
+                                    active, text, sources, history
+                                )
+                                if finished is not None:
+                                    return finished
+                                continue
+                        finished = self._attempt_finish(
+                            active,
+                            "That scan returned no files. "
+                            "Try a specific folder (e.g. Downloads or Documents).",
+                            sources,
+                            history,
+                            force=True,
+                        )
+                        if finished is not None:
+                            return finished
+                        continue
                     text = "Done." if not cmd else f"Done (`{cmd}`)."
                     finished = self._attempt_finish(
                         active, text, sources, history
@@ -592,6 +1149,63 @@ class AgentLoop:
                     if finished is not None:
                         return finished
                     continue
+                # Failed discovery: try a known-good rewrite before giving up.
+                if not result.get("ok") and not out:
+                    repaired = _repair_bash_command(cmd, utterance)
+                    already = any(
+                        str(
+                            ((h.get("call") or {}).get("args") or {}).get("command")
+                            or ""
+                        )
+                        == repaired
+                        for h in history
+                    )
+                    if repaired and repaired != cmd and not already:
+                        event_bus.publish(
+                            utterance=utterance,
+                            kind="action",
+                            text="Retrying shell…",
+                            detail="pending",
+                        )
+                        call = {
+                            "tool": "run_bash",
+                            "args": {"command": repaired},
+                        }
+                        result = self.registry.run(
+                            "run_bash", {"command": repaired}
+                        )
+                        history.append({"call": call, "result": result})
+                        trace_step(
+                            "agent_tool_result",
+                            step=step,
+                            tool="run_bash",
+                            result=_trim(result),
+                            repaired=True,
+                        )
+                        out2 = (result.get("stdout") or "").strip()
+                        err2 = (
+                            result.get("error") or result.get("stderr") or ""
+                        ).strip()
+                        if result.get("ok") and out2:
+                            text = self._format_command_answer(
+                                utterance, repaired, out2
+                            )
+                            finished = self._attempt_finish(
+                                active, text, sources, history
+                            )
+                            if finished is not None:
+                                return finished
+                            continue
+                        finished = self._attempt_finish(
+                            active,
+                            f"Shell error: {err2 or err or 'no output'}",
+                            sources,
+                            history,
+                            force=True,
+                        )
+                        if finished is not None:
+                            return finished
+                        continue
                 finished = self._attempt_finish(
                     active,
                     f"Shell error: {err or 'command failed'}",
@@ -714,93 +1328,42 @@ class AgentLoop:
                 )
                 return self._finish(utterance, err, sources, history)
 
-            # UI tools: keep looping so the agent can multi-step; only stop on hard fail.
+            # UI tools: soft failures retry once via planner; hard permission errors stop.
             if tool in {"ui_snapshot", "ui_click", "ui_type", "ui_key", "ui_menu"}:
                 if not result.get("ok"):
                     err = _friendly_ui_error(result.get("error") or "UI action failed")
-                    return self._finish(utterance, err, sources, history)
+                    hard = bool(
+                        re.search(
+                            r"(?i)accessibility|bridge is offline|not allowed|assistive",
+                            err,
+                        )
+                    )
+                    ui_fails = sum(
+                        1
+                        for h in history
+                        if (h.get("call") or {}).get("tool")
+                        in {
+                            "ui_snapshot",
+                            "ui_click",
+                            "ui_type",
+                            "ui_key",
+                            "ui_menu",
+                        }
+                        and not (h.get("result") or {}).get("ok")
+                    )
+                    if hard or ui_fails >= 2:
+                        return self._finish(utterance, err, sources, history)
+                    # Transient bridge / focus glitch — keep going (e.g. retry type, or click).
+                    event_bus.publish(
+                        utterance=utterance,
+                        kind="action",
+                        text="Screen control hiccup — retrying…",
+                        detail="pending",
+                    )
+                    continue
                 # Successful UI step — continue toward respond / more clicks.
                 continue
 
-            if tool == "find_files" and result.get("ok") and step >= 0:
-                paths = result.get("paths") or []
-                items = result.get("items") or []
-                if paths or items:
-                    lines = []
-                    if items:
-                        for i, it in enumerate(items[:12], 1):
-                            kind = it.get("kind") or "file"
-                            name = it.get("name") or Path(str(it.get("path") or "")).name
-                            path = it.get("path") or ""
-                            lines.append(f"{i}. [{kind}] {name}\n   {path}")
-                        header = (
-                            f"Most recent in Downloads ({len(items)}):"
-                            if result.get("scope") == "Downloads"
-                            else f"Found {len(items)} item(s):"
-                        )
-                    else:
-                        for i, p in enumerate(paths[:12], 1):
-                            lines.append(f"{i}. {p}")
-                        header = f"Found {len(paths)} file(s):"
-                    listing = header + "\n" + "\n".join(lines)
-                    if _goal_status(utterance, history, listing) == "incomplete":
-                        event_bus.publish(
-                            utterance=utterance,
-                            kind="action",
-                            text="Acting on results…",
-                            detail="pending",
-                        )
-                        continue
-                    finished = self._attempt_finish(
-                        utterance, listing, sources, history
-                    )
-                    if finished is not None:
-                        return finished
-                    continue
-                finished = self._attempt_finish(
-                    utterance,
-                    "No matching files found.",
-                    sources,
-                    history,
-                    force=True,
-
-                )
-                if finished is not None:
-                    return finished
-                continue
-
-            if tool == "spotlight_file_search" and result.get("ok") and step >= 0:
-                paths = result.get("paths") or []
-                if paths:
-                    lines = [f"{i}. {p}" for i, p in enumerate(paths[:15], 1)]
-                    listing = (
-                        f"Spotlight found {len(paths)} file(s):\n"
-                        + "\n".join(lines)
-                    )
-                    if _goal_status(utterance, history, listing) == "incomplete":
-                        event_bus.publish(
-                            utterance=utterance,
-                            kind="action",
-                            text="Acting on results…",
-                            detail="pending",
-                        )
-                        continue
-                    finished = self._attempt_finish(
-                        utterance, listing, sources, history
-                    )
-                    if finished is not None:
-                        return finished
-                    continue
-                finished = self._attempt_finish(
-                    utterance,
-                    "No Spotlight matches found.",
-                    sources,
-                    history,
-                    force=True,
-                )
-                if finished is not None:
-                    return finished
-                continue
 
             if tool == "manage_system_resources" and result.get("ok") and step >= 0:
                 action = str(result.get("action") or "")
@@ -866,8 +1429,8 @@ class AgentLoop:
             quick = _safety_heuristic_tool(utterance)
             if quick:
                 return _apply_use_web(utterance, quick, history=history, use_web=use_web)
-            # Don't let the local model invent world facts (params, who/when, …).
-            # Search On forces the web except for greetings / meta / about-me.
+            # Don't let the local model invent world facts when cloud is off.
+            # When cloud can answer, skip forced web_search (cloud fast-path handles it).
             text = (utterance or "").strip()
             force_web = (
                 use_web == "on"
@@ -876,7 +1439,17 @@ class AgentLoop:
                 and not _META_RE.search(text)
                 and not _ABOUT_ME_RE.search(text)
             )
+            cloud_ok = False
+            try:
+                cloud_ok = self.parser._cloud.should_use_cloud(utterance)
+            except Exception:  # noqa: BLE001
+                cloud_ok = False
             if use_web != "off" and (force_web or _is_factual_lookup(utterance)):
+                if cloud_ok and use_web != "on":
+                    return {
+                        "tool": "respond",
+                        "args": {"text": self._local_answer(utterance)},
+                    }
                 return {"tool": "web_search", "args": {"query": utterance}}
 
         # After discovery, force the mutating follow-up when the goal is clear.
@@ -892,6 +1465,14 @@ class AgentLoop:
             return _sanitize_planned_call(
                 utterance,
                 parsed,
+                history=scoped or history,
+                use_web=use_web,
+            )
+        # Parse failed. Mac actions → write bash; never invent a web how-to.
+        if _is_action_request(utterance):
+            return _apply_use_web(
+                utterance,
+                {"tool": "__write_and_run_bash__", "args": {}},
                 history=scoped or history,
                 use_web=use_web,
             )
@@ -927,18 +1508,20 @@ class AgentLoop:
             if tool == "web_search" and result.get("context"):
                 try:
                     return self.parser.answer_from_search(
-                        utterance, str(result["context"])
+                        utterance,
+                        str(result["context"]),
+                        on_token=lambda t: _publish_answer_partial(
+                            utterance,
+                            t,
+                            backend=(
+                                "cloud"
+                                if self.parser._cloud.should_use_cloud(utterance)
+                                else "local"
+                            ),
+                        ),
                     )
                 except Exception:  # noqa: BLE001
                     pass
-            if tool == "find_files" and result.get("paths"):
-                paths = result["paths"]
-                lines = "\n".join(f"- {p}" for p in paths[:12])
-                return f"Found {len(paths)} file(s):\n{lines}"
-            if tool == "spotlight_file_search" and result.get("paths"):
-                paths = result["paths"]
-                lines = "\n".join(f"- {p}" for p in paths[:15])
-                return f"Spotlight found {len(paths)} file(s):\n{lines}"
             if tool == "manage_system_resources" and result.get("processes"):
                 lines = [
                     f"- {p.get('name')} (pid {p.get('pid')}): "
@@ -988,10 +1571,77 @@ class AgentLoop:
         # Never surface raw tool JSON to the user.
         return self._local_answer(utterance)
 
+    def _should_direct_answer(self, utterance: str, use_web: str) -> bool:
+        """True for knowledge/coding Q&A — skip the Mac tool-loop planner."""
+        mode = use_web if use_web in ("auto", "on", "off") else "auto"
+        # User forced web search — keep the grounded search path.
+        if mode == "on":
+            return False
+        # Follow-ups that act on a prior Mac result must stay in the tool loop.
+        try:
+            from memory.user_context import get_prior_turns
+
+            if get_prior_turns() and _followup_needs_local_tools(utterance):
+                return False
+        except Exception:  # noqa: BLE001
+            pass
+        text = (utterance or "").strip()
+        if not text:
+            return False
+        # Live Mac / filesystem / UI asks stay on the tool loop.
+        try:
+            from llm.cloud import is_local_system_task
+
+            if is_local_system_task(text):
+                return False
+        except Exception:  # noqa: BLE001
+            pass
+        # Profile notes use a dedicated path in the tool loop.
+        if _ABOUT_ME_RE.search(text):
+            return False
+        # Capabilities / greetings still use direct answer (no planner burn).
+        if _META_RE.search(text) or _CHAT_RE.match(text):
+            return True
+        # Opening apps / Mac UI controls stay on the local tool loop.
+        # Do NOT use _is_action_request here — "make/create/type" also match coding asks.
+        if _is_open_action(text):
+            return False
+        if _control_mac_heuristic(text) or _close_app_heuristic(text):
+            return False
+        safety = _safety_heuristic_tool(text)
+        if safety and safety.get("tool") not in {
+            None,
+            "respond",
+            "__answer_about_user__",
+        }:
+            return False
+        return True
+
+    def _should_answer_via_cloud(self, utterance: str, use_web: str) -> bool:
+        """True when this ask should skip the local tool loop and hit the cloud LLM."""
+        if not self._should_direct_answer(utterance, use_web):
+            return False
+        text = (utterance or "").strip()
+        # Greetings / capabilities / profile stay on-device even when cloud is enabled.
+        if _ABOUT_ME_RE.search(text) or _META_RE.search(text) or _CHAT_RE.match(text):
+            return False
+        return bool(self.parser._cloud.should_use_cloud(utterance))
+
     def _local_answer(self, utterance: str) -> str:
         try:
-            return self.parser.generate_answer(utterance)
+            # Assume local until generate_answer flips to cloud on success.
+            self.parser.last_answer_backend = "local"
+
+            def _on_token(t: str) -> None:
+                backend = getattr(self.parser, "last_answer_backend", "local") or "local"
+                # While streaming we may not know yet — prefer cloud if routing would allow.
+                if self.parser._cloud.should_use_cloud(utterance):
+                    backend = "cloud"
+                _publish_answer_partial(utterance, t, backend=backend)
+
+            return self.parser.generate_answer(utterance, on_token=_on_token)
         except Exception:  # noqa: BLE001
+            self.parser.last_answer_backend = "local"
             return "I could not answer that right now."
 
     def _format_command_answer(
@@ -1009,6 +1659,72 @@ class AgentLoop:
         except Exception:  # noqa: BLE001
             return friendly or stdout.strip()[:2000]
 
+    def _try_hybrid_version_finish(
+        self,
+        utterance: str,
+        sources: list[Any],
+        history: list[dict[str, Any]],
+    ) -> Optional[dict[str, Any]]:
+        """Finish 'latest online + what's installed' once both tool results exist."""
+        if not (
+            _needs_local_machine_check(utterance)
+            and _utterance_wants_web_search(utterance)
+        ):
+            return None
+        if not _history_has_successful_bash(history):
+            return None
+        if _web_search_count(history) == 0:
+            return None
+        local_out = _latest_useful_bash_stdout(history)
+        web_ctx = _combined_search_context(history)
+        if not local_out or not web_ctx:
+            return None
+        event_bus.publish(
+            utterance=utterance,
+            kind="action",
+            text="Comparing with latest…",
+            detail="pending",
+        )
+        # Prefer deterministic compare — small local models botch "3.12 < 3.14"
+        # and invent "run this yourself" advice.
+        reply = _deterministic_hybrid_version_answer(utterance, local_out, web_ctx)
+        if not reply:
+            narrate("thinking")
+            try:
+                reply = self.parser.answer_from_search(
+                    utterance,
+                    (
+                        f"{web_ctx}\n\n"
+                        f"=== Installed on this Mac (already checked) ===\n"
+                        f"{local_out}\n\n"
+                        "Rules: Do NOT tell the user to run a terminal command — "
+                        "MacAgent already checked this Mac. State the latest version "
+                        "from the web, the installed version from the Mac output, "
+                        "and whether the Mac is out of date. Be consistent: if "
+                        "installed < latest, say out of date."
+                    ),
+                    on_token=lambda t: _publish_answer_partial(
+                        utterance,
+                        t,
+                        backend=(
+                            "cloud"
+                            if self.parser._cloud.should_use_cloud(utterance)
+                            else "local"
+                        ),
+                    ),
+                )
+            except Exception:  # noqa: BLE001
+                reply = ""
+            if _candidate_is_shell_advice(reply or "") or not (reply or "").strip():
+                reply = (
+                    f"On this Mac: {local_out.strip()}\n\n"
+                    "I looked up the latest release online (see sources). "
+                    "I couldn't reliably parse both versions to compare."
+                )
+        return self._attempt_finish(
+            utterance, reply.strip(), sources, history, force=True
+        )
+
     def _request_confirm(
         self,
         utterance: str,
@@ -1020,12 +1736,32 @@ class AgentLoop:
     ) -> dict[str, Any]:
         cmd = (command or "").strip()
         summary = (summary or "").strip() or f"Run:\n{cmd}"
+        history.append(
+            {
+                "call": {"tool": "run_bash", "args": {"command": cmd}},
+                "result": {"ok": False, "needs_confirm": True},
+            }
+        )
+        # Snapshot loop state so Approve/Deny can resume the ChatML tool cycle.
+        resume = {
+            "history": list(history),
+            "sources": list(sources),
+            "use_web": getattr(self, "_use_web", "auto"),
+            "compound_state": getattr(self, "_compound_state", None),
+            "last_text": "",
+        }
         pending = create_pending(
             utterance=utterance,
             summary=summary,
             command=cmd,
             tool="run_bash",
+            resume=resume,
         )
+        # Stamp the pending id onto the placeholder for debugging.
+        history[-1]["result"]["id"] = pending["id"]
+        resume["history"] = list(history)
+        update_pending_resume(pending["id"], resume)
+
         event_bus.publish(
             utterance=utterance,
             kind="confirm",
@@ -1045,12 +1781,6 @@ class AgentLoop:
             command=cmd[:500],
             summary=summary[:500],
         )
-        history.append(
-            {
-                "call": {"tool": "run_bash", "args": {"command": cmd}},
-                "result": {"ok": False, "needs_confirm": True, "id": pending["id"]},
-            }
-        )
         return {
             "action": "confirm",
             "pending_id": pending["id"],
@@ -1060,6 +1790,62 @@ class AgentLoop:
             "sources": sources,
             "steps": len(history),
         }
+
+    def continue_after_confirm(
+        self,
+        *,
+        utterance: str,
+        command: str,
+        approved: bool,
+        tool_result: dict[str, Any],
+        resume: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Resume the agent loop after Approve/Deny (append tool result → back to Qwen)."""
+        history = list(resume.get("history") or [])
+        sources = list(resume.get("sources") or [])
+        entry = {
+            "call": {"tool": "run_bash", "args": {"command": command}},
+            "result": tool_result,
+        }
+        if history and (history[-1].get("result") or {}).get("needs_confirm"):
+            history[-1] = entry
+        else:
+            history.append(entry)
+
+        if not approved:
+            return self._finish(
+                utterance, "Cancelled — nothing was changed.", sources, history
+            )
+
+        last_text = ""
+        if tool_result.get("ok"):
+            last_text = (tool_result.get("stdout") or "").strip() or "Done."
+            cmd_l = (command or "").lower()
+            if "empty the trash" in cmd_l:
+                last_text = "Trash emptied."
+            elif "shut down" in cmd_l:
+                last_text = "Shutting down…"
+            elif "restart" in cmd_l:
+                last_text = "Restarting…"
+            elif re.search(r"\bsleep\b", cmd_l):
+                last_text = "Sleeping…"
+        else:
+            last_text = str(
+                tool_result.get("error") or tool_result.get("stderr") or "command failed"
+            )
+
+        # Feed tool stdout/stderr back into ChatML and let Qwen decide the final reply.
+        return self.run(
+            utterance,
+            use_web=str(resume.get("use_web") or "auto"),
+            resume={
+                "history": history,
+                "sources": sources,
+                "use_web": resume.get("use_web") or "auto",
+                "compound_state": resume.get("compound_state"),
+                "last_text": last_text,
+            },
+        )
 
     def _attempt_finish(
         self,
@@ -1210,6 +1996,12 @@ class AgentLoop:
         sources: list[Any],
         history: list[dict[str, Any]],
     ) -> dict[str, Any]:
+        try:
+            from memory.user_context import clear_cloud_handoff
+
+            clear_cloud_handoff()
+        except Exception:  # noqa: BLE001
+            pass
         # Normalize sources for the overlay (tappable links only — no text footer).
         normalized: list[dict[str, str]] = []
         for s in sources[:5]:
@@ -1232,12 +2024,24 @@ class AgentLoop:
         except Exception as exc:  # noqa: BLE001
             logger.warning("activity log failed: %s", exc)
 
+        # Tool-executed Mac actions are always local — never attribute to cloud.
+        used_tools = [
+            (h.get("call") or {}).get("tool")
+            for h in history
+            if (h.get("call") or {}).get("tool") not in {None, "respond", ""}
+        ]
+        if used_tools:
+            backend = "local"
+        else:
+            backend = getattr(self.parser, "last_answer_backend", "local") or "local"
+
         event_bus.publish(
             utterance=utterance,
             kind="answer",
             text=text,
             detail="agent",
             sources=normalized or None,
+            backend=backend,
         )
         try:
             narrate_answer(text or "")
@@ -1248,6 +2052,7 @@ class AgentLoop:
             kind="answer",
             detail="agent",
             text=text,
+            backend=backend,
             tools=[h.get("call", {}).get("tool") for h in history],
         )
         return {
@@ -1255,6 +2060,7 @@ class AgentLoop:
             "answer": text,
             "sources": normalized,
             "steps": len(history),
+            "backend": backend,
         }
 
 
@@ -1368,6 +2174,160 @@ def _identical_failure_count(history: list[dict[str, Any]]) -> int:
     return count
 
 
+_LATEST_DOWNLOAD_BASH = (
+    'f=$(ls -t ~/Downloads/* 2>/dev/null | head -1); '
+    'if [ -n "$f" ]; then ls -lh "$f"; echo "$f"; '
+    'else echo "Downloads is empty"; fi'
+)
+
+# Scoped home scan — never walk / or /Volumes (often empty/hangs).
+_BIGGEST_FILE_BASH = (
+    'find "$HOME" -type f -maxdepth 5 '
+    "! -path '*/Library/Caches/*' ! -path '*/.Trash/*' "
+    "-exec du -k {} + 2>/dev/null | sort -nr | head -n 5 | "
+    "awk '{printf \"%.1f MB\\t\", $1/1024; $1=\"\"; sub(/^ /,\"\"); print}'"
+)
+
+_WANTS_BIGGEST_FILE_RE = re.compile(
+    r"(?i)("
+    r"\b(biggest|largest)\b.{0,40}\bfiles?\b|"
+    r"\bfiles?\b.{0,40}\b(biggest|largest)\b|"
+    r"what'?s\s+the\s+(biggest|largest)\s+file"
+    r")"
+)
+
+
+def _followup_needs_local_tools(utterance: str) -> bool:
+    """True when a follow-up likely acts on a prior Mac result (open/delete/…)."""
+    text = (utterance or "").strip()
+    if not text:
+        return False
+    if _is_open_action(text):
+        return True
+    if _control_mac_heuristic(text) or _close_app_heuristic(text):
+        return True
+    if re.search(
+        r"(?i)\b("
+        r"open|launch|delete|remove|trash|move|copy|kill|quit|close|"
+        r"run\s+it|show\s+(me\s+)?(the\s+)?(file|path|folder)|"
+        r"where\s+is\s+(it|that|the\s+file)"
+        r")\b",
+        text,
+    ):
+        return True
+    return False
+
+
+def _path_from_prior_assistant() -> Optional[str]:
+    """Best absolute/~ path from the latest follow-up Assistant reply."""
+    try:
+        from memory.user_context import get_prior_turns
+    except Exception:  # noqa: BLE001
+        return None
+    turns = get_prior_turns()
+    if not turns:
+        return None
+    text = str(turns[-1].get("assistant") or "")
+    paths = re.findall(
+        r"(?:/Users/[^\s`\"'<>]+|~/[^\s`\"'<>]+)",
+        text,
+    )
+    if not paths:
+        return None
+    # Prefer a real file path over a directory listing noise.
+    for p in reversed(paths):
+        cleaned = p.rstrip(").,;:]")
+        if cleaned:
+            return cleaned
+    return None
+
+
+def _repair_bash_command(command: str, utterance: str = "") -> Optional[str]:
+    """Rewrite known-bad Linux-only commands into macOS-safe equivalents."""
+    cmd = (command or "").strip()
+    blob = f"{cmd}\n{utterance or ''}"
+    # GNU find flags macOS BSD find does not support.
+    gnu_only = bool(
+        re.search(r"(?i)-printf\b|-stat\s+-c\b|find\b.+\s+-printf\b", cmd)
+    )
+    wants_download = bool(re.search(r"(?i)downl|Downloads", blob))
+    if wants_download and (
+        gnu_only
+        or re.search(r"(?i)find\s+~/Downloads|find\s+\"?\$HOME/Downloads", cmd)
+    ):
+        return _LATEST_DOWNLOAD_BASH
+    if gnu_only and re.search(r"(?i)Downloads", cmd):
+        return _LATEST_DOWNLOAD_BASH
+    # Whole-volume / root finds are empty or hang; biggest-file asks → home scan.
+    root_find = bool(
+        re.search(r"(?i)\bfind\s+(/Volumes(?:/\S*)?|/(?:\s|$)|/System\b)", cmd)
+    )
+    if _WANTS_BIGGEST_FILE_RE.search(blob) or (
+        root_find and re.search(r"(?i)\b(du|sort|head)\b", cmd)
+    ):
+        if cmd != _BIGGEST_FILE_BASH:
+            return _BIGGEST_FILE_BASH
+    if root_find and "-maxdepth" not in cmd.lower():
+        return _BIGGEST_FILE_BASH
+    # Linux checksum → macOS.
+    if re.search(r"(?i)\bsha256sum\b", cmd):
+        return re.sub(r"(?i)\bsha256sum\b", "shasum -a 256", cmd)
+    if re.search(r"(?i)\bmd5sum\b", cmd):
+        return re.sub(r"(?i)\bmd5sum\b", "md5 -r", cmd)
+    return None
+
+
+def _bash_command_looks_broken(command: str) -> bool:
+    """True when a planner-invented shell string is truncated or nonsensical."""
+    cmd = (command or "").strip()
+    if not cmd:
+        return True
+    if len(cmd) > 700:
+        return True
+    # Truncated mid-pipeline / escape.
+    if re.search(r"[|\\&;]\s*$", cmd) or cmd.endswith("\\"):
+        return True
+    # Unbalanced quotes.
+    if cmd.count("'") % 2 == 1 or cmd.count('"') % 2 == 1:
+        return True
+    # Nested find|xargs|find loops the small model invents (never useful).
+    if len(re.findall(r"(?i)\bfind\b", cmd)) >= 3:
+        return True
+    if len(re.findall(r"(?i)\bxargs\b", cmd)) >= 2 and re.search(
+        r"(?i)\bfind\b", cmd
+    ):
+        return True
+    # Obviously incomplete JSON-ish or cut mid-token.
+    if re.search(r"(?i)\b(xargs|find|awk|sort)\s*$", cmd):
+        return True
+    return False
+
+
+
+def _process_monitor_heuristic(text: str) -> Optional[dict[str, Any]]:
+    """Local-only: list top CPU/memory processes (never invent from history/cloud)."""
+    if not text:
+        return None
+    if re.search(
+        r"(?i)\b("
+        r"top\s+(cpu|memory|ram|process(?:es)?|apps)|"
+        r"(cpu|memory|ram)\s+(hogs?|usage|process(?:es)?)|"
+        r"what('?s|\s+is)\s+using\s+(my\s+)?(cpu|memory|ram)|"
+        r"list\s+(all\s+|the\s+|my\s+|running\s+)*process(?:es)?|"
+        r"show\s+(all\s+|the\s+|my\s+|running\s+)*process(?:es)?|"
+        r"(all|running)\s+process(?:es)?|"
+        r"what\s+process(?:es)?\s+(are\s+)?(running|on)|"
+        r"process(?:es)?\s+on\s+(my\s+)?(mac|computer|machine)|"
+        r"system\s+resources|"
+        r"resource\s+usage|"
+        r"\bps\s+aux\b|\bactivity\s+monitor\b"
+        r")\b",
+        text,
+    ):
+        return {"tool": "manage_system_resources", "args": {"action": "list"}}
+    return None
+
+
 def _safety_heuristic_tool(utterance: str) -> Optional[dict[str, Any]]:
     """Minimal fast-path only — greetings, help, notes, math, hard power/trash.
 
@@ -1406,6 +2366,15 @@ def _safety_heuristic_tool(utterance: str) -> Optional[dict[str, Any]]:
             "args": {"command": empty_trash_command()},
         }
 
+    # Process monitor — must stay local (never invent from chat history / cloud).
+    proc = _process_monitor_heuristic(text)
+    if proc:
+        return proc
+
+    # Biggest file on disk — deterministic home-scoped scan (never /Volumes).
+    if _WANTS_BIGGEST_FILE_RE.search(text):
+        return {"tool": "run_bash", "args": {"command": _BIGGEST_FILE_BASH}}
+
     if re.search(
         r"(?i)("
         r"\b(shut\s*down|turn\s+off|power\s+off)\b.+\b(mac|pc|computer|machine|system)\b|"
@@ -1435,326 +2404,6 @@ def _safety_heuristic_tool(utterance: str) -> Optional[dict[str, Any]]:
 
     return None
 
-
-def _heuristic_tool(utterance: str) -> Optional[dict[str, Any]]:
-    """Legacy full heuristic map — kept for sanitize remaps / tests, not the main loop."""
-    text = (utterance or "").strip()
-    lower = text.lower()
-    if not text:
-        return None
-
-    safety = _safety_heuristic_tool(text)
-    if safety:
-        return safety
-
-    # Common Mac toggles (wifi / bluetooth / mute / dark mode).
-    control = _control_mac_heuristic(text)
-    if control:
-        return control
-
-    # Close / quit / kill an app or browser (before planner can invent pmset).
-    close_call = _close_app_heuristic(text)
-    if close_call:
-        return close_call
-
-    # Native Notification Center — “notify me …”, “send a notification …”
-    notify_m = re.search(
-        r"(?i)\b("
-        r"notify\s+me|"
-        r"send\s+(me\s+)?(a\s+)?notification|"
-        r"show\s+(me\s+)?(a\s+)?notification|"
-        r"alert\s+me|"
-        r"desktop\s+notification"
-        r")\b",
-        text,
-    )
-    if notify_m:
-        msg = text
-        for pat in (
-            r"(?i)^(please\s+)?(can\s+you\s+|could\s+you\s+)?",
-            r"(?i)\b(notify\s+me(\s+(that|about|when|with))?|"
-            r"send\s+(me\s+)?(a\s+)?notification(\s+(that|about|saying|with))?|"
-            r"show\s+(me\s+)?(a\s+)?notification(\s+(that|about|saying|with))?|"
-            r"alert\s+me(\s+(that|about|when|with))?|"
-            r"desktop\s+notification(\s+(that|about|saying|with))?)\s*",
-        ):
-            msg = re.sub(pat, "", msg).strip()
-        msg = msg.strip(" .,:;\"'") or "Done"
-        play = bool(re.search(r"(?i)\b(sound|beep|ping|chime)\b", text))
-        return {
-            "tool": "trigger_native_notification",
-            "args": {
-                "title": "MacAgent",
-                "subtitle": "",
-                "message": msg[:200],
-                "play_sound": play,
-            },
-        }
-
-    # Process monitor — top CPU / memory / kill process
-    if re.search(
-        r"(?i)\b("
-        r"top\s+(cpu|memory|ram|processes|apps)|"
-        r"(cpu|memory|ram)\s+(hogs?|usage|processes)|"
-        r"what('?s|\s+is)\s+using\s+(my\s+)?(cpu|memory|ram)|"
-        r"list\s+(running\s+)?processes|"
-        r"system\s+resources|"
-        r"resource\s+usage"
-        r")\b",
-        text,
-    ):
-        return {"tool": "manage_system_resources", "args": {"action": "list"}}
-
-    kill_m = re.search(
-        r"(?i)\b(kill|quit|force[\s-]?quit|terminate|close)\s+"
-        r"(the\s+)?(process\s+)?(?P<name>[\w.\- ]+?)(?:\s+process)?\s*$",
-        text,
-    )
-    if kill_m and not re.search(r"(?i)\b(kill\s+me|quit\s+asking|close\s+enough)\b", text):
-        name = kill_m.group("name").strip().rstrip(".?!")
-        name = re.sub(r"(?i)^(called|named|the)\s+", "", name).strip()
-        name = re.sub(r"(?i)\s+(browser|app|application)$", "", name).strip()
-        if name and len(name) < 64:
-            resolved = _resolve_app_name(name)
-            return {
-                "tool": "manage_system_resources",
-                "args": {"action": "kill", "target_process": resolved},
-            }
-
-    # Spotlight file search — prefer mdfind tool over bash find
-    spotlight_m = re.search(
-        r"(?i)\b("
-        r"spotlight(\s+search)?|"
-        r"mdfind|"
-        r"search\s+(my\s+)?(mac|computer|disk|system)\s+for|"
-        r"find\s+(the\s+)?file\b"
-        r")\b",
-        text,
-    )
-    if spotlight_m or (
-        re.search(r"(?i)\b(find|locate|search\s+for)\b", text)
-        and re.search(
-            r"(?i)\b(file|pdf|doc|docx|xlsx?|png|jpg|jpeg|csv|txt|folder)\b",
-            text,
-        )
-        and not re.search(r"(?i)\b(download|downloads)\b", text)
-    ):
-        q = text
-        q = re.sub(
-            r"(?i)^(please\s+)?(can\s+you\s+|could\s+you\s+)?",
-            "",
-            q,
-        ).strip()
-        q = re.sub(
-            r"(?i)\b("
-            r"spotlight(\s+search)?|"
-            r"mdfind|"
-            r"search\s+(my\s+)?(mac|computer|disk|system)\s+for|"
-            r"find\s+(the\s+)?(file|folder)|"
-            r"find|locate|search\s+for|show\s+me"
-            r")\b",
-            " ",
-            q,
-        )
-        q = re.sub(
-            r"(?i)\b(file|pdf|doc|folder|on\s+my\s+mac|please)\b",
-            " ",
-            q,
-        )
-        q = re.sub(r"\s+", " ", q).strip(" .,:;\"'")
-        if q:
-            return {"tool": "spotlight_file_search", "args": {"query": q}}
-
-    # Explicit "write/run python code" — not every word like calculate in notes.
-    if re.search(
-        r"(?i)\b(write|run|execute)\b.+\b(code|script|python|program)\b|"
-        r"\b(factorial|fibonacci|prime|sort this|parse json|regex)\b",
-        text,
-    ):
-        return {"tool": "__write_and_run_python__", "args": {}}
-
-    # Recently downloaded / Downloads — bash, not a special-case tool.
-    if re.search(
-        r"(?i)\b("
-        r"recent(ly)?\s+download|download(ed)?\s+(item|file|folder|stuff)?|"
-        r"last\s+download|latest\s+download|newest\s+in\s+downloads|"
-        r"what('?s|\s+is|\s+are)?\s+(the\s+)?(most\s+recent(ly)?|latest)\b|"
-        r"what('?s| did i)\s+download|"
-        r"find( me)?\s+(my\s+)?recent(ly)?\s+download|"
-        r"show( me)?\s+(my\s+)?downloads|"
-        r"file\s+that\s+i\s+download"
-        r")\b",
-        text,
-    ) and re.search(r"(?i)download", text):
-        singular = bool(
-            re.search(r"(?i)\b(most\s+recent(ly)?|last|newest|latest)\b", text)
-            and not re.search(r"(?i)\b(list|show\s+all|all\s+my)\b", text)
-        )
-        if _DELETE_RE.search(text):
-            return {
-                "tool": "run_bash",
-                "args": {"command": _delete_latest_download_command()},
-            }
-        if _MOVE_RE.search(text) or _COPY_RE.search(text):
-            verb = "cp" if _COPY_RE.search(text) else "mv"
-            dest = _resolve_move_destination(text)
-            return {
-                "tool": "run_bash",
-                "args": {"command": _move_latest_download_command(dest, verb=verb)},
-            }
-        if _is_open_action(text):
-            return {
-                "tool": "run_bash",
-                "args": {
-                    "command": (
-                        'f=$(ls -t ~/Downloads/* 2>/dev/null | head -1); '
-                        'if [ -n "$f" ]; then open "$f"; echo "Opened: $f"; '
-                        'else echo "Downloads is empty"; fi'
-                    )
-                },
-            }
-        if singular:
-            return {
-                "tool": "run_bash",
-                "args": {
-                    "command": "ls -lt ~/Downloads | head -6",
-                },
-            }
-        return {
-            "tool": "run_bash",
-            "args": {
-                "command": "ls -lt ~/Downloads | head -20",
-            },
-        }
-
-    # Open folder / directory via bash (before open_app).
-    folder_m = re.search(
-        r"(?i)^\s*(open|show|reveal)\s+(the\s+)?(folder|directory|dir)\s+(.+)$",
-        text,
-    )
-    if folder_m and (
-        folder_m.group(1).lower() in {"show", "reveal"} or _is_open_action(text)
-    ):
-        name = folder_m.group(4).strip().rstrip(".")
-        name = re.sub(r"(?i)^(named|called)\s+", "", name).strip()
-        return {"tool": "open_folder", "args": {"query": name}}
-    folder_m2 = re.search(
-        r"(?i)^\s*(open|show|reveal)\s+(.+?)\s+(folder|directory|dir)\s*$",
-        text,
-    )
-    if folder_m2 and (
-        folder_m2.group(1).lower() in {"show", "reveal"} or _is_open_action(text)
-    ):
-        name = folder_m2.group(2).strip()
-        name = re.sub(r"(?i)^(the|a|my)\s+", "", name).strip()
-        return {"tool": "open_folder", "args": {"query": name}}
-
-    # File / folder search — let the model invent a bash command.
-    if re.search(
-        r"(?i)\b(find|locate|search for|show me)\b.+\b(file|pdf|doc|folder|invoice|item|download)\b",
-        text,
-    ) or re.search(
-        r"(?i)\b(find|locate)\s+(my\s+)?[\w.\- ]+\.(pdf|docx?|xlsx?|png|jpg)\b",
-        text,
-    ) or re.search(r"(?i)\b(run|execute)\b.+\b(bash|shell|command|terminal)\b", text):
-        return {"tool": "__write_and_run_bash__", "args": {}}
-
-    if _is_open_action(text) and re.search(
-        r"(?i)\b(open|launch|start)\s+(system\s+)?(settings|preferences)\b", lower
-    ):
-        pane = "general"
-        for key in (
-            "wifi",
-            "bluetooth",
-            "accessibility",
-            "privacy",
-            "network",
-            "keyboard",
-            "displays",
-            "sound",
-            "battery",
-            "notifications",
-            "spotlight",
-        ):
-            if key in lower or key.replace("i", "i-") in lower:
-                pane = key
-                break
-        if "wi-fi" in lower or "wi fi" in lower:
-            pane = "wifi"
-        return {"tool": "open_system_settings", "args": {"pane": pane}}
-
-    # Past interaction lookup — "what did I ask last time?"
-    if _PAST_QUERY_RE.search(text):
-        q = text
-        q = re.sub(r"(?i)^(what\s+did\s+i\s+(ask|say|tell\s+you)\??\s*)", "", q).strip()
-        return {"tool": "search_past_interactions", "args": {"query": q or text, "limit": 8}}
-
-    # Compound open: "open YouTube and comp3370 folder" — before single-target open.
-    compound_open = _heuristic_compound_open(text)
-    if compound_open:
-        return compound_open
-
-    # "can you open …" / "please open …" / "open …" — not "open-source" questions
-    if _is_open_action(text):
-        m = re.search(
-            r"(?i)(?:^|\b)(?:can\s+you\s+|could\s+you\s+|please\s+)?(open|launch|start)\s+(.+)$",
-            _scrub_open_compounds(text),
-        )
-        if m:
-            target = m.group(2).strip().rstrip(".?!")
-            if target and not re.match(r"(?i)^source(d)?\b", target):
-                if "setting" in target.lower() or "preference" in target.lower():
-                    pane = "general"
-                    tl = target.lower()
-                    for key in (
-                        "wifi",
-                        "bluetooth",
-                        "accessibility",
-                        "privacy",
-                        "network",
-                        "keyboard",
-                        "displays",
-                        "sound",
-                        "battery",
-                        "notifications",
-                        "spotlight",
-                    ):
-                        if key in tl:
-                            pane = key
-                            break
-                    if "wi-fi" in tl or "wi fi" in tl:
-                        pane = "wifi"
-                    return {
-                        "tool": "open_system_settings",
-                        "args": {"pane": pane},
-                    }
-                opened = _heuristic_open_target(target)
-                if opened:
-                    return opened
-
-    if re.search(r"(?i)\b(what('?s| is) in my (notes|context)|show (my )?notes)\b", text):
-        return {"tool": "get_user_context", "args": {}}
-
-    if re.search(r"(?i)\b(remember that|note that|save (this )?note)\b", text):
-        note = re.sub(
-            r"(?i)^(please\s+)?(remember that|note that|save (this )?note:?)\s*",
-            "",
-            text,
-        ).strip()
-        existing = load_notes_safe()
-        merged = (existing + "\n" + note).strip() if existing else note
-        return {"tool": "update_user_context", "args": {"notes": merged}}
-
-    return None
-
-
-def load_notes_safe() -> str:
-    try:
-        from memory.user_context import load_user_notes
-
-        return load_user_notes()
-    except Exception:  # noqa: BLE001
-        return ""
 
 
 def _control_mac_heuristic(utterance: str) -> Optional[dict[str, Any]]:
@@ -1842,13 +2491,136 @@ def _control_mac_heuristic(utterance: str) -> Optional[dict[str, Any]]:
 
 def _refuse_system_action(utterance: str, message: str) -> dict[str, Any]:
     """On a wrong planned tool, remap to a real heuristic action when possible."""
-    remapped = _control_mac_heuristic(utterance) or _close_app_heuristic(utterance)
+    remapped = (
+        _control_mac_heuristic(utterance)
+        or _close_app_heuristic(utterance)
+        or _remap_catalog_hijack(utterance, [])
+    )
     if remapped:
         return remapped
     return {
         "tool": "respond",
         "args": {"text": message, "goal_done": True},
     }
+
+
+def _remap_catalog_hijack(
+    utterance: str, history: Optional[list[dict[str, Any]]] = None
+) -> Optional[dict[str, Any]]:
+    """When the planner invents a catalog example tool, recover the real ask."""
+    text = (utterance or "").strip()
+    if not text:
+        return None
+    hist = history or []
+
+    # Open Calculator / type / read screen — never answer with Wi‑Fi refusal.
+    if _needs_gui_control(text) or _is_open_action(text):
+        opened = any(
+            (h.get("call") or {}).get("tool") == "open_app"
+            and (h.get("result") or {}).get("ok")
+            for h in hist
+        )
+        if not opened and _is_open_action(text):
+            name = _open_app_name_from_utterance(text)
+            if name:
+                return {"tool": "open_app", "args": {"name": name}}
+        if _needs_gui_control(text):
+            # Prefer typing the expression when they asked to type a calculation.
+            expr = _calc_expression_from_utterance(text)
+            if expr:
+                args: dict[str, Any] = {"text": expr}
+                for item in reversed(hist):
+                    call = item.get("call") or {}
+                    if call.get("tool") == "open_app":
+                        app = str((call.get("args") or {}).get("name") or "").strip()
+                        if app:
+                            args["app"] = app
+                        break
+                if "app" not in args and re.search(r"(?i)\bcalculator\b", text):
+                    args["app"] = "Calculator"
+                return {"tool": "ui_type", "args": args}
+            return {"tool": "ui_snapshot", "args": {"limit": 40}}
+        if _is_open_action(text):
+            name = _open_app_name_from_utterance(text)
+            if name:
+                return {"tool": "open_app", "args": {"name": name}}
+
+    if _needs_local_machine_check(text):
+        if _utterance_wants_web_search(text) and not any(
+            (h.get("call") or {}).get("tool") == "web_search" for h in hist
+        ):
+            return {
+                "tool": "web_search",
+                "args": {"query": _hybrid_web_search_query(text)},
+            }
+        local_cmd = _preferred_local_check_command(text)
+        if local_cmd:
+            return {"tool": "run_bash", "args": {"command": local_cmd}}
+        return {"tool": "__write_and_run_bash__", "args": {}}
+
+    return None
+
+
+def _hybrid_web_search_query(text: str) -> str:
+    """Sharper query for 'latest X + am I out of date?' hybrid asks."""
+    t = text or ""
+    if re.search(r"(?i)\bpython\b", t):
+        return "latest stable Python release site:python.org"
+    if re.search(r"(?i)\bnode(\.?js)?\b", t):
+        return "latest stable Node.js LTS release"
+    if re.search(r"(?i)\bruby\b", t):
+        return "latest stable Ruby release"
+    if re.search(r"(?i)\bjava\b", t):
+        return "latest stable Java JDK release"
+    return t
+
+
+def _open_app_name_from_utterance(text: str) -> Optional[str]:
+    cleaned = _scrub_open_compounds(text or "")
+    m = re.search(
+        r"(?i)(?:^|\b)(?:please\s+|can\s+you\s+|could\s+you\s+)?"
+        r"(?:open|launch|start)\s+(?P<name>[A-Za-z][A-Za-z0-9 .+-]{1,40}?)"
+        r"(?=\s*[,.]|\s+and\b|\s+type\b|\s+then\b|$)",
+        cleaned,
+    )
+    if not m:
+        return None
+    name = m.group("name").strip(" .,")
+    # Avoid swallowing the rest of a sentence.
+    name = re.split(r"(?i)\s+(type|click|tell|and|then)\b", name)[0].strip()
+    return name or None
+
+
+def _calc_expression_from_utterance(text: str) -> Optional[str]:
+    """Best-effort '154 multiplied by 8' → '154*8=' for Calculator keystroke."""
+    t = text or ""
+    m = re.search(
+        r"(?i)\btype\s+(?P<a>\d+(?:\.\d+)?)\s*"
+        r"(?P<op>multiplied\s+by|times|divided\s+by|over|plus|minus|\*|x|/|\+|-)\s*"
+        r"(?P<b>\d+(?:\.\d+)?)",
+        t,
+    )
+    if not m:
+        m = re.search(
+            r"(?i)(?P<a>\d+(?:\.\d+)?)\s*"
+            r"(?P<op>multiplied\s+by|times|divided\s+by|\*|x|/|\+|-)\s*"
+            r"(?P<b>\d+(?:\.\d+)?)",
+            t,
+        )
+    if not m:
+        return None
+    op_raw = m.group("op").lower()
+    if "multipl" in op_raw or op_raw in {"times", "*", "x"}:
+        op = "*"
+    elif "divid" in op_raw or op_raw in {"over", "/"}:
+        op = "/"
+    elif "plus" in op_raw or op_raw == "+":
+        op = "+"
+    elif "minus" in op_raw or op_raw == "-":
+        op = "-"
+    else:
+        op = "*"
+    return f"{m.group('a')}{op}{m.group('b')}="
 
 
 def _command_is_destructive(command: str) -> bool:
@@ -1869,6 +2641,107 @@ def _sanitize_planned_call(
     text = (utterance or "").strip()
     hist = history or []
     mode = use_web if use_web in ("auto", "on", "off") else "auto"
+
+    # Follow-up deixis on a prior path — don't make the small planner invent tools.
+    prior_path = _path_from_prior_assistant()
+    if prior_path and re.search(
+        r"(?i)^\s*(please\s+|can\s+you\s+|could\s+you\s+)?("
+        r"open|show|reveal|launch"
+        r")\s+(it|that|this|the\s+file|the\s+folder)\b",
+        text,
+    ):
+        import shlex
+
+        q = shlex.quote(prior_path)
+        return {
+            "tool": "run_bash",
+            "args": {"command": f"open {q} && echo Opened: {q}"},
+        }
+    if prior_path and re.search(
+        r"(?i)^\s*(please\s+|can\s+you\s+|could\s+you\s+)?("
+        r"delete|remove|trash|rm"
+        r")\s+(it|that|this|the\s+file)\b",
+        text,
+    ):
+        import shlex
+
+        q = shlex.quote(prior_path)
+        return {
+            "tool": "run_bash",
+            "args": {"command": f"rm -- {q} && echo Deleted: {q}"},
+        }
+
+    # File locate → bash only (never Spotlight / find_files / mdfind).
+    if tool in {"spotlight_file_search", "find_files"}:
+        return {"tool": "__write_and_run_bash__", "args": {}}
+    if tool == "run_bash" and re.search(
+        r"(?i)\bmdfind\b", str(args.get("command") or "")
+    ):
+        return {"tool": "__write_and_run_bash__", "args": {}}
+
+    # Mac side-effects: don't web-howto a pure local task — but hybrid
+    # "search the web AND check my Mac" must keep web_search first.
+    if (
+        tool == "web_search"
+        and mode != "on"
+        and _is_action_request(text)
+        and not _utterance_wants_web_search(text)
+    ):
+        return {"tool": "__write_and_run_bash__", "args": {}}
+
+    # Hybrid asks: if the planner skipped the web half, insert it before local.
+    if (
+        mode != "off"
+        and _needs_local_machine_check(text)
+        and _utterance_wants_web_search(text)
+        and tool in {"run_bash", "respond", "__write_and_run_bash__"}
+        and not any((h.get("call") or {}).get("tool") == "web_search" for h in hist)
+    ):
+        return {
+            "tool": "web_search",
+            "args": {"query": _hybrid_web_search_query(text)},
+        }
+
+    # Rewrite Linux-only find / Downloads guesses before they run.
+    if tool == "run_bash":
+        cmd = str(args.get("command") or "")
+        if _bash_command_looks_broken(cmd):
+            return {"tool": "__write_and_run_bash__", "args": {}}
+        # Coerce version-check asks to a single reliable local command.
+        # Avoids `python3 && python && pip` dying on missing `python`.
+        local_cmd = _preferred_local_check_command(text)
+        if local_cmd and _needs_local_machine_check(text) and cmd.strip() != local_cmd:
+            return {"tool": "run_bash", "args": {"command": local_cmd}}
+        # Never curl|grep the web from bash when the user asked to search.
+        if local_cmd and re.search(r"(?i)\b(curl|wget)\b", cmd):
+            return {"tool": "run_bash", "args": {"command": local_cmd}}
+        repaired = _repair_bash_command(cmd, text)
+        if repaired and repaired != cmd:
+            return {"tool": "run_bash", "args": {"command": repaired}}
+
+    # After open_app, stamp the app name onto ui_type so keys hit Calculator not the overlay.
+    if tool in {"ui_type", "ui_key", "ui_click", "ui_snapshot"}:
+        if not str(args.get("app") or "").strip():
+            for item in reversed(hist):
+                call = item.get("call") or {}
+                result = item.get("result") or {}
+                if call.get("tool") != "open_app" or not result.get("ok"):
+                    continue
+                name = str((call.get("args") or {}).get("name") or "").strip()
+                if name:
+                    merged = dict(args)
+                    merged["app"] = name
+                    return {"tool": tool, "args": merged}
+                break
+
+    # On-disk Downloads / files must run locally — never cloud inventing "I ran ls".
+    if tool in {"respond", "web_search"} and re.search(
+        r"(?i)\bdownl", text
+    ):
+        return {
+            "tool": "run_bash",
+            "args": {"command": _LATEST_DOWNLOAD_BASH},
+        }
 
     # Factual lookups must search before respond / run_python hallucinations.
     if (
@@ -1935,23 +2808,27 @@ def _sanitize_planned_call(
             return control
 
     # Never allow control_mac unless the utterance clearly asks for that toggle.
-    # IQ2/small planners invent "dark mode" from catalog examples on unrelated Q&A.
+    # IQ2/small planners invent "dark mode" from catalog examples on unrelated asks.
     if tool == "control_mac":
         expected = _control_mac_heuristic(text)
-        if not expected:
-            if mode != "off" and _is_info_question(text):
-                return {"tool": "web_search", "args": {"query": text}}
-            return {
-                "tool": "respond",
-                "args": {
-                    "text": (
-                        "I won't change Wi‑Fi / volume / appearance unless you ask "
-                        "(e.g. “dark mode”, “mute”, “turn off wifi”)."
-                    ),
-                    "goal_done": True,
-                },
-            }
-        return expected
+        if expected:
+            return expected
+        # Catalog hijack — remap to the real Mac intent instead of a Wi‑Fi refusal.
+        remapped = _remap_catalog_hijack(text, hist)
+        if remapped:
+            return remapped
+        if mode != "off" and _is_info_question(text):
+            return {"tool": "web_search", "args": {"query": text}}
+        return {
+            "tool": "respond",
+            "args": {
+                "text": (
+                    "I won't change Wi‑Fi / volume / appearance unless you ask "
+                    "(e.g. “dark mode”, “mute”, “turn off wifi”)."
+                ),
+                "goal_done": True,
+            },
+        }
 
     if tool == "run_bash":
         cmd = str(args.get("command") or "")
@@ -2002,6 +2879,9 @@ def _sanitize_planned_call(
         control = _control_mac_heuristic(text)
         if control:
             return control
+        remapped = _remap_catalog_hijack(text, hist)
+        if remapped:
+            return remapped
         return {
             "tool": "respond",
             "args": {
@@ -2020,6 +2900,9 @@ def _sanitize_planned_call(
         control = _control_mac_heuristic(text)
         if control:
             return control
+        remapped = _remap_catalog_hijack(text, hist)
+        if remapped:
+            return remapped
         if mode != "off" and _is_info_question(text):
             return {"tool": "web_search", "args": {"query": text}}
         if re.search(r"(?i)\b(close|quit|kill)\b", text):
@@ -2108,12 +2991,26 @@ def _friendly_ui_error(raw: str) -> str:
         or "not allowed" in lower
         or "accessibility" in lower
         or "osascript is not allowed" in lower
+        or "untrusted" in lower
     ):
         return (
-            "I need Accessibility permission to control the screen "
-            "(click/type). Open Preferences → Permissions → "
-            "Open Accessibility Settings, enable MacAgent once, then try again.\n\n"
-            "For a list of what I can do without that, ask: “what can you do?”"
+            "macOS still reports MacAgent as untrusted for screen control "
+            "(common after a rebuild even if the toggle looks On).\n\n"
+            "1. System Settings → Privacy & Security → Accessibility\n"
+            "2. Turn MacAgent OFF, then ON again\n"
+            "3. Quit MacAgent (menu bar → Quit) and reopen /Applications/MacAgent.app\n\n"
+            "Enable that app only — not AEServer or Terminal."
+        )
+    if "invalid request" in lower or "empty request" in lower or "incomplete http" in lower:
+        return (
+            "Screen control glitched talking to MacAgent.app. "
+            "Keep the MacAgent app running, then try again "
+            "(or rebuild/relaunch the app if this keeps happening)."
+        )
+    if "bridge is offline" in lower or "bridge_down" in lower:
+        return (
+            "UI bridge is offline. Open/restart the MacAgent app (menu bar) "
+            "so screen control can use Accessibility."
         )
     return (raw or "UI action failed").strip()
 
@@ -2220,10 +3117,6 @@ def _goal_status(
             if tool == "respond":
                 continue
             saw_tool = True
-            if tool == "find_files":
-                continue
-            if tool == "spotlight_file_search":
-                continue
             if tool == "run_bash":
                 cmd = str((call.get("args") or {}).get("command") or "")
                 if _is_discovery_bash(cmd):
@@ -2257,8 +3150,6 @@ def _goal_status(
             if tool == "respond":
                 continue
             saw_tool = True
-            if tool in {"find_files", "spotlight_file_search"}:
-                continue
             if tool == "run_bash":
                 cmd = str((call.get("args") or {}).get("command") or "")
                 if _is_discovery_bash(cmd):
@@ -2276,7 +3167,33 @@ def _goal_status(
         return "unknown"
 
     if _is_open_action(text) and not _DELETE_RE.search(text):
-        # "open my latest download" etc.
+        # "Open Calculator, type …, tell me the result" — launch alone is incomplete.
+        if _needs_gui_control(text):
+            has_open = any(
+                (h.get("call") or {}).get("tool")
+                in {"open_app", "open_url", "open_folder", "open_system_settings"}
+                and (h.get("result") or {}).get("ok")
+                for h in history
+            ) or any(
+                (h.get("call") or {}).get("tool") == "run_bash"
+                and (h.get("result") or {}).get("ok")
+                and re.search(
+                    r"(?i)\bopen\b",
+                    str(((h.get("call") or {}).get("args") or {}).get("command") or ""),
+                )
+                for h in history
+            )
+            has_ui = _history_has_ui_action(history)
+            if has_open and not has_ui:
+                return "incomplete"
+            if has_ui and _needs_screen_read(text) and not _history_has_ui_snapshot(
+                history
+            ):
+                return "incomplete"
+            if has_ui and (not _needs_screen_read(text) or _history_has_ui_snapshot(history)):
+                return "done"
+            return "incomplete" if not has_open else "unknown"
+        # Plain open asks.
         if any(
             (h.get("call") or {}).get("tool")
             in {"open_app", "open_url", "open_folder", "open_system_settings"}
@@ -2321,12 +3238,46 @@ def _goal_status(
             return "done"
         return "incomplete"
 
+    # "Search the web… and check what's on my Mac" — research alone is intermediate.
+    if _needs_local_machine_check(text):
+        if not _history_has_successful_bash(history):
+            return "incomplete"
+        if _utterance_wants_web_search(text) and _web_search_count(history) == 0:
+            return "incomplete"
+        return "unknown"
+
+    # Any Mac action: answering with "run this yourself" is not finished.
+    if (
+        _is_action_request(text)
+        and _candidate_is_shell_advice(cand)
+        and not _history_has_successful_bash(history)
+    ):
+        return "incomplete"
+
     return "unknown"
 
 
 def _goal_incomplete_reason(
     utterance: str, history: list[dict[str, Any]], candidate: str
 ) -> str:
+    if _needs_local_machine_check(utterance or ""):
+        if not _history_has_successful_bash(history):
+            return "researched or advised, but did not check this Mac yet"
+        if _utterance_wants_web_search(utterance or "") and _web_search_count(
+            history
+        ) == 0:
+            return "checked this Mac but did not search the web for the latest yet"
+        if _candidate_is_shell_advice(candidate or ""):
+            return "suggested a terminal command instead of running it"
+        return "local Mac check not finished yet"
+    if _needs_gui_control(utterance or ""):
+        if not _history_has_ui_action(history):
+            return "app opened but on-screen type/click not done yet"
+        if _needs_screen_read(utterance or "") and not _history_has_ui_snapshot(history):
+            return "typed/clicked but did not read the screen result yet"
+        return "GUI steps not finished yet"
+    if _candidate_is_shell_advice(candidate or "") and _is_action_request(utterance or ""):
+        return "gave advice to run a command instead of running it"
     if _DELETE_RE.search(utterance or ""):
         return "listed or found the target but did not delete it yet"
     if _MOVE_RE.search(utterance or ""):
@@ -2338,6 +3289,294 @@ def _goal_incomplete_reason(
     if _is_open_action(utterance or ""):
         return "found the target but did not open it yet"
     return "action not completed yet"
+
+
+def _needs_gui_control(text: str) -> bool:
+    """True when the ask needs ui_type / ui_click / screen read, not just open."""
+    return bool(_GUI_FOLLOWUP_RE.search(text or ""))
+
+
+def _needs_screen_read(text: str) -> bool:
+    return bool(
+        re.search(
+            r"(?i)\b("
+            r"on[\s-]?screen|read\s+(the\s+)?(screen|result|display)|"
+            r"tell\s+me\s+(the\s+)?(result|answer|number)|"
+            r"what('?s|\s+is)\s+(on\s+)?(the\s+)?(screen|display|result)"
+            r")\b",
+            text or "",
+        )
+    )
+
+
+def _needs_local_machine_check(text: str) -> bool:
+    """True when the user wants MacAgent to inspect THIS Mac (not only advise)."""
+    return bool(_LOCAL_MACHINE_CHECK_RE.search(text or ""))
+
+
+def _utterance_wants_web_search(text: str) -> bool:
+    """True when the user explicitly asked to look something up online."""
+    return bool(
+        re.search(
+            r"(?i)\b("
+            r"search\s+(the\s+)?web|look\s+up\s+online|google|"
+            r"latest|current\s+stable|newest\s+(stable\s+)?(release|version)|"
+            r"what('?s|\s+is)\s+the\s+latest|"
+            r"from\s+the\s+(web|internet)|online\b"
+            r")\b",
+            text or "",
+        )
+    )
+
+
+def _preferred_local_check_command(text: str) -> Optional[str]:
+    """Deterministic local inspect command for common 'am I up to date?' asks."""
+    t = text or ""
+    if re.search(r"(?i)\bpython\b", t):
+        return "python3 --version"
+    if re.search(r"(?i)\bnode(\.?js)?\b", t):
+        return "node --version"
+    if re.search(r"(?i)\bruby\b", t):
+        return "ruby --version"
+    if re.search(r"(?i)\bjava\b", t):
+        return "java -version 2>&1"
+    if re.search(r"(?i)\b(macos|mac\s*os)\s+version|sw_vers\b", t):
+        return "sw_vers"
+    return None
+
+
+def _bash_stdout_is_useless(out: str) -> bool:
+    t = (out or "").strip()
+    if not t:
+        return True
+    return bool(
+        re.search(
+            r"(?i)^(error|failed|unable|cannot|command not found)\b|"
+            r"error fetching|no matches|nothing found",
+            t,
+        )
+    )
+
+
+def _candidate_is_shell_advice(text: str) -> bool:
+    """True when the reply tells the user to run a command instead of doing it."""
+    t = text or ""
+    if not t.strip():
+        return False
+    if not _SHELL_ADVICE_RE.search(t):
+        # Bare backtick shell without "you can run" still counts if clearly a cmd.
+        return bool(
+            re.search(
+                r"(?i)`(python3?|node|npm|brew|sw_vers|uname|which|pip3?)\b[^`]*`",
+                t,
+            )
+        )
+    return True
+
+
+def _extract_suggested_shell_commands(text: str) -> list[str]:
+    """Pull runnable shell snippets out of intermediate advice / answers."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in re.finditer(r"`([^`\n]{2,160})`", text or ""):
+        cmd = m.group(1).strip().lstrip("$").strip()
+        if not cmd or cmd in seen:
+            continue
+        # Skip URLs and prose.
+        if re.search(r"(?i)^https?://", cmd) or " " not in cmd and "/" in cmd and not cmd.startswith("~"):
+            if not re.match(
+                r"(?i)^(python|python3|node|npm|npx|brew|pip|pip3|sw_vers|"
+                r"uname|which|ls|df|du|git|ruby|java|go|rustc|php)\b",
+                cmd,
+            ):
+                continue
+        if re.match(
+            r"(?i)^(python|python3|node|npm|npx|brew|pip|pip3|sw_vers|uname|"
+            r"which|ls|df|du|git|ruby|java|system_profiler|defaults)\b",
+            cmd,
+        ) or re.search(r"(?i)--version|-V\b", cmd):
+            seen.add(cmd)
+            out.append(cmd)
+    return out[:3]
+
+
+def _history_has_successful_bash(history: list[dict[str, Any]]) -> bool:
+    for item in history:
+        call = item.get("call") or {}
+        result = item.get("result") or {}
+        if call.get("tool") != "run_bash":
+            continue
+        out = (result.get("stdout") or "").strip()
+        if not out or _bash_stdout_is_useless(out):
+            continue
+        if result.get("ok"):
+            return True
+        # Soft success: useful stdout before a later failing `&&` link.
+        err = (result.get("error") or result.get("stderr") or "").strip()
+        if re.search(r"(?i)command not found|not found", err) or re.search(
+            r"(?i)^(Python|Node|v?\d|ruby|java|go |ProductName|System Version)",
+            out,
+            re.M,
+        ):
+            return True
+    return False
+
+
+def _latest_useful_bash_stdout(history: list[dict[str, Any]]) -> str:
+    for item in reversed(history or []):
+        call = item.get("call") or {}
+        result = item.get("result") or {}
+        if call.get("tool") != "run_bash":
+            continue
+        out = (result.get("stdout") or "").strip()
+        if out and not _bash_stdout_is_useless(out):
+            return out[:2000]
+    return ""
+
+
+def _version_tuple(version: str) -> tuple[int, ...]:
+    parts: list[int] = []
+    for piece in re.split(r"[^\d]+", (version or "").strip()):
+        if piece.isdigit():
+            parts.append(int(piece))
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts[:4])
+
+
+def _extract_installed_software_version(local_out: str, utterance: str) -> Optional[str]:
+    """Parse installed version from `python3 --version` / similar stdout."""
+    out = local_out or ""
+    if re.search(r"(?i)\bpython\b", utterance or ""):
+        m = re.search(r"(?i)\bPython\s+(\d+\.\d+(?:\.\d+)?)\b", out)
+        if m:
+            return m.group(1)
+    if re.search(r"(?i)\bnode\b", utterance or ""):
+        m = re.search(r"(?i)\bv?(\d+\.\d+(?:\.\d+)?)\b", out)
+        if m:
+            return m.group(1)
+    m = re.search(r"(?i)\b(?:version|v)?\s*(\d+\.\d+(?:\.\d+)?)\b", out)
+    return m.group(1) if m else None
+
+
+def _extract_latest_software_version(web_ctx: str, utterance: str) -> Optional[str]:
+    """Best-effort latest version from search context (prefer explicit 'latest')."""
+    ctx = web_ctx or ""
+    name = "Python"
+    if re.search(r"(?i)\bnode(\.?js)?\b", utterance or ""):
+        name = "Node"
+    elif re.search(r"(?i)\bruby\b", utterance or ""):
+        name = "Ruby"
+    elif re.search(r"(?i)\bjava\b", utterance or ""):
+        name = "Java"
+
+    preferred: list[str] = []
+    # "Latest Python 3 Release - Python 3.14.6"
+    for m in re.finditer(
+        rf"(?i)latest[^\n]{{0,80}}{name}[^\n]{{0,40}}?"
+        rf"(\d+\.\d+(?:\.\d+)?)",
+        ctx,
+    ):
+        preferred.append(m.group(1))
+    for m in re.finditer(
+        rf"(?i){name}\s+(\d+\.\d+\.\d+)\s+is\s+now\s+available",
+        ctx,
+    ):
+        preferred.append(m.group(1))
+    if preferred:
+        return max(preferred, key=_version_tuple)
+
+    found: list[str] = []
+    for m in re.finditer(rf"(?i)\b{name}\s+(\d+\.\d+\.\d+)\b", ctx):
+        found.append(m.group(1))
+    # Prefer versions near python.org download language.
+    if not found:
+        for m in re.finditer(r"(?i)\b(\d+\.\d+\.\d+)\b", ctx):
+            found.append(m.group(1))
+    if not found:
+        return None
+    # Drop ancient majors when talking about Python 3.
+    if name.lower() == "python":
+        found = [v for v in found if _version_tuple(v)[0] >= 3]
+    return max(found, key=_version_tuple) if found else None
+
+
+def _deterministic_hybrid_version_answer(
+    utterance: str, local_out: str, web_ctx: str
+) -> Optional[str]:
+    """Rule-based latest-vs-installed answer — no LLM arithmetic."""
+    installed = _extract_installed_software_version(local_out, utterance)
+    latest = _extract_latest_software_version(web_ctx, utterance)
+    if not installed or not latest:
+        return None
+    label = "Python"
+    if re.search(r"(?i)\bnode\b", utterance or ""):
+        label = "Node.js"
+    elif re.search(r"(?i)\bruby\b", utterance or ""):
+        label = "Ruby"
+    elif re.search(r"(?i)\bjava\b", utterance or ""):
+        label = "Java"
+
+    inst_t = _version_tuple(installed)
+    late_t = _version_tuple(latest)
+    if inst_t < late_t:
+        verdict = (
+            f"You are out of date: this Mac has {installed}, "
+            f"which is behind the latest stable {latest}."
+        )
+    elif inst_t > late_t:
+        verdict = (
+            f"This Mac has {installed}, which is newer than the latest stable "
+            f"release I found ({latest})."
+        )
+    else:
+        verdict = (
+            f"You are up to date: this Mac already has the latest stable "
+            f"release ({installed})."
+        )
+    return (
+        f"Latest stable {label}: {latest}\n"
+        f"Installed on this Mac: {installed}\n\n"
+        f"{verdict}"
+    )
+
+
+def _suggested_cmds_from_history(history: list[dict[str, Any]]) -> list[str]:
+    for item in reversed(history or []):
+        call = item.get("call") or {}
+        result = item.get("result") or {}
+        tool = call.get("tool")
+        blob = ""
+        if tool == "respond":
+            blob = str(
+                result.get("text")
+                or (call.get("args") or {}).get("text")
+                or ""
+            )
+        elif tool == "_goal_check":
+            blob = str(result.get("candidate") or "")
+        if blob:
+            cmds = _extract_suggested_shell_commands(blob)
+            if cmds:
+                return cmds
+    return []
+
+
+def _history_has_ui_action(history: list[dict[str, Any]]) -> bool:
+    return any(
+        (h.get("call") or {}).get("tool")
+        in {"ui_type", "ui_click", "ui_key", "ui_menu"}
+        and (h.get("result") or {}).get("ok")
+        for h in history
+    )
+
+
+def _history_has_ui_snapshot(history: list[dict[str, Any]]) -> bool:
+    return any(
+        (h.get("call") or {}).get("tool") == "ui_snapshot"
+        and (h.get("result") or {}).get("ok")
+        for h in history
+    )
 
 
 def _delete_latest_download_command() -> str:
@@ -2396,25 +3635,10 @@ def _path_from_ls_stdout(stdout: str) -> Optional[str]:
 
 
 def _first_path_from_history(history: list[dict[str, Any]]) -> Optional[str]:
-    import shlex
-
     for item in reversed(history):
         call = item.get("call") or {}
         result = item.get("result") or {}
         tool = call.get("tool")
-        if tool == "find_files":
-            items = result.get("items") or []
-            if items:
-                p = items[0].get("path")
-                if p:
-                    return str(p)
-            paths = result.get("paths") or []
-            if paths:
-                return str(paths[0])
-        if tool == "spotlight_file_search":
-            paths = result.get("paths") or []
-            if paths:
-                return str(paths[0])
         if tool == "run_bash" and result.get("ok"):
             cmd = str((call.get("args") or {}).get("command") or "")
             out = str(result.get("stdout") or "")
@@ -2422,11 +3646,14 @@ def _first_path_from_history(history: list[dict[str, Any]]) -> Optional[str]:
                 p = _path_from_ls_stdout(out)
                 if p:
                     return p
-            # echo Opened: /path
+            # echo Opened: /path  or bare absolute path line
             m = re.search(r"(?i)(?:opened|deleted|moved|copied):\s*(.+)$", out, re.M)
             if m:
                 return m.group(1).strip()
-    _ = shlex  # silence if unused in some paths
+            for line in reversed(out.splitlines()):
+                line = line.strip()
+                if line.startswith("/") and " " not in line:
+                    return line
     return None
 
 
@@ -2437,8 +3664,18 @@ def _forced_followup(
     if not history:
         return None
 
-    # Q&A: prior search answer was too thin — search again with a sharper query.
+    # Q&A: prior page/search was thin — next unread page first, else new query.
     if _history_needs_more_search(history) and _web_search_count(history) < _MAX_WEB_SEARCHES:
+        unread, pages_read, last_q = _last_search_unread(history)
+        if unread and pages_read < 3:
+            return {
+                "tool": "web_search",
+                "args": {
+                    "query": last_q or utterance,
+                    "unread_urls": unread,
+                    "pages_already_read": pages_read,
+                },
+            }
         query = _next_search_query(utterance, history)
         if query:
             return {"tool": "web_search", "args": {"query": query}}
@@ -2446,6 +3683,50 @@ def _forced_followup(
     if _history_has_successful_mutation(history):
         return None
     text = utterance or ""
+
+    # Misrouted web research / intermediate advice on a Mac action → run shell.
+    if _is_action_request(text) or _needs_local_machine_check(text):
+        last_tool = ((history[-1].get("call") or {}).get("tool") or "")
+        ran_bash = _history_has_successful_bash(history)
+        # Local version known, but user also asked to search the web for "latest".
+        if (
+            ran_bash
+            and _utterance_wants_web_search(text)
+            and _web_search_count(history) == 0
+            and last_tool in {"run_bash", "_goal_check", "respond"}
+        ):
+            return {
+                "tool": "web_search",
+                "args": {"query": _hybrid_web_search_query(text)},
+            }
+        # Prefer executing the command the model already suggested in prose.
+        if not ran_bash and last_tool in {
+            "web_search",
+            "respond",
+            "_goal_check",
+            "run_bash",
+        }:
+            # After a failed curl||echo bash, still need the real local check.
+            if last_tool == "run_bash" and _needs_local_machine_check(text):
+                local_cmd = _preferred_local_check_command(text)
+                if local_cmd and not _history_has_command_containing(history, local_cmd):
+                    return {"tool": "run_bash", "args": {"command": local_cmd}}
+            suggested = _suggested_cmds_from_history(history)
+            if suggested:
+                return {"tool": "run_bash", "args": {"command": suggested[0]}}
+            local_cmd = _preferred_local_check_command(text)
+            if local_cmd:
+                return {"tool": "run_bash", "args": {"command": local_cmd}}
+            if last_tool == "web_search" or _needs_local_machine_check(text):
+                return {"tool": "__write_and_run_bash__", "args": {}}
+            if last_tool in {"respond", "_goal_check"} and _candidate_is_shell_advice(
+                str(
+                    (history[-1].get("result") or {}).get("text")
+                    or (history[-1].get("result") or {}).get("candidate")
+                    or ""
+                )
+            ):
+                return {"tool": "__write_and_run_bash__", "args": {}}
 
     # Close/quit was mis-planned (e.g. pmset) — force the kill tool once.
     close = _close_app_heuristic(text)
@@ -2534,7 +3815,43 @@ def _web_search_count(history: list[dict[str, Any]]) -> int:
         1
         for h in history
         if (h.get("call") or {}).get("tool") == "web_search"
+        and not (h.get("result") or {}).get("continued")
     )
+
+
+def _last_search_unread(
+    history: list[dict[str, Any]],
+) -> tuple[list[str], int, str]:
+    """Return (unread_urls, pages_read, query) from the latest search chain."""
+    unread: list[str] = []
+    pages_read = 0
+    query = ""
+    for item in reversed(history or []):
+        call = item.get("call") or {}
+        result = item.get("result") or {}
+        if call.get("tool") != "web_search":
+            if call.get("tool") in {"_search_retry", "_goal_check", "respond"}:
+                continue
+            break
+        if not query:
+            query = str((call.get("args") or {}).get("query") or "").strip()
+        # Prefer the newest unread list / page count in the chain.
+        if not unread:
+            raw = result.get("unread_urls") or (call.get("args") or {}).get(
+                "unread_urls"
+            )
+            if isinstance(raw, list):
+                unread = [str(u).strip() for u in raw if str(u).strip()]
+        pr = result.get("pages_read")
+        if pr is not None:
+            try:
+                pages_read = max(pages_read, int(pr))
+            except (TypeError, ValueError):
+                pass
+        # Stop after the first non-continued search root if we have data.
+        if not result.get("continued"):
+            break
+    return unread, pages_read, query
 
 
 def _history_needs_more_search(history: list[dict[str, Any]]) -> bool:
@@ -2654,8 +3971,14 @@ def _next_search_query(utterance: str, history: list[dict[str, Any]]) -> Optiona
 
 
 def _history_summary_for_critic(history: list[dict[str, Any]]) -> str:
+    # Critic only needs recent steps + a count of earlier ones.
     lines: list[str] = []
-    for i, item in enumerate(history[-6:], 1):
+    if len(history) > 4:
+        lines.append(f"(earlier {len(history) - 3} steps omitted)")
+        slice_ = history[-3:]
+    else:
+        slice_ = history[-6:]
+    for i, item in enumerate(slice_, 1):
         call = item.get("call") or {}
         result = item.get("result") or {}
         tool = call.get("tool")
@@ -2704,6 +4027,9 @@ def _decompose_compound_request(text: str) -> list[str]:
     text = (text or "").strip()
     if not text:
         return [text]
+    # Keep open+type+read as one multi-step GUI goal (don't split into fake opens).
+    if _needs_gui_control(text):
+        return [text]
     open_parts = _extract_compound_open_parts(text)
     if open_parts and len(open_parts) >= 2:
         return open_parts
@@ -2732,53 +4058,15 @@ def _extract_compound_open_parts(text: str) -> Optional[list[str]]:
     left, right = m.group(1).strip().rstrip(".?!"), m.group(2).strip().rstrip(".?!")
     if not left or not right:
         return None
+    # "open Calculator and type …" is GUI follow-up, not two apps.
+    if _needs_gui_control(cleaned) or re.search(
+        r"(?i)\b(type|click|press|tell|delete|move|remove)\b", right
+    ):
+        return None
+    if re.search(r"(?i)\b(type|click|press|tell|delete|move|remove)\b", left):
+        return None
     return [f"open {left}", f"open {right}"]
 
-
-def _normalize_folder_name(raw: str) -> str:
-    name = (raw or "").strip().rstrip(".?!")
-    name = re.sub(r"(?i)^(the|a|my)\s+", "", name).strip()
-    name = re.sub(r"(?i)\b(folder|directory|dir)\b", "", name).strip()
-    name = re.sub(r"(?i)^(named|called)\s+", "", name).strip()
-    course = re.search(r"(?i)\b([a-z]{2,6}\d{3,4}[a-z]?)\b", name)
-    if course:
-        return course.group(1)
-    digits = re.search(r"\b(\d{3,5})\b", name)
-    if digits:
-        return digits.group(1)
-    return name
-
-
-def _heuristic_open_target(target: str) -> Optional[dict[str, Any]]:
-    t = (target or "").strip().rstrip(".?!")
-    if not t:
-        return None
-    lower = t.lower()
-    if lower in _KNOWN_SITES:
-        return {"tool": "open_url", "args": {"url": _KNOWN_SITES[lower]}}
-    for key, url in _KNOWN_SITES.items():
-        if lower == key or lower.startswith(key + " "):
-            return {"tool": "open_url", "args": {"url": url}}
-    if re.search(r"(?i)\b(folder|directory|dir)\b", t) or re.search(
-        r"(?i)\b(\d{3,5}|[a-z]{2,6}\d{3,4})\b", t
-    ):
-        folder = _normalize_folder_name(t)
-        if folder:
-            return {"tool": "open_folder", "args": {"query": folder}}
-    if t.startswith("http") or re.search(r"(?i)\b(www\.|\.com|\.org|\.net)\b", t):
-        return {"tool": "open_url", "args": {"url": t if t.startswith("http") else f"https://{t}"}}
-    compact = t.replace(" ", "")
-    if re.match(r"(?i)^[a-z]{2,6}\d{3,4}[a-z]?$", compact):
-        return {"tool": "open_folder", "args": {"query": compact}}
-    return {"tool": "open_app", "args": {"name": t}}
-
-
-def _heuristic_compound_open(text: str) -> Optional[dict[str, Any]]:
-    """First step of a compound open when subtask queue hasn't started yet."""
-    parts = _extract_compound_open_parts(text)
-    if not parts:
-        return None
-    return _heuristic_open_target(re.sub(r"(?i)^open\s+", "", parts[0]).strip())
 
 
 def _is_open_action(utterance: str) -> bool:
@@ -2849,6 +4137,8 @@ def _is_action_request(utterance: str) -> bool:
     if _META_RE.search(text):
         return False
     cleaned = _scrub_open_compounds(text)
+    if _needs_gui_control(text) or _needs_local_machine_check(text):
+        return True
     # Pure questions with no action verbs stay Q&A.
     if re.match(
         r"(?i)^\s*(what|why|how\s+do\s+i\s+know|who|when|where|which|whose|"
@@ -2862,23 +4152,6 @@ def _is_action_request(utterance: str) -> bool:
         return True
     return False
 
-
-def _bash_open_folder(name: str) -> str:
-    """Fast folder lookup via Spotlight; limited find fallback (no full-home scan)."""
-    import shlex
-
-    q = shlex.quote((name or "").strip())
-    return (
-        f"name={q}; "
-        'p=$(mdfind -onlyin "$HOME" "kind:folder $name" 2>/dev/null | head -1); '
-        'if [ -z "$p" ]; then '
-        'for d in "$HOME/Desktop" "$HOME/Documents" "$HOME/Downloads" "$HOME/Projects"; do '
-        '  [ -d "$d" ] || continue; '
-        '  p=$(find "$d" -maxdepth 8 -type d -iname "*$name*" 2>/dev/null | head -1); '
-        '  [ -n "$p" ] && break; '
-        "done; fi; "
-        'if [ -n "$p" ]; then open "$p"; echo "Opened: $p"; else echo "No folder found for: $name"; fi'
-    )
 
 
 def _friendly_ls_answer(utterance: str, stdout: str) -> Optional[str]:

@@ -7,7 +7,7 @@ import threading
 import time
 from typing import Optional
 
-from tools.tts_kokoro import speak_answer, speak_status
+from tools.tts_kokoro import is_muted, speak_answer, speak_status, tts_config
 
 _last_phrase: dict[str, str] = {}
 _last_phase_at: float = 0.0
@@ -57,6 +57,9 @@ def _pick(phase: str) -> str:
 
 def narrate(phase: str, *, force: bool = False) -> Optional[str]:
     """Speak a varied status line for this phase. Returns the phrase used."""
+    cfg = tts_config()
+    if not cfg.get("enabled") or is_muted() or not cfg.get("speak_status"):
+        return None
     global _last_phase_at
     phase_key = (phase or "acting").strip().lower()
     if phase_key not in _PHRASES:
@@ -73,4 +76,6 @@ def narrate(phase: str, *, force: bool = False) -> Optional[str]:
 
 def narrate_answer(text: str) -> None:
     """Interrupt status speech and read the final answer aloud."""
+    if is_muted():
+        return
     speak_answer(text or "")

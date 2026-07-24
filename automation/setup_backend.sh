@@ -67,6 +67,14 @@ cat <<EOF
 
 ✓ Backend ready.
 
+Default model: Qwen3-4B Q4_K_M in ${MODEL_DIR}
+
+Optional light GGUFs (drop into ${MODEL_DIR}, then pick in Preferences):
+  • Llama 3.2 3B Instruct Q4_K_M  — general chat (~2 GB)
+  • Phi-3.5 Mini Instruct Q4_K_M  — everyday logic (~2.5 GB)
+  • Qwen 2.5 7B Instruct Q4_K_M   — coding/math (~4.4 GB; tight on 8GB RAM)
+  • SmolLM2 1.7B Instruct          — ultra-light backup (~1 GB)
+
 Next:
   1. Install MacAgent.app from the release DMG (if you have not already).
   2. Open MacAgent → grant Accessibility + Microphone when prompted.

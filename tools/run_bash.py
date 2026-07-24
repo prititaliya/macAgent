@@ -15,6 +15,13 @@ logger = logging.getLogger(__name__)
 _SLOW_FIND_RE = re.compile(
     r"(?i)\bfind\s+(~|\$HOME|/Users/)[^\n|;]*(-type\s+d|-iname\b)"
 )
+# Whole-disk / volume walks return empty or hang; always require a scoped path.
+_ROOT_FIND_RE = re.compile(
+    r"(?i)\bfind\s+(/Volumes(?:/\S*)?|/(?:\s|$)|/System\b)"
+)
+_DISCOVERY_RE = re.compile(
+    r"(?i)\b(find|du|ls|stat|mdfind|locate|wc|head|tail|cat|grep|awk|sort)\b"
+)
 
 
 def _command_timeout(command: str) -> float:
@@ -177,13 +184,23 @@ def run_bash(
             "ok": False,
             "error": (
                 "command blocked: unbounded find under ~ is too slow — "
-                "use open_folder or spotlight_file_search instead"
+                "add -maxdepth (e.g. find ~/Documents -maxdepth 4 -iname '*name*')"
+            ),
+            "command": cmd[:800],
+        }
+    if _ROOT_FIND_RE.search(cmd) and "-maxdepth" not in cmd.lower():
+        return {
+            "ok": False,
+            "error": (
+                "command blocked: scanning / or /Volumes without -maxdepth is "
+                "too slow/empty — search under $HOME with -maxdepth instead"
             ),
             "command": cmd[:800],
         }
     try:
+        # pipefail so `find … | sort | head` fails when find dies mid-pipeline.
         proc = subprocess.run(
-            ["/bin/bash", "-lc", cmd],
+            ["/bin/bash", "-lc", f"set -o pipefail; {cmd}"],
             capture_output=True,
             text=True,
             timeout=effective_timeout,
@@ -194,6 +211,21 @@ def run_bash(
         stdout = (proc.stdout or "")[:_MAX_OUTPUT]
         stderr = (proc.stderr or "")[:_MAX_OUTPUT]
         ok = proc.returncode == 0
+        # `… | sort | head -n N` often exits 141 (SIGPIPE) once head closes the pipe.
+        # That still means we got the lines we asked for.
+        if (not ok) and stdout.strip() and proc.returncode in (141, 128 + 13):
+            ok = True
+        # Pipelines can exit 0 even when find printed a fatal error to stderr.
+        if ok and not stdout.strip() and re.search(
+            r"(?i)unknown primary|illegal option|invalid|not found",
+            stderr or "",
+        ):
+            ok = False
+        # Discovery with no stdout is not success — callers must not say "Done".
+        if ok and not stdout.strip() and _DISCOVERY_RE.search(cmd):
+            ok = False
+            if not (stderr or "").strip():
+                stderr = "no output (nothing matched or scan produced empty results)"
         out: dict[str, Any] = {
             "ok": ok,
             "returncode": proc.returncode,
@@ -202,8 +234,12 @@ def run_bash(
             "command": cmd[:800],
             "confirmed": confirmed,
         }
-        if not ok and not stdout and stderr:
-            out["error"] = stderr.strip()[:500]
+        if not ok and not stdout.strip():
+            err = (stderr or "").strip()
+            if err:
+                out["error"] = err[:500]
+            elif proc.returncode != 0:
+                out["error"] = f"exit {proc.returncode}"
         return out
     except subprocess.TimeoutExpired:
         return {
